@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">Inkvol</string>
+    <string name="widget_continue_reading">继续阅读</string>
+    <string name="widget_empty_reading">打开一本书\n这里会记住进度</string>
+    <string name="reader_share_page">分享页面</string>
+</resources>

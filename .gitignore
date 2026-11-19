@@ -1,0 +1,36 @@
+# Gradle / Android
+.gradle/
+.kotlin/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+
+# 构建产物
+*.apk
+*.aab
+*.hap
+
+# M0.5 spike：第三方源码与中间产物不入库
+tools/spike/unrar/
+tools/spike/build-arm64/
+tools/spike/unrarsrc.tar.gz
+tools/spike/logcat.txt
+tools/spike/*.jar
+tools/spike/junrar-src/
+
+# 开源发布：本地工具目录（测试截图/真实书库数据库/含本机路径的脚本）整目录不入库
+/tools/
+
+# 开源发布：开发期历史快照不入库
+/backup/
+
+# 数据库文件（含真实阅读数据）不入库
+*.db
+
+# CodeBuddy 工作区元数据（本地计划/规则）不入库
+.codebuddy/
+
+# 临时日志
+build_log.txt

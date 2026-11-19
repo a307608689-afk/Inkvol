@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!-- M0.5 spike 专用：进程内 DocumentsProvider，用于对比
+             DocumentsContract 批量 query 与 DocumentFile 逐项访问的开销。
+             仅 debug 变体存在，release 不打包。 -->
+        <provider
+            android:name=".spike.BenchDocumentsProvider"
+            android:authorities="com.inkvol.app.spike.docs"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
+        <!-- M1 端到端扫描测试：一个真实的漫画文件夹树（4+3 张图 + 1 个 CBZ） -->
+        <provider
+            android:name=".spike.TestLibraryProvider"
+            android:authorities="com.inkvol.app.spike.library"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+    </application>
+
+</manifest>
