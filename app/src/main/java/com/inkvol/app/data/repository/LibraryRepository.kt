@@ -22,15 +22,37 @@ import com.inkvol.app.data.model.PurifyRuleRecord
 import com.inkvol.app.data.model.ReadingStats
 import com.inkvol.app.data.model.ScanState
 import com.inkvol.app.data.model.TrashBook
+import com.inkvol.app.data.model.FolderFacet
+import com.inkvol.app.data.model.FullTextEvent
+import com.inkvol.app.data.model.FullTextHit
+import com.inkvol.app.data.model.SearchChapterRow
+import com.inkvol.app.data.model.SearchFacets
+import com.inkvol.app.data.model.SearchFilter
+import com.inkvol.app.data.model.SearchFilterCodec
+import com.inkvol.app.data.model.SearchFilterTemplate
+import com.inkvol.app.data.model.SearchState
+import com.inkvol.app.data.model.TagFacet
+import com.inkvol.app.data.model.TriStateSet
+import com.inkvol.app.data.model.tagList
+import com.inkvol.app.data.model.FullTextBookGroup
+import com.inkvol.app.data.settings.SettingsKeys
+import com.inkvol.app.data.settings.SettingsRepository
 import com.inkvol.app.ui.reader.panel.PanelLayoutCache
 import com.inkvol.app.data.source.BookContentSource
 import com.inkvol.app.data.source.BookSourceFactory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -40,7 +62,10 @@ import java.io.File
  *
  * 分类是全局的（跨书库），删除书夹只解除关系；隐藏书库的过滤在 SQL 层完成。
  */
-class LibraryRepository(private val context: Context) {
+class LibraryRepository(
+    private val context: Context,
+    private val settingsRepository: SettingsRepository,
+) {
 
     private val db = InkvolDatabase(context)
     private val scanner = LibraryScanner(context, db)
@@ -112,8 +137,20 @@ class LibraryRepository(private val context: Context) {
     private val _notice = MutableStateFlow<String?>(null)
     val notice: StateFlow<String?> = _notice.asStateFlow()
 
+    /** 供同步模块发射完成/失败通知（AppContainer 装配后可用）。 */
+    fun postNotice(message: String) {
+        _notice.value = message
+    }
+
+    /** M4.5 同步挂钩：进度保存后通知（setter 注入避免构造环；null = 同步未装配）。 */
+    var syncOnProgressSaved: (() -> Unit)? = null
+
+    /** M4.5 同步挂钩：书籍被级联硬删（多选删除/书库移除/回收站清除）后通知。 */
+    var syncOnBooksPurged: ((Collection<String>) -> Unit)? = null
+
     init {
         scope.launch { reload() }
+        scope.launch { restoreSearchSession() }
     }
 
     suspend fun refresh() = withContext(Dispatchers.IO) { reload() }
@@ -231,6 +268,7 @@ class LibraryRepository(private val context: Context) {
                 return@launch
             }
             cleanupBookFiles(removed.first, removed.second)
+            syncOnBooksPurged?.invoke(removed.first)
             reload()
             _notice.value = "已移除「${library.name}」，书架同步更新，本地文件未删除"
         }
@@ -263,30 +301,436 @@ class LibraryRepository(private val context: Context) {
         withContext(Dispatchers.IO) {
             val key = "$bookId:${chapter.index}"
             novelChapterCache.get(key)?.let { return@withContext it }
-            val file = File(context.filesDir, "novel_text/$bookId.txt")
-            if (!file.exists()) return@withContext ""
-            val length = (chapter.byteEnd - chapter.byteStart).coerceAtLeast(0L)
-            if (length <= 0L) return@withContext ""
-            val output = java.io.ByteArrayOutputStream(length.toInt().coerceAtMost(64 * 1024 * 1024))
-            java.io.RandomAccessFile(file, "r").use { random ->
-                random.seek(chapter.byteStart)
-                val buffer = ByteArray(64 * 1024)
-                var remaining = length
-                while (remaining > 0) {
-                    val read = random.read(
-                        buffer,
-                        0,
-                        buffer.size.toLong().coerceAtMost(remaining).toInt(),
-                    )
-                    if (read <= 0) break
-                    output.write(buffer, 0, read)
-                    remaining -= read
-                }
-            }
-            val text = output.toString("UTF-8")
+            val text = readChapterBytes(bookId, chapter)
             novelChapterCache.put(key, text)
             text
         }
+
+    /** M7 全文搜索专用：同一读法但**不进 LRU**——全库扫描会疯狂替换缓存项，挤出阅读器热章节。 */
+    suspend fun readNovelChapterRaw(bookId: String, chapter: NovelChapterRecord): String =
+        withContext(Dispatchers.IO) { readChapterBytes(bookId, chapter) }
+
+    private fun readChapterBytes(bookId: String, chapter: NovelChapterRecord): String {
+        val file = File(context.filesDir, "novel_text/$bookId.txt")
+        if (!file.exists()) return ""
+        val length = (chapter.byteEnd - chapter.byteStart).coerceAtLeast(0L)
+        if (length <= 0L) return ""
+        val output = java.io.ByteArrayOutputStream(length.toInt().coerceAtMost(64 * 1024 * 1024))
+        java.io.RandomAccessFile(file, "r").use { random ->
+            random.seek(chapter.byteStart)
+            val buffer = ByteArray(64 * 1024)
+            var remaining = length
+            while (remaining > 0) {
+                val read = random.read(
+                    buffer,
+                    0,
+                    buffer.size.toLong().coerceAtMost(remaining).toInt(),
+                )
+                if (read <= 0) break
+                output.write(buffer, 0, read)
+                remaining -= read
+            }
+        }
+        return output.toString("UTF-8")
+    }
+
+    // ---------------- M7 全局搜索 ----------------
+
+    /** 单书命中上限（与阅读器书内搜索同口径）；全库软上限防超大库淹没。 */
+    private companion object {
+        const val FULL_TEXT_PER_BOOK_LIMIT = 100
+        const val FULL_TEXT_GLOBAL_LIMIT = 300
+    }
+
+    /**
+     * 书目搜索：全量候选内存过滤（书量 <1万，与书架 filteredBooks 同模式）。
+     * SQL 不便表达逗号标签与书夹/文件夹映射，统一在内存判定；JOIN 去重口径由 db.queryBooks 保证。
+     */
+    suspend fun searchBooks(query: String, filter: SearchFilter): List<BookRecord> =
+        withContext(Dispatchers.IO) {
+            val books = db.queryBooks()
+            val categoryIds = db.queryCategoryBookIds()
+            val folderIds = db.queryBookFolderIds()
+            filterBooks(books, query, filter, categoryIds, folderIds)
+        }
+
+    private fun filterBooks(
+        books: List<BookRecord>,
+        query: String,
+        filter: SearchFilter,
+        categoryIds: Map<Long, Set<String>>,
+        folderIds: Map<String, Set<Long>>,
+    ): List<BookRecord> {
+        val q = query.trim()
+        val result = books.filter { book ->
+            val keywordHit = q.isEmpty() ||
+                listOf(
+                    book.title,
+                    book.series ?: "",
+                    book.volume ?: "",
+                    book.writer ?: "",
+                    book.tags ?: "",
+                    book.displayPath,
+                ).any { it.contains(q, ignoreCase = true) }
+            keywordHit &&
+                filter.matchesBasic(book) &&
+                matchCategories(book.id, filter.categories, categoryIds) &&
+                matchFolders(book.id, filter.folders, folderIds)
+        }
+        return sortBooksByRelevance(result, q)
+    }
+
+    /** 书夹三态判定：UNCLASSIFIED_ID 虚拟项 = 不在任何书夹。 */
+    private fun matchCategories(
+        bookId: String,
+        tri: TriStateSet,
+        categoryIds: Map<Long, Set<String>>,
+    ): Boolean {
+        if (!tri.isActive) return true
+        val inAny = categoryIds.values.any { bookId in it }
+        fun hit(id: String): Boolean =
+            if (id == SearchFilter.UNCLASSIFIED_ID) !inAny
+            else categoryIds[id.toLongOrNull()]?.contains(bookId) == true
+        if (tri.include.isNotEmpty() && tri.include.none { hit(it) }) return false
+        if (tri.exclude.isNotEmpty() && tri.exclude.any { hit(it) }) return false
+        return true
+    }
+
+    /** 文件夹三态判定（同书夹结构）。 */
+    private fun matchFolders(
+        bookId: String,
+        tri: TriStateSet,
+        folderIds: Map<String, Set<Long>>,
+    ): Boolean {
+        if (!tri.isActive) return true
+        val owned = folderIds[bookId] ?: emptySet()
+        fun hit(id: String): Boolean = id.toLongOrNull()?.let { it in owned } == true
+        if (tri.include.isNotEmpty() && tri.include.none { hit(it) }) return false
+        if (tri.exclude.isNotEmpty() && tri.exclude.any { hit(it) }) return false
+        return true
+    }
+
+    /** 相关性排序：标题前缀命中 > 标题包含 > 其余字段；同级按加入时间新→旧。 */
+    private fun sortBooksByRelevance(list: List<BookRecord>, query: String): List<BookRecord> {
+        if (query.isBlank()) return list.sortedByDescending { it.addedAt }
+        val ql = query.lowercase()
+        return list.sortedWith(
+            compareBy(
+                { !it.title.lowercase().startsWith(ql) },
+                { !it.title.lowercase().contains(ql) },
+                { -it.addedAt },
+            ),
+        )
+    }
+
+    /** 章节标题搜索：SQL LIKE + 书籍级筛选兜底（书夹/文件夹/系列/作者/标签在内存对齐书目口径）。 */
+    suspend fun searchChapterHits(query: String, filter: SearchFilter): List<SearchChapterRow> =
+        withContext(Dispatchers.IO) {
+            val rows = db.querySearchChapters(query, filter.type, filter.formats, filter.readStatus)
+            if (rows.isEmpty()) return@withContext rows
+            if (filter.isEmpty()) return@withContext rows
+            val allowed = filterBooks(
+                db.queryBooks(),
+                "",
+                filter,
+                db.queryCategoryBookIds(),
+                db.queryBookFolderIds(),
+            ).map { it.id }.toSet()
+            rows.filter { it.bookId in allowed }
+        }
+
+    /** 筛选 facet 数据源（进页一次预载：书夹/文件夹/系列/标签/作者 distinct）。 */
+    suspend fun searchFacets(): SearchFacets = withContext(Dispatchers.IO) {
+        val books = db.queryBooks()
+        val tagCounts = HashMap<String, Int>()
+        val seriesSet = LinkedHashSet<String>()
+        val writerSet = LinkedHashSet<String>()
+        books.forEach { book ->
+            book.tagList().forEach { tagCounts.merge(it, 1, Int::plus) }
+            book.series?.takeIf { it.isNotBlank() }?.let { seriesSet.add(it) }
+            book.writer?.takeIf { it.isNotBlank() }?.let { writerSet.add(it) }
+        }
+        SearchFacets(
+            categories = db.queryCategories(),
+            folders = db.queryFolders().map { FolderFacet(it.id, it.name) },
+            series = seriesSet.toList().sortedWith(String.CASE_INSENSITIVE_ORDER),
+            tags = tagCounts.entries
+                .map { TagFacet(it.key, it.value) }
+                .sortedWith(compareByDescending<TagFacet> { it.count }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }),
+            writers = writerSet.toList().sortedWith(String.CASE_INSENSITIVE_ORDER),
+        )
+    }
+
+    /**
+     * 正文全文流式扫描：串行逐书（LRU 不友好也没必要并行 IO）、每书/全库双上限、
+     * 逐书 emit 事件（调用方取消 Flow 即取消扫描）。中文子串匹配 indexOf(ignoreCase)，无分词依赖。
+     */
+    fun searchNovelFullText(
+        books: List<BookRecord>,
+        query: String,
+    ): Flow<FullTextEvent> = flow {
+        val limitedIds = mutableSetOf<String>()
+        var globalCount = 0
+        var scanned = 0
+        for (book in books) {
+            currentCoroutineContext().ensureActive()
+            scanned++
+            emit(FullTextEvent.Progress(scanned, books.size, book.title))
+            val hits = ArrayList<FullTextHit>()
+            for (chapter in db.queryNovelChapters(book.id)) {
+                currentCoroutineContext().ensureActive()
+                val text = readChapterBytes(book.id, chapter)
+                if (text.isEmpty()) continue
+                var idx = text.indexOf(query, ignoreCase = true)
+                while (idx >= 0 && hits.size < FULL_TEXT_PER_BOOK_LIMIT && globalCount < FULL_TEXT_GLOBAL_LIMIT) {
+                    val ctxStart = (idx - 24).coerceAtLeast(0)
+                    val ctxEnd = (idx + query.length + 40).coerceAtMost(text.length)
+                    hits += FullTextHit(
+                        book = book,
+                        chapterIdx = chapter.index,
+                        chapterTitle = chapter.title,
+                        charPos = idx,
+                        context = text.substring(ctxStart, ctxEnd).replace('\n', ' '),
+                        matchLen = query.length,
+                        ctxOffset = ctxStart,
+                    )
+                    globalCount++
+                    idx = text.indexOf(query, idx + query.length, ignoreCase = true)
+                }
+                if (hits.size >= FULL_TEXT_PER_BOOK_LIMIT) {
+                    limitedIds += book.id
+                    break
+                }
+                if (globalCount >= FULL_TEXT_GLOBAL_LIMIT) break
+            }
+            if (hits.isNotEmpty()) emit(FullTextEvent.BookBatch(book, hits.toList()))
+            if (globalCount >= FULL_TEXT_GLOBAL_LIMIT) break
+        }
+        emit(FullTextEvent.Done(limitedIds.toSet(), globalCount >= FULL_TEXT_GLOBAL_LIMIT))
+    }.flowOn(Dispatchers.IO)
+
+    // ---------------- M7 搜索会话（状态 + 历史/筛选/模板持久化） ----------------
+
+    private val _search = MutableStateFlow(SearchState())
+    val search: StateFlow<SearchState> = _search.asStateFlow()
+
+    private var searchJob: Job? = null
+    private var bodyScanJob: Job? = null
+
+    /** 进页预载筛选 facet（幂等；书架扫描完成后 facets 需刷新时置回 null 重载）。 */
+    fun ensureSearchFacets() {
+        if (_search.value.facets != null) return
+        scope.launch { _search.value = _search.value.copy(facets = searchFacets()) }
+    }
+
+    /** facet 失效（后台扫描完成）后强制重载。 */
+    fun invalidateSearchFacets() {
+        _search.value = _search.value.copy(facets = null)
+        ensureSearchFacets()
+    }
+
+    /**
+     * 执行搜索：书目/章节即时（repository.searchBooks 内存过滤毫秒级）；
+     * 正文扫描延迟 bodyDebounceMs 再起跑（输入触发 400ms 防打字抖动，筛选变化 0ms 立即重启）。
+     * 关键词 <2 字符不扫正文（1 字命中泛滥）；类型筛=仅漫画时不扫（无正文）。
+     */
+    fun runSearch(rawQuery: String, bodyDebounceMs: Long = 400L) {
+        val q = rawQuery.trim()
+        val filter = _search.value.filter
+        searchJob?.cancel()
+        _search.value = _search.value.copy(
+            query = q,
+            searched = q.isNotEmpty(),
+            loading = q.isNotEmpty(),
+            books = emptyList(),
+            chapterHits = emptyList(),
+            bodyGroups = emptyList(),
+            bodyScanned = 0,
+            bodyTotal = 0,
+            bodyCurrentTitle = "",
+            bodyDone = true,
+            bodyBookLimitedIds = emptySet(),
+            bodyGlobalLimited = false,
+        )
+        if (q.isEmpty()) {
+            bodyScanJob?.cancel()
+            return
+        }
+        pushHistory(q)
+        searchJob = scope.launch {
+            val books = searchBooks(q, filter)
+            val chapters = searchChapterHits(q, filter)
+            // 本 Job 已被更新的 runSearch 取消时不再写回旧结果
+            currentCoroutineContext().ensureActive()
+            _search.value = _search.value.copy(loading = false, books = books, chapterHits = chapters)
+        }
+        startBodyScan(q, filter, bodyDebounceMs)
+    }
+
+    private fun startBodyScan(q: String, filter: SearchFilter, debounceMs: Long) {
+        bodyScanJob?.cancel()
+        if (q.length < 2 || filter.type == "COMIC") return
+        bodyScanJob = scope.launch {
+            if (debounceMs > 0) delay(debounceMs)
+            currentCoroutineContext().ensureActive()
+            val bodyBooks = searchBooks(q, filter).filter { it.type == "NOVEL" }
+            _search.value = _search.value.copy(
+                bodyScanned = 0,
+                bodyTotal = bodyBooks.size,
+                bodyDone = false,
+                bodyBookLimitedIds = emptySet(),
+                bodyGlobalLimited = false,
+            )
+            searchNovelFullText(bodyBooks, q).collect { event ->
+                when (event) {
+                    is FullTextEvent.BookBatch -> _search.value = _search.value.copy(
+                        bodyGroups = _search.value.bodyGroups + FullTextBookGroup(event.book, event.hits),
+                    )
+
+                    is FullTextEvent.Progress -> _search.value = _search.value.copy(
+                        bodyScanned = event.scanned,
+                        bodyTotal = event.total,
+                        bodyCurrentTitle = event.currentTitle,
+                    )
+
+                    is FullTextEvent.Done -> _search.value = _search.value.copy(
+                        bodyDone = true,
+                        bodyBookLimitedIds = event.bookLimitedIds,
+                        bodyGlobalLimited = event.globalLimited,
+                    )
+                }
+            }
+        }
+    }
+
+    /** 手动停止正文扫描（保留已聚合结果）。 */
+    fun stopBodyScan() {
+        bodyScanJob?.cancel()
+        bodyScanJob = null
+        _search.value = _search.value.copy(bodyDone = true, bodyScanned = 0, bodyTotal = 0)
+    }
+
+    /** 从结果态退回初始态：清结果不清历史/筛选/模板（SSMH clearSearch 同语义）。 */
+    fun clearSearch() {
+        searchJob?.cancel()
+        bodyScanJob?.cancel()
+        _search.value = _search.value.copy(
+            query = "",
+            searched = false,
+            loading = false,
+            books = emptyList(),
+            chapterHits = emptyList(),
+            bodyGroups = emptyList(),
+            bodyScanned = 0,
+            bodyTotal = 0,
+            bodyCurrentTitle = "",
+            bodyDone = true,
+            bodyBookLimitedIds = emptySet(),
+            bodyGlobalLimited = false,
+        )
+    }
+
+    /** 筛选变化：持久化 + 有关键词时立即重跑（正文 0ms 立即重启，范围变了）。 */
+    fun setSearchFilter(filter: SearchFilter) {
+        _search.value = _search.value.copy(filter = filter, activeTemplateId = null)
+        scope.launch {
+            runCatching { settingsRepository.putString(SettingsKeys.SEARCH_FILTER, SearchFilterCodec.encodeFilter(filter)) }
+        }
+        if (_search.value.query.isNotEmpty()) runSearch(_search.value.query, bodyDebounceMs = 0)
+    }
+
+    private fun pushHistory(q: String) {
+        val next = (listOf(q) + _search.value.history.filterNot { it == q }).take(30)
+        _search.value = _search.value.copy(history = next)
+        scope.launch {
+            runCatching { settingsRepository.putString(SettingsKeys.SEARCH_HISTORY, SearchFilterCodec.encodeStrings(next)) }
+        }
+    }
+
+    fun clearSearchHistory() {
+        _search.value = _search.value.copy(history = emptyList())
+        scope.launch {
+            runCatching { settingsRepository.putString(SettingsKeys.SEARCH_HISTORY, SearchFilterCodec.encodeStrings(emptyList())) }
+        }
+    }
+
+    /** 保存模板；达上限返回 false（由 UI 提示）。 */
+    fun saveSearchTemplate(name: String, filter: SearchFilter): Boolean {
+        val current = _search.value.templates
+        if (current.size >= SearchFilterCodec.LIMIT) return false
+        val item = SearchFilterTemplate(
+            id = java.util.UUID.randomUUID().toString(),
+            name = uniqueTemplateName(name.trim().ifBlank { "未命名模板" }, current),
+            filter = filter,
+            createdAt = System.currentTimeMillis(),
+        )
+        val next = listOf(item) + current
+        _search.value = _search.value.copy(templates = next)
+        persistTemplates(next)
+        return true
+    }
+
+    fun renameSearchTemplate(id: String, name: String) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return
+        val others = _search.value.templates.filterNot { it.id == id }
+        val next = _search.value.templates.map { template ->
+            if (template.id == id) template.copy(name = uniqueTemplateName(trimmed, others)) else template
+        }
+        _search.value = _search.value.copy(templates = next)
+        persistTemplates(next)
+    }
+
+    fun deleteSearchTemplate(id: String) {
+        val next = _search.value.templates.filterNot { it.id == id }
+        val activeGone = _search.value.activeTemplateId == id
+        _search.value = _search.value.copy(templates = next, activeTemplateId = if (activeGone) null else _search.value.activeTemplateId)
+        persistTemplates(next)
+    }
+
+    /** 应用模板：更新最近使用并置顶，回写筛选记忆并立即重跑。 */
+    fun applySearchTemplate(id: String): SearchFilter? {
+        val target = _search.value.templates.firstOrNull { it.id == id } ?: return null
+        val updated = target.copy(lastUsedAt = System.currentTimeMillis())
+        val next = listOf(updated) + _search.value.templates.filterNot { it.id == id }
+        _search.value = _search.value.copy(templates = next, filter = target.filter, activeTemplateId = id)
+        persistTemplates(next)
+        scope.launch {
+            runCatching { settingsRepository.putString(SettingsKeys.SEARCH_FILTER, SearchFilterCodec.encodeFilter(target.filter)) }
+        }
+        if (_search.value.query.isNotEmpty()) runSearch(_search.value.query, bodyDebounceMs = 0)
+        return target.filter
+    }
+
+    private fun persistTemplates(list: List<SearchFilterTemplate>) {
+        scope.launch {
+            runCatching { settingsRepository.putString(SettingsKeys.SEARCH_FILTER_TEMPLATES, SearchFilterCodec.encodeList(list)) }
+        }
+    }
+
+    private fun uniqueTemplateName(base: String, existing: List<SearchFilterTemplate>): String {
+        if (existing.none { it.name == base }) return base
+        var index = 2
+        while (existing.any { it.name == "$base $index" }) index++
+        return "$base $index"
+    }
+
+    private suspend fun restoreSearchSession() {
+        runCatching {
+            val prefs = settingsRepository.snapshotPreferences()
+            _search.value = _search.value.copy(
+                history = SearchFilterCodec.decodeStrings(
+                    settingsRepository.stringOf(prefs, SettingsKeys.SEARCH_HISTORY, ""),
+                ),
+                filter = SearchFilterCodec.decodeFilter(
+                    settingsRepository.stringOf(prefs, SettingsKeys.SEARCH_FILTER, ""),
+                ) ?: SearchFilter(),
+                templates = SearchFilterCodec.decodeList(
+                    settingsRepository.stringOf(prefs, SettingsKeys.SEARCH_FILTER_TEMPLATES, ""),
+                ),
+            )
+        }
+    }
 
     suspend fun novelProgress(bookId: String): NovelProgressRecord? = withContext(Dispatchers.IO) {
         db.queryNovelProgress(bookId)
@@ -352,6 +796,7 @@ class LibraryRepository(private val context: Context) {
         scope.launch {
             db.saveNovelProgress(bookId, chapterIndex, charOffset)
             db.saveProgress(bookId, chapterIndex, overallPercent)
+            syncOnProgressSaved?.invoke()
         }
     }
 
@@ -362,6 +807,7 @@ class LibraryRepository(private val context: Context) {
     fun saveProgress(bookId: String, page: Int, percent: Double) {
         scope.launch {
             db.saveProgress(bookId, page, percent)
+            syncOnProgressSaved?.invoke()
         }
     }
 
@@ -618,6 +1064,7 @@ class LibraryRepository(private val context: Context) {
             }
             val covers = db.deleteBooks(ids)
             cleanupBookFiles(ids, covers)
+            syncOnBooksPurged?.invoke(ids)
             reload()
             _notice.value = when {
                 deleteFiles && filesFailed == 0 && filesDeleted > 0 -> "已删除 ${ids.size} 本（含源文件）"
@@ -712,7 +1159,8 @@ class LibraryRepository(private val context: Context) {
             _books.value = db.queryBooks()
             _categories.value = db.queryCategories()
             _categoryBookIds.value = db.queryCategoryBookIds()
-            db.purgeExpiredTrash()
+            val purged = db.purgeExpiredTrash()
+            if (purged.isNotEmpty()) syncOnBooksPurged?.invoke(purged)
             _readingStats.value = db.queryReadingStats()
             _readingHistory.value = db.queryReadingHistory()
             _libraries.value = db.queryLibraries()

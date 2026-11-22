@@ -9,11 +9,13 @@ import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextIndent
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.inkvol.app.data.model.BookRecord
 import com.inkvol.app.data.model.NovelChapterRecord
 import com.inkvol.app.data.model.NovelFontRecord
@@ -33,6 +35,9 @@ class NovelOpenSession(
     val firstPageBitmap: ImageBitmap,
     /** 生成 firstPagination 时的分页宽度（双页=半页宽）；Reader 用于缓存命中校验。 */
     val paginationWidthPx: Int,
+    /** M7 搜索定位：章内字符偏移（>=0 时 Reader 显示一次性临时高亮）。 */
+    val locateChar: Int = -1,
+    val locateLen: Int = 0,
 )
 
 /** 双页中缝宽度：分页预算与 spread 渲染/快照共用同一常量，保证排版一致。 */
@@ -52,6 +57,8 @@ internal object NovelPageSnapshot {
         startPadPx: Float,
         endPadPx: Float,
         topPadPx: Float,
+        /** 底部留白（与阅读器 bottomPadDp 同源）：配合 contentHeightPx 把分页余数平分上下，快照与实际页面首行位置一致。 */
+        bottomPadPx: Float = 0f,
         secondPage: NovelTextPage? = null,
         /** 双页时每半页宽（与分页预算同源取整）；<=0 或无 secondPage 时按单页渲染。 */
         halfWidthPx: Int = 0,
@@ -72,11 +79,22 @@ internal object NovelPageSnapshot {
             if (page == null) return@draw
 
             fun drawColumn(target: NovelTextPage, x: Float, contentWidth: Int) {
-                var top = topPadPx
+                // 渲染余数平分上下（与 NovelPageContent 同口径）：页高 - 内容高的余数一半垫到首行上方。
+                val remPx = (
+                    height - topPadPx.roundToInt() - bottomPadPx.roundToInt() -
+                        target.contentHeightPx
+                    ).coerceAtLeast(0)
+                var top = topPadPx + remPx / 2f
                 target.slices.forEachIndexed { index, slice ->
                     val layout = textMeasurer.measure(
                         text = AnnotatedString(slice.text),
-                        style = novelTextStyle(prefs, theme, fontFamily),
+                        // M6.4-K：续片快照同样去首行缩进，与分页/阅读器渲染口径一致。
+                        style = if (slice.isBlockStart) {
+                            novelTextStyle(prefs, theme, fontFamily)
+                        } else {
+                            novelTextStyle(prefs, theme, fontFamily)
+                                .copy(textIndent = TextIndent(firstLine = 0.sp))
+                        },
                         constraints = Constraints(maxWidth = contentWidth),
                     )
                     drawText(

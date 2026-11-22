@@ -49,11 +49,17 @@ class SingleFileImporter(
         val title = displayName.substringBeforeLast('.')
 
         if (SourceRules.isNovelName(displayName)) {
-            val isEpub = SourceRules.extensionOf(displayName) == "epub"
+            val ext = SourceRules.extensionOf(displayName)
+            val isEpub = ext == "epub"
+            val isMobi = ext == "mobi"
             val parsedChapters: List<com.inkvol.app.data.model.NovelChapterRecord>
             val parsedCoverPath: String?
             if (isEpub) {
                 val parsed = EpubParser.parse(context, fingerprint, local)
+                parsedChapters = parsed.chapters
+                parsedCoverPath = parsed.coverPath
+            } else if (isMobi) {
+                val parsed = MobiParser.parse(context, fingerprint, local)
                 parsedChapters = parsed.chapters
                 parsedCoverPath = parsed.coverPath
             } else {
@@ -63,7 +69,11 @@ class SingleFileImporter(
                 parsedChapters = parsed.chapters
                 parsedCoverPath = null
             }
-            val format = if (isEpub) "EPUB" else "TXT"
+            val format = when {
+                isEpub -> "EPUB"
+                isMobi -> "MOBI"
+                else -> "TXT"
+            }
             val coverPath = parsedCoverPath
                 ?: NovelCoverGenerator.save(context, fingerprint, title, parsedChapters.size)
             val book = BookRecord(
@@ -104,6 +114,90 @@ class SingleFileImporter(
             coverPath = probe.coverPath,
             addedAt = System.currentTimeMillis(),
             docId = uri.toString(),
+            displayPath = displayName,
+        )
+        db.upsertBook(book, folderId)
+        return@withContext book
+    }
+
+    /**
+     * M4.5 文件同步下载导入：文件已由调用方持久化在 filesDir/library/（docId=file://）。
+     * 指纹校验去重；书架已存在时抛 AlreadyExistsException 由调用方忽略。
+     */
+    suspend fun importLocalFile(file: File, displayName: String): BookRecord = withContext(Dispatchers.IO) {
+        val size = file.length()
+        if (size <= 0) throw UnsupportedException("文件为空")
+        val fingerprint = Fingerprint.ofArchive(size) { file.inputStream() }
+        if (db.hasBook(fingerprint)) throw AlreadyExistsException()
+
+        val libraryId = db.findOrCreateLibrary(SINGLE_LIBRARY_URI, "单文件导入")
+        val folderId = db.findOrCreateFolder(libraryId, SINGLE_LIBRARY_URI, "单文件导入")
+        val title = displayName.substringBeforeLast('.')
+
+        if (SourceRules.isNovelName(displayName)) {
+            val ext = SourceRules.extensionOf(displayName)
+            val isEpub = ext == "epub"
+            val isMobi = ext == "mobi"
+            val parsedChapters: List<com.inkvol.app.data.model.NovelChapterRecord>
+            val parsedCoverPath: String?
+            if (isEpub) {
+                val parsed = EpubParser.parse(context, fingerprint, file)
+                parsedChapters = parsed.chapters
+                parsedCoverPath = parsed.coverPath
+            } else if (isMobi) {
+                val parsed = MobiParser.parse(context, fingerprint, file)
+                parsedChapters = parsed.chapters
+                parsedCoverPath = parsed.coverPath
+            } else {
+                val parsed = TxtNovelParser.parse(context, fingerprint, file.inputStream())
+                parsedChapters = parsed.chapters
+                parsedCoverPath = null
+            }
+            val format = when {
+                isEpub -> "EPUB"
+                isMobi -> "MOBI"
+                else -> "TXT"
+            }
+            val coverPath = parsedCoverPath
+                ?: NovelCoverGenerator.save(context, fingerprint, title, parsedChapters.size)
+            val book = BookRecord(
+                id = fingerprint,
+                type = "NOVEL",
+                title = title,
+                series = "单文件导入",
+                volume = null,
+                writer = null,
+                tags = null,
+                pageCount = parsedChapters.size,
+                format = format,
+                fileSize = size,
+                coverPath = coverPath,
+                addedAt = System.currentTimeMillis(),
+                docId = Uri.fromFile(file).toString(),
+                displayPath = displayName,
+            )
+            db.upsertBook(book, folderId)
+            db.replaceNovelChapters(fingerprint, parsedChapters)
+            return@withContext book
+        }
+
+        val probe = ArchiveProber(context).probe(file, fingerprint)
+            ?: throw UnsupportedException("暂不支持这种格式")
+
+        val book = BookRecord(
+            id = fingerprint,
+            type = "COMIC",
+            title = probe.meta?.title ?: title,
+            series = "单文件导入",
+            volume = probe.meta?.volume,
+            writer = probe.meta?.writer,
+            tags = probe.meta?.tags,
+            pageCount = probe.pageCount,
+            format = probe.format,
+            fileSize = size,
+            coverPath = probe.coverPath,
+            addedAt = System.currentTimeMillis(),
+            docId = Uri.fromFile(file).toString(),
             displayPath = displayName,
         )
         db.upsertBook(book, folderId)

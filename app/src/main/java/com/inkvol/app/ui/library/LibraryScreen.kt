@@ -4,18 +4,29 @@ import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -25,9 +36,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsIgnoringVisibility
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -55,6 +68,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CreateNewFolder
@@ -73,7 +87,10 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -83,10 +100,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -102,10 +122,13 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
@@ -119,7 +142,9 @@ import com.inkvol.app.data.settings.SettingsRepository
 import com.inkvol.app.ui.components.LocalGlassNotice
 import com.inkvol.app.ui.components.LocalPageOverlayController
 import com.inkvol.app.ui.components.LocalReaderOpenController
+import com.inkvol.app.ui.components.LibraryDetailScroll
 import com.inkvol.app.ui.components.LibraryGridScroll
+import com.inkvol.app.ui.components.LibraryPullRefresh
 import com.inkvol.app.ui.components.LocalScrollToTop
 import com.inkvol.app.ui.components.ReaderOpenPhase
 import com.inkvol.app.ui.components.ReaderOpenRect
@@ -133,6 +158,8 @@ import com.inkvol.app.ui.components.glass.GlassOverlay
 import com.inkvol.app.ui.components.glass.GlassOverlayMotion
 import com.inkvol.app.ui.components.glass.GlassOverlayPresence
 import com.inkvol.app.ui.components.glass.PlusMenuOverlay
+import com.inkvol.app.ui.components.glass.FolderSortMenuOverlay
+import com.inkvol.app.ui.components.glass.SortMenuOverlay
 import com.inkvol.app.ui.components.glass.GlassRounded
 import com.inkvol.app.ui.components.glass.GlassTier
 import com.inkvol.app.ui.components.glass.LocalGlassChrome
@@ -150,13 +177,14 @@ import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
 private val CATEGORY_COLORS = listOf(
     "#C8462F", "#4CAF7D", "#6C8CFF", "#E0A33E", "#9B59B6", "#5F6368",
 )
 
-private sealed interface LibraryTarget {
+internal sealed interface LibraryTarget {
     data class User(val id: Long, val name: String, val color: String) : LibraryTarget
     data class System(val kind: SystemCategory) : LibraryTarget
     data class Series(val name: String) : LibraryTarget
@@ -167,10 +195,139 @@ private sealed interface LibraryTarget {
  * 表现为「二级页/漫画小说筛选被重置回一级/全部」。这里与 LibraryGridScroll 同范式：
  * 离页时在 onDispose 落值，进书架首帧直读恢复；显式返回（回一级/点回「全部」）
  * 自然落 null，进程被杀后重开也归零回一级，不做磁盘持久化。
+ * target 是 mutableStateOf：宿主（InkvolApp）在组合内读它做侧栏排序菜单分流
+ * （书夹一级 vs 二级页弹不同菜单），必须可观察才能即时跟随二级页打开/关闭。
  */
-private object LibraryUiState {
-    var target: LibraryTarget? = null
+internal object LibraryUiState {
+    var target: LibraryTarget? by mutableStateOf(null)
     var typeFilter: String? = null
+}
+
+/**
+ * 分类档位顺序（与头部 chips 的 全部→漫画→小说 排列一致）。
+ * ① 三档网格状态 map 的键序；② 分类切换滑动动画的方向判定：
+ * 目标 index 更大 = 向前 = 新页从右滑入（与 Tab / 二级页转场同语言）。
+ */
+private val libraryTypeOrder = listOf<String?>(null, "COMIC", "NOVEL")
+
+/**
+ * 视图档位顺序（与 viewHeader chips 的 书夹→系列→平铺 排列一致）。
+ * ① 视图×分类状态 map 的键序；② 视图切换滑动动画的方向判定：
+ * 目标 index 更大 = 向前 = 新页从右滑入（与分类切换同语言）。
+ */
+private val libraryViewOrder = listOf(
+    SettingsKeys.VIEW_FOLDER,
+    SettingsKeys.VIEW_SERIES,
+    SettingsKeys.VIEW_FLAT,
+)
+
+/**
+ * 二级页（书夹 / 系列 / 智能书夹）的稳定键：
+ * ① 进程级滚动位置的保存/命中判据（LibraryDetailScroll.key）；
+ * ② 「当前活跃网格」与头部重置键的组成部分。
+ */
+private fun targetKeyOf(target: LibraryTarget?): String? = when (target) {
+    null -> null
+    is LibraryTarget.User -> "user:${target.id}"
+    is LibraryTarget.System -> "system:${target.kind.name}"
+    is LibraryTarget.Series -> "series:${target.name}"
+}
+
+/** 二级页标题行高度（48 的返回/排序按钮行 + 8 与网格的间距）：计入头部内容高。 */
+private val DETAIL_TITLE_ROW_HEIGHT = 56.dp
+
+/**
+ * 一镜到底返回：把网格落回保存位置。
+ *
+ * 两段式（与 §9.13/§9.14 的定案一致）：
+ * ① 立即派发 + 逐帧重申（≤40 帧）——新组装的 LazyGrid 最初几个测量帧会把锚点重置回
+ *    (0,0)，单次 scrollToItem 会被下一次测量冲掉；
+ * ② 等 totalItemsCount 连续两帧稳定后再落位一次——返回后数据会二次生长（5→16），
+ *    早于数据稳定的落位会被重构顶回顶部。
+ *
+ * 落位判定用「目标 item 的纵向位置 ≈ 目标 offset」而不是「目标 item 在视口内」：
+ * 后者在目标靠近顶部（返回时数据从顶部开始渲染）时常真，导致重申被立即 break、
+ * 首测量帧的 (0,0) 不被纠正——chips/视图切换后的组合踩这条最明显。
+ */
+private suspend fun restoreGridPosition(
+    state: LazyGridState,
+    index: Int,
+    offset: Int,
+    tag: String,
+) {
+    if (index <= 0 && offset <= 0) return
+    // 兜底：网格尚未 attach（如二级页内容还没测量）时 scrollToItem 会挂起等布局，
+    // 不能让恢复流程卡死——settled 不置位会让状态栏控制被永久挂起、卡片回报被忽略。
+    // 正常路径两段各 ≤40 帧（约 1.3s），3s 只兜底异常。
+    withTimeoutOrNull(3000L) { restoreGridPositionImpl(state, index, offset, tag) }
+        ?: Log.d("InkvolOpen", "diag restore $tag timeout")
+}
+
+private suspend fun restoreGridPositionImpl(
+    state: LazyGridState,
+    index: Int,
+    offset: Int,
+    tag: String,
+) {
+    fun landed(): Boolean {
+        val info = state.layoutInfo
+        if (info.totalItemsCount <= index) return false
+        if (state.firstVisibleItemIndex == index &&
+            state.firstVisibleItemScrollOffset == offset
+        ) {
+            return true
+        }
+        val item = info.visibleItemsInfo.firstOrNull { it.index == index } ?: return false
+        // LazyGridItemInfo.offset 是 IntOffset（本版本 API），取纵向分量比较
+        return kotlin.math.abs(item.offset.y + offset) <= 2
+    }
+    Log.d("InkvolOpen", "diag restore $tag start target=($index,$offset)")
+    runCatching { state.scrollToItem(index, offset) }
+    var reassertFrames = 0
+    while (reassertFrames < 40) {
+        if (landed()) break
+        runCatching { state.scrollToItem(index, offset) }
+        delay(16)
+        reassertFrames++
+    }
+    var prevCount = -1
+    var stable = 0
+    var attempts = 0
+    while (attempts < 40) {
+        val count = state.layoutInfo.totalItemsCount
+        if (count == prevCount) {
+            stable++
+        } else {
+            stable = 0
+            prevCount = count
+        }
+        if (stable >= 2 && count > index) break
+        delay(16)
+        attempts++
+    }
+    if (state.layoutInfo.totalItemsCount > index) {
+        runCatching { state.scrollToItem(index, offset) }
+    }
+    Log.d(
+        "InkvolOpen",
+        "diag restore $tag done frames=$reassertFrames attempts=$attempts " +
+            "grid=(${state.firstVisibleItemIndex},${state.firstVisibleItemScrollOffset}) " +
+            "count=${state.layoutInfo.totalItemsCount}",
+    )
+}
+
+/**
+ * 视图行在网格滚动中的纵向位移（px，正数 = 向上移出）。
+ * 网格 item 0 是行高占位：index 0 时按滚动偏移跟手，滚过 item 0 即完全移出。
+ * 只应在 graphicsLayer 的 draw 阶段调用（读网格状态不触发重组）。
+ */
+private fun viewHeaderScrollPx(state: LazyGridState, headerHeightPx: Float): Float {
+    if (headerHeightPx <= 0f) return 0f
+    return if (state.firstVisibleItemIndex > 0) {
+        headerHeightPx
+    } else {
+        state.firstVisibleItemScrollOffset.toFloat().coerceIn(0f, headerHeightPx)
+    }
 }
 
 /** 卡片拖拽排序的瞬时状态；baseBounds 在拖拽开始时快照，避免移动中的卡片反馈干扰目标计算。 */
@@ -198,23 +355,22 @@ private fun DragSortState.withDrag(amount: Offset): DragSortState {
     return copy(offset = nextOffset, targetId = targetId)
 }
 
-private fun List<Long>.movedIds(fromId: Long, toId: Long): List<Long> {
-    val from = indexOf(fromId)
-    val to = indexOf(toId)
-    if (from < 0 || to < 0 || from == to) return this
-    return toMutableList().apply {
-        add(to, removeAt(from))
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(
+    ExperimentalFoundationApi::class,
+    ExperimentalMaterial3Api::class,
+    ExperimentalLayoutApi::class,
+)
 @Composable
 fun LibraryScreen(
     settingsRepository: SettingsRepository,
     libraryRepository: LibraryRepository,
+    // M4.5 同步（删除确认卡的同步范围提示）
+    syncRepository: com.inkvol.app.data.sync.SyncRepository? = null,
     /** 平板完整侧栏已有导入入口时，标题行不再重复加号 */
     showHeaderImport: Boolean = true,
     onOpenBook: (BookRecord, ReaderOpenRect?) -> Unit = { _, _ -> },
+    /** 加号菜单 → 书库管理（路由 library-manager，与设置页入口同款） */
+    onOpenLibraryManager: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val chrome = LocalGlassChrome.current
@@ -225,12 +381,71 @@ fun LibraryScreen(
     // 生长覆盖成 (0,0)，且折叠状态机会被这个假位置翻成展开再折叠）。改用进程级
     // LibraryGridScroll 直接构造：每次进入书架（含一镜到底返回）首帧就持有保存的
     // 滚动位置，折叠状态机首采样即正确；进程被杀后重开自然回顶。
-    val gridState = remember {
-        LazyGridState(
-            firstVisibleItemIndex = LibraryGridScroll.index,
-            firstVisibleItemScrollOffset = LibraryGridScroll.offset,
-        )
+    // 进入书架时的视图档（prefs 同步快照，与 map 键生成 / 一镜到底锚点恢复同源；
+    // "booklist" 旧值回落书夹视图）。remember 钉死一次，避免 prefs 异步加载后漂移。
+    val initialViewMode = remember {
+        settingsRepository.cachedPreferences()?.let {
+            val stored = settingsRepository.stringOf(it, SettingsKeys.LIBRARY_VIEW, SettingsKeys.VIEW_FOLDER)
+            if (stored == "booklist") SettingsKeys.VIEW_FOLDER else stored
+        } ?: SettingsKeys.VIEW_FOLDER
     }
+    // 视图（书夹/系列/平铺）× 分类（全部/漫画/小说）共 9 个组合各自持有独立
+    // LazyGridState：
+    // ① 视图/分类切换动画期间新旧两页并存（AnimatedContent），共用一个状态会触发
+    //   已知的「滚动位置串味」（二级页 targetGridState 同款教训）；
+    // ② 每个组合记住自己的滚动位置，切回时原位恢复（导航 Tab 同语义）。
+    // 恢复目标组合 = 离开书架时记录的「事实」（LibraryGridScroll.viewMode/typeFilter），
+    // 进程刚启动（holder 为 null）才回落到 prefs 快照 + LibraryUiState.typeFilter。
+    // 之前用「进书架时的 prefs 快照」反推：只要与离开时的实时值不同源（prefs 首帧为
+    // null / 书架内切过视图），带保存值的就是另一个组合，显示的那页从 (0,0) 开始、
+    // 恢复 effect 还作用在未组合的网格上（settled 卡住）——chips/视图切换后的回顶源头。
+    val restoreViewMode = remember { LibraryGridScroll.viewMode ?: initialViewMode }
+    val restoreTypeFilter = remember {
+        if (LibraryGridScroll.viewMode != null) {
+            LibraryGridScroll.typeFilter
+        } else {
+            LibraryUiState.typeFilter
+        }
+    }
+    val gridStates = remember {
+        buildMap<Pair<String, String?>, LazyGridState> {
+            for (vm in libraryViewOrder) {
+                for (tf in libraryTypeOrder) {
+                    put(
+                        vm to tf,
+                        if (vm == restoreViewMode && tf == restoreTypeFilter) {
+                            LazyGridState(
+                                firstVisibleItemIndex = LibraryGridScroll.index,
+                                firstVisibleItemScrollOffset = LibraryGridScroll.offset,
+                            )
+                        } else {
+                            LazyGridState()
+                        },
+                    )
+                }
+            }
+        }
+    }
+    // 二级页网格：每个 target 一个实例（普通 HashMap，非响应式——实例不需要触发重组）。
+    // 放在顶层按需创建而不是内容 lambda 里的 remember(t)：① 头部状态机与恢复逻辑要按
+    // 「当前显示的网格」取状态，必须能在顶层拿到；② AnimatedContent 退场页按旧 t 仍取到
+    // 旧实例，不会当场回顶；③ 初值直接吃 LibraryDetailScroll（一镜到底返回恢复位置）。
+    val detailStates = remember { HashMap<String, LazyGridState>() }
+    fun detailStateOf(t: LibraryTarget): LazyGridState =
+        detailStates.getOrPut(targetKeyOf(t).orEmpty()) {
+            val saved = LibraryDetailScroll.takeIf { it.key == targetKeyOf(t) }
+            if (saved != null) {
+                LazyGridState(saved.index, saved.offset)
+            } else {
+                LazyGridState()
+            }
+        }
+    // 二级页 target 提前声明：头部折叠/标题行/恢复都要按当前页面取网格。
+    var target by remember { mutableStateOf(LibraryUiState.target) }
+    // 分类筛选：与 LibraryUiState.typeFilter 同源的本地快照态（chips 写入）。
+    // 声明位置必须在 gridStates 之后、各消费点之前——头部状态机 / 恢复 /
+    // 回顶 / 离页保存都按「当前组合」取状态。
+    var typeFilter by remember { mutableStateOf(LibraryUiState.typeFilter) }
     val configuration = LocalConfiguration.current
     // 网格回报稳定信号（B 层）：Closing 期间卡片回报 sourceRect 只有在网格落位
     // 稳定后才可信——恢复期的数据生长与逐帧重申会让卡片上报瞬态坐标（§9.16 的
@@ -243,31 +458,89 @@ fun LibraryScreen(
         drawContent()
     })
 
-    // 一镜到底返回：网格滚动位置恢复。
-    // 返回后网格 item 数会先少后多（诊断见 5→16 生长），首帧/异步补滚都会被这次
-    // 数据重构顶回 index 0。所以这里等 item 数连续两帧稳定、且足以容纳目标 index
-    // 之后再 scrollToItem，落在数据生长结束后，才不会被重构顶掉。
+    // 一镜到底返回：网格滚动位置恢复（一级 / 二级同一套两段式落位）。
+    // 返回后 item 数会先少后多（诊断见 5→16 生长），首帧/异步补滚都会被这次数据重构
+    // 顶回 index 0：所以等 item 数连续两帧稳定、且足以容纳目标 index 之后再落位。
+    // 恢复目标是「当前真正显示的网格」：二级页返回时一级网格根本没组合，对它
+    // scrollToItem 既无效、又会把 settled 拖到 ~1.28s 之后（宿主起飞闸 800ms）。
     LaunchedEffect(Unit) {
         val savedLandscape = LibraryGridScroll.landscape
         val landscapeNow = configuration.screenWidthDp > configuration.screenHeightDp
         val crossOrientation = savedLandscape != null && savedLandscape != landscapeNow
+        val detailTarget = LibraryUiState.target
+        if (detailTarget != null) {
+            // ---- 二级页（书夹 / 系列 / 智能书夹）----
+            var index = LibraryDetailScroll.index
+            var offset = LibraryDetailScroll.offset
+            if (crossOrientation) {
+                // 跨方向：index 是线性序号仍有效；offset 是旧方向像素语义 → 归零；
+                // 锚点优先，保证返回动画的飞回目标卡在新方向视口内、能回报坐标。
+                val snapshot = settingsRepository.cachedPreferences()
+                // 二级页排序与一级书架共用全局档（全 App 一份排序，SSMH 同款）
+                val restoreSortMode = snapshot?.let {
+                    settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT, SettingsKeys.SORT_RECENT)
+                } ?: SettingsKeys.SORT_RECENT
+                val restoreSortDescending = snapshot?.let {
+                    settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT_DESC, "1")
+                } != "0"
+                index = LibraryGridScroll.anchorBookId?.let { anchorId ->
+                    sortBooks(
+                        booksOf(
+                            detailTarget,
+                            libraryRepository.books.value,
+                            libraryRepository.categoryBookIds.value,
+                        ),
+                        restoreSortMode,
+                        restoreSortDescending,
+                    ).indexOfFirst { it.id == anchorId }.takeIf { it >= 0 }
+                } ?: LibraryDetailScroll.index
+                offset = 0
+            }
+            restoreGridPosition(detailStateOf(detailTarget), index, offset, "detail")
+            // 恢复完成：放行卡片回报（onGloballyPositioned 只在位置变化时回调，
+            // 落位后不再有回调，卡片会在 settled 翻转时用最后已知位置补发一次）。
+            gridSettled = true
+            Log.d("InkvolOpen", "diag restore gridSettled=true (detail)")
+            return@LaunchedEffect
+        }
+        // ---- 一级书架（视图 × 分类组合）----
+        val restoreState = gridStates.getValue(restoreViewMode to restoreTypeFilter)
         var index = LibraryGridScroll.index
         var offset = LibraryGridScroll.offset
         if (crossOrientation) {
             // 跨方向恢复（阅读期间旋转过再返回）：index 是线性序号仍然有效，
             // offset 是旧方向的像素语义、直接用会落错位置。锚点优先——定位到
             // 最近打开的书（返回动画的飞回目标），保证目标卡在视口内、能回报
-            // 新方向下的正确坐标；flat 视图网格 = viewHeader(item 0) + books。
+            // 新方向下的正确坐标；flat 视图网格 = 视图行占位(item 0) + books。
             // 查不到（书夹/系列视图、书已删、数据未到）退回原 index。
-            // viewMode 用 cachedPreferences 同步快照求值（组合状态在 effect 之后
-            // 才声明，且首帧即实际值）；"booklist" 旧值回落书夹视图。
-            val viewModeNow = settingsRepository.cachedPreferences()?.let {
-                val stored = settingsRepository.stringOf(it, SettingsKeys.LIBRARY_VIEW, SettingsKeys.VIEW_FOLDER)
-                if (stored == "booklist") SettingsKeys.VIEW_FOLDER else stored
-            } ?: SettingsKeys.VIEW_FOLDER
+            // 视图档用 restoreViewMode（离开书架时记录的组合，与网格初值同源）。
             index = LibraryGridScroll.anchorBookId?.let { anchorId ->
-                if (LibraryUiState.target == null && viewModeNow == SettingsKeys.VIEW_FLAT) {
-                    libraryRepository.books.value
+                if (restoreViewMode == SettingsKeys.VIEW_FLAT) {
+                    // 分类档下网格是过滤+排序后的列表，index 必须在同一序列上求值，
+                    // 否则会定位到错误的书（排序改动后网格顺序 ≠ SQL 顺序）。
+                    // flat 网格 item 0 = 视图行等高占位，books 从 item 1 起，
+                    // 需 +1 补偿（与网格结构同步）。
+                    // 排序档走 cachedPreferences 同步快照（initialViewMode 同款模式）：
+                    // 本 effect 只在进入书架首帧跑，快照值与网格首帧渲染档位同源，
+                    // 且不依赖下方才声明的 prefs 响应值。
+                    val snapshot = settingsRepository.cachedPreferences()
+                    val restoreSortMode = snapshot?.let {
+                        settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT, SettingsKeys.SORT_RECENT)
+                    } ?: SettingsKeys.SORT_RECENT
+                    val restoreSortDescending = snapshot?.let {
+                        settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT_DESC, "1")
+                    } != "0"
+                    val sourceBooks = sortBooks(
+                        when (restoreTypeFilter) {
+                            null -> libraryRepository.books.value
+                            else -> libraryRepository.books.value.filter {
+                                it.type == restoreTypeFilter
+                            }
+                        },
+                        restoreSortMode,
+                        restoreSortDescending,
+                    )
+                    sourceBooks
                         .indexOfFirst { it.id == anchorId }
                         .takeIf { it >= 0 }
                         ?.plus(1)
@@ -277,88 +550,12 @@ fun LibraryScreen(
             } ?: LibraryGridScroll.index
             offset = 0
         }
-        Log.d(
-            "InkvolOpen",
-            "diag restore start target=($index,$offset) cross=$crossOrientation " +
-                "grid=(${gridState.firstVisibleItemIndex},${gridState.firstVisibleItemScrollOffset}) " +
-                "count=${gridState.layoutInfo.totalItemsCount}",
-        )
-        if (index > 0 || offset > 0) {
-            // 立即派发 + 逐帧重申：新组装的 LazyGrid 在最初几个测量帧（视口未定、
-            // 数据未齐、条目高度未就绪）会把任何锚点重置回 (0,0)，内容先画在列表
-            // 顶部、稳定后才拉回——可见的瞬间跳动。逐帧检查并重申，布局一旦可绘制
-            // 就落在保存位置。落位判定按「目标 item 已在视口内」而非 firstVisible
-            // 精确相等：Adaptive 列数下目标可能与行首 item 同行，scrollToItem 按行
-            // 落位、firstVisibleItemIndex 停在行首（实测横屏一排 5 本时 scrollToItem(4)
-            // 落 (1,0)，视觉已正确）——精确比较会白耗 40 帧、拖慢 settled 与
-            // 「旋转后返回」的起飞闸。
-            runCatching { gridState.scrollToItem(index, offset) }
-            var reassertFrames = 0
-            while (reassertFrames < 40) {
-                val targetVisible = gridState.layoutInfo.visibleItemsInfo.any { it.index == index }
-                if (targetVisible) break
-                runCatching { gridState.scrollToItem(index, offset) }
-                delay(16)
-                reassertFrames++
-            }
-            Log.d(
-                "InkvolOpen",
-                "diag restore settled frames=$reassertFrames " +
-                    "grid=(${gridState.firstVisibleItemIndex},${gridState.firstVisibleItemScrollOffset})",
-            )
-            var prevCount = -1
-            var stable = 0
-            var attempts = 0
-            while (attempts < 40) {  // 最多约 40 帧（~640ms）等待稳定
-                val count = gridState.layoutInfo.totalItemsCount
-                if (count == prevCount) {
-                    stable++
-                } else {
-                    stable = 0
-                    prevCount = count
-                }
-                if (stable >= 2 && count > index) break
-                delay(16)
-                attempts++
-            }
-            Log.d(
-                "InkvolOpen",
-                "diag restore pre-scroll attempts=$attempts " +
-                    "grid=(${gridState.firstVisibleItemIndex},${gridState.firstVisibleItemScrollOffset}) " +
-                    "count=${gridState.layoutInfo.totalItemsCount}",
-            )
-            if (gridState.layoutInfo.totalItemsCount > index) {
-                gridState.scrollToItem(index, offset)
-                Log.d(
-                    "InkvolOpen",
-                    "diag restore post-scroll " +
-                        "grid=(${gridState.firstVisibleItemIndex},${gridState.firstVisibleItemScrollOffset})",
-                )
-            }
-        }
+        restoreGridPosition(restoreState, index, offset, "grid")
         // 恢复完成：放行卡片回报（onGloballyPositioned 只在位置变化时回调，
         // 落位后不再有回调，卡片会在 settled 翻转时用最后已知位置补发一次，
         // 保证「旋转后返回」的起飞闸能收到首条可信坐标）。
         gridSettled = true
         Log.d("InkvolOpen", "diag restore gridSettled=true")
-    }
-
-    // 离开书架（进阅读器）时记下滚动位置，供下次进入恢复。
-    DisposableEffect(Unit) {
-        onDispose {
-            LibraryGridScroll.index = gridState.firstVisibleItemIndex
-            LibraryGridScroll.offset = gridState.firstVisibleItemScrollOffset
-            // 记录离开时的方向：下次进入若方向不同（阅读期间旋转过再返回），
-            // 恢复逻辑走跨方向路径（index 保留、offset 归零 + 锚点校准）。
-            // 方向用网格视口的实际宽高判断，不能读 onDispose 闭包捕获的
-            // configuration——DisposableEffect(Unit) 只在首次组合安装，旋转
-            // 重组不重装，闭包里的方向永远是首帧值（实测横屏打开存了 false）。
-            // M6.3：此处曾打 Log.d，实测主线程卡在 logd 写入 21.5s 引发 ANR，
-            // 关键路径的日志已全部移除。
-            val viewport = gridState.layoutInfo.viewportSize
-            LibraryGridScroll.landscape =
-                viewport.width > viewport.height && viewport.width > 0
-        }
     }
 
     val books by libraryRepository.books.collectAsStateWithLifecycle()
@@ -380,6 +577,63 @@ fun LibraryScreen(
     val plusAction = prefs?.let {
         settingsRepository.stringOf(it, SettingsKeys.PLUS_ACTION, SettingsKeys.PLUS_ASK)
     } ?: SettingsKeys.PLUS_ASK
+    // 一级书架全局排序（与平板侧栏排序菜单同一持久化真源）：缺省 recent + 降序
+    // = 旧版 SQL ORDER BY added_at DESC 的原样行为，升级/全新安装零感知。
+    val sortMode = prefs?.let {
+        settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT, SettingsKeys.SORT_RECENT)
+    } ?: SettingsKeys.SORT_RECENT
+    val sortDescending = prefs?.let {
+        settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT_DESC, "1")
+    } != "0"
+    // 书夹视图（一级）书夹卡排序：单独记忆（library_folder_sort / _desc），缺省
+    // custom + 升序 = 现状拖拽序 + 名称自然方向，与全局书排序互不影响。
+    val folderSortMode = prefs?.let {
+        settingsRepository.stringOf(it, SettingsKeys.LIBRARY_FOLDER_SORT, SettingsKeys.FOLDER_SORT_CUSTOM)
+    } ?: SettingsKeys.FOLDER_SORT_CUSTOM
+    val folderSortDescending = prefs?.let {
+        settingsRepository.stringOf(it, SettingsKeys.LIBRARY_FOLDER_SORT_DESC, "0")
+    } == "1"
+
+    // 闭包/effect 内读「实时视图档」：viewMode 是普通 val（重组时重建），LaunchedEffect /
+    // onDispose 这类不随重组重启的闭包捕获的是首帧值（切过视图后会陈旧），必须经
+    // rememberUpdatedState 中转；typeFilter 是快照态委托，读到的天然是最新值。
+    val currentViewMode by rememberUpdatedState(viewMode)
+
+    // 离开书架（进阅读器）时记下滚动位置，供下次进入恢复。
+    // 取「当前组合」的状态：currentViewMode/typeFilter 经委托读取，onDispose 时刻
+    // 拿到的是离开前的最新值——与 LibraryUiState.typeFilter 落盘同源，下次进入
+    // 恢复到同一组合。
+    DisposableEffect(Unit) {
+        onDispose {
+            // 一级：位置 + 「离开时的组合」（恢复用事实，不再靠 prefs 快照反推）
+            val leavingState = gridStates.getValue(currentViewMode to typeFilter)
+            LibraryGridScroll.index = leavingState.firstVisibleItemIndex
+            LibraryGridScroll.offset = leavingState.firstVisibleItemScrollOffset
+            LibraryGridScroll.viewMode = currentViewMode
+            LibraryGridScroll.typeFilter = typeFilter
+            // 二级页：同一时刻只有一个存活，位置同样落进进程级 holder
+            //（key 不匹配时不会被采用，保留「退出再进自然回顶」语义）
+            val leavingTarget = target
+            val leavingDetail = leavingTarget?.let {
+                detailStates[targetKeyOf(it).orEmpty()]
+            }
+            if (leavingTarget != null && leavingDetail != null) {
+                LibraryDetailScroll.key = targetKeyOf(leavingTarget)
+                LibraryDetailScroll.index = leavingDetail.firstVisibleItemIndex
+                LibraryDetailScroll.offset = leavingDetail.firstVisibleItemScrollOffset
+            }
+            // 记录离开时的方向：下次进入若方向不同（阅读期间旋转过再返回），
+            // 恢复逻辑走跨方向路径（index 保留、offset 归零 + 锚点校准）。
+            // 方向用网格视口的实际宽高判断，不能读 onDispose 闭包捕获的
+            // configuration——DisposableEffect(Unit) 只在首次组合安装，旋转
+            // 重组不重装，闭包里的方向永远是首帧值（实测横屏打开存了 false）。
+            // M6.3：此处曾打 Log.d，实测主线程卡在 logd 写入 21.5s 引发 ANR，
+            // 关键路径的日志已全部移除。
+            val viewport = leavingState.layoutInfo.viewportSize
+            LibraryGridScroll.landscape =
+                viewport.width > viewport.height && viewport.width > 0
+        }
+    }
 
     // ---- 一镜到底返回：冻结状态栏让位 ----
     // Reader 会隐藏系统栏，返回时 statusBars inset 有 ~250ms 回归动画，实时值会让
@@ -387,51 +641,80 @@ fun LibraryScreen(
     // 系统栏显示时的高度（rememberSaveable 跨路由保存，等于回归完成后的终值），
     // 仅在 Closing 期间使用，其它场景一律实时值，滚动自动隐藏状态栏等既有行为零变化。
     val readerOpenCtl = LocalReaderOpenController.current
-    val liveStatusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    // 冻结值必须取「回归完成后的终值」——用 statusBarsIgnoringVisibility（与显隐无关、
+    // 恒等于显示态高度），不能用实时 statusBars：小说打开时宿主/阅读器会 hide 系统栏，
+    // 0→40 的过渡中间值（实测 0.38 / 0.76dp）会在 Library 卸载前被写进 rememberSaveable，
+    // 下次返回时被当成冻结让位 → 标题先上移一个状态栏高度再回落。
+    val stableStatusBarTop = WindowInsets.statusBarsIgnoringVisibility
+        .asPaddingValues()
+        .calculateTopPadding()
     var savedStatusBarTop by rememberSaveable { mutableStateOf(0f) }
-    LaunchedEffect(liveStatusBarTop.value, readerOpenCtl?.phase) {
-        if (readerOpenCtl?.phase != ReaderOpenPhase.Closing) {
-            savedStatusBarTop = liveStatusBarTop.value
+    LaunchedEffect(stableStatusBarTop.value, readerOpenCtl?.phase) {
+        if (readerOpenCtl?.phase != ReaderOpenPhase.Closing && stableStatusBarTop.value > 0f) {
+            savedStatusBarTop = stableStatusBarTop.value
         }
     }
+    // 阈值 1dp：历史（旧版本/旧会话）可能已经把 0.38 这类过渡值存进 saveable，
+    // 直接当冻结值就是那一次「标题跳到状态栏位置」。
     val frozenStatusBarTop = if (
-        readerOpenCtl?.phase == ReaderOpenPhase.Closing && savedStatusBarTop > 0f
+        readerOpenCtl?.phase == ReaderOpenPhase.Closing && savedStatusBarTop > 1f
     ) {
         savedStatusBarTop.dp
     } else {
         null
     }
+    // 「当前活跃网格」= 当前真正在显示、在滚动的那个网格（一级组合 / 二级页）。
+    // 头部状态机必须绑定它：
+    // ① 二级页上滑才能折叠头部——绑定一级网格时 canScrollForward/Backward 恒 false，
+    //    命中「短内容不折叠」守卫直接放行滚动，头部永远不折；
+    // ② 返回二级页时 atTop 不再读「未组合的一级网格」（恒在顶部 → 状态栏被强制唤出，
+    //    与进书前的隐藏态打架 = 用户看到的「状态栏消失又出现」）。
+    val activeDetailState = target?.let { detailStateOf(it) }
+    val activeGridState = activeDetailState ?: gridStates.getValue(viewMode to typeFilter)
     val headerState = rememberGlassHeaderState(
-        gridState = gridState,
-        resetKey = viewMode,
+        // 切档/进出二级页时实例变化，core 内 remember(stateKey) 会重建滚动连接 / 方向监听。
+        gridState = activeGridState,
+        // resetKey：视图/分类切换、二级页进出都是离散时机，头部滑回展开
+        //（二级页标题行必须在状态栏下方，进页先展开一次）。
+        resetKey = viewMode to typeFilter to targetKeyOf(target),
         frozenStatusBarTop = frozenStatusBarTop,
         closingHold = readerOpenCtl?.phase == ReaderOpenPhase.Closing,
-        // 书夹排上移 10dp：默认 118 的呼吸留白砍 10，历史/设置页用列表版重载不受影响
-        headerContentHeight = 108.dp,
+        // 恢复落位完成前不动系统栏：Closing 只覆盖反向动画那一段，逐帧重申 + 数据
+        // 稳定会延续到 Idle 之后，这期间显隐判定读到的是瞬态位置（先 show 后 hide）。
+        statusBarHold = !gridSettled,
+        // 书夹排上移 10dp：默认 118 的呼吸留白砍 10，历史/设置页用列表版重载不受影响。
+        // 二级页头部多一行标题行（随折叠一起上移、折满整块出屏）。
+        headerContentHeight = 108.dp +
+            if (activeDetailState != null) DETAIL_TITLE_ROW_HEIGHT else 0.dp,
     )
     // 让位量由折叠量单点导出：折叠量与「前置滚动消费」同源，
     // 折叠期间列表不滚、让位收缩多少内容就上移多少（与头部 1:1 同行）。
     val shelfGridTop = headerState.gridTopPadding
 
-    // 回顶（底栏重复点书架）：滚回顶部后把头部滑回展开态，并轻量刷新书库（仅重读数据库，
-    // 书夹二级页与一级网格共用 gridState，回顶自动覆盖）
+    // 回顶（底栏重复点书架）：滚回顶部后把头部滑回展开态，并轻量刷新书库（仅重读数据库）。
+    // collect 闭包读 currentViewMode/typeFilter 最新值：事件落在哪个组合就回哪个组合的顶部。
+    // 回顶事件要落在「当前显示网格」上：LaunchedEffect(Unit) 不随重组重启，
+    // 直接读 activeGridState 会捕获首帧实例（二级页切进来后仍是旧的一级网格）。
+    val currentActiveGrid by rememberUpdatedState(activeGridState)
     LaunchedEffect(Unit) {
         scrollToTop.events.collect {
-            if (gridState.layoutInfo.totalItemsCount > 0) {
-                gridState.animateScrollToItem(0)
+            // 回顶落在当前真正显示的网格上（二级页时是二级页自己的列表）
+            val topState = currentActiveGrid
+            if (topState.layoutInfo.totalItemsCount > 0) {
+                topState.animateScrollToItem(0)
             }
             headerState.expand()
             libraryRepository.refresh()
         }
     }
 
-    var target by remember { mutableStateOf(LibraryUiState.target) }
     var selected by remember { mutableStateOf<Set<String>>(emptySet()) }
     var plusMenuOpen by remember { mutableStateOf(false) }
+    // 手机端排序菜单（标题行排序钮弹出；与加号菜单互斥，开一个关另一个）
+    var sortMenuOpen by remember { mutableStateOf(false) }
     var moveSheetOpen by remember { mutableStateOf(false) }
     var deleteSheetOpen by remember { mutableStateOf(false) }
     var metadataSheetOpen by remember { mutableStateOf(false) }
-    var typeFilter by remember { mutableStateOf(LibraryUiState.typeFilter) }
     // 离开书架（开书/切 Tab 被 NavHost 卸载）时保留二级页与筛选；显式清除（回一级、
     // 点回「全部」）会先写 null，离页时自然落 null。与上面的滚动落值互不干扰。
     DisposableEffect(Unit) {
@@ -440,6 +723,12 @@ fun LibraryScreen(
             LibraryUiState.typeFilter = typeFilter
         }
     }
+    // target 变化实时同步到进程级状态：宿主侧栏排序钮显隐（书夹/系列二级页打开时
+    // 也要显示排序钮，与一级平铺/系列视图同规则）读的是 LibraryUiState.target——
+    // 原先只在 onDispose 落值，二级页打开过程中宿主读到的是离开书架时的陈旧值，
+    // 书夹视图进二级页排序钮恒不出现。实时同步后打开/关闭即时反映，一级书夹视图
+    // （target == null）依旧隐藏；一镜到底恢复链读同一值，离开书架时序不变。
+    LaunchedEffect(target) { LibraryUiState.target = target }
     var editor by remember { mutableStateOf<CategoryEditorState?>(null) }
     val overlayController = LocalPageOverlayController.current
 
@@ -449,7 +738,7 @@ fun LibraryScreen(
     var editorHeld by remember { mutableStateOf<CategoryEditorState?>(null) }
     LaunchedEffect(editor) { editor?.let { editorHeld = it } }
 
-    val overlayActive = plusMenuOpen || editor != null ||
+    val overlayActive = plusMenuOpen || sortMenuOpen || editor != null ||
         moveSheetOpen || deleteSheetOpen || metadataSheetOpen
     // 用 present（含退场）而不是 target：多选条/底栏都要等面板退完再出现
     val overlayShowing = overlayActive || overlayPresence.present
@@ -471,7 +760,9 @@ fun LibraryScreen(
             libraryRepository.clearNotice()
         }
     }
-    LaunchedEffect(target) { selected = emptySet() }
+    LaunchedEffect(target) {
+        selected = emptySet()
+    }
     // 返回书架时校验恢复的二级页仍有效（书夹可能在阅读期间被删除或重扫清空），
     // 失效静默落回一级，不弹提示；System 档按 readStatus 过滤，恒有效。
     LaunchedEffect(target, books, categories) {
@@ -501,7 +792,10 @@ fun LibraryScreen(
             SettingsKeys.PLUS_FOLDER -> folderPicker.launch(null)
             SettingsKeys.PLUS_FILE -> filePicker.launch(arrayOf("*/*"))
             SettingsKeys.PLUS_RESCAN -> libraryRepository.rescanAll()
-            else -> plusMenuOpen = true
+            else -> {
+                sortMenuOpen = false
+                plusMenuOpen = true
+            }
         }
     }
 
@@ -534,9 +828,16 @@ fun LibraryScreen(
         else -> books.filter { it.type == typeFilter }
     }
 
-    val viewHeader: @Composable () -> Unit = {
+    // 视图 chips 行：横向固定（不再是网格 item，转场时不随页左右滑动），纵向由
+    // 当前网格的滚动驱动（覆盖层 translationY，滚过即隐藏——与原 item 0 行为
+    // 逐像素一致）。网格 item 0 保留等高空白占位（headerSpacerHeight）维持滚动
+    // 空间与索引语义（一镜到底锚点 +1 依赖它）。只渲染一份实例，直接读全局
+    // viewMode。行高由 onSizeChanged 测量回填：首帧占位为 0、行会与内容重叠
+    // 一帧（屏幕条目进场时不可见，可接受）。
+    var viewHeaderHeightPx by remember { mutableStateOf(0f) }
+    val viewHeader: @Composable (Modifier) -> Unit = { headerModifier ->
         Row(
-            modifier = Modifier
+            modifier = headerModifier
                 .fillMaxWidth()
                 .padding(top = 2.dp, bottom = 0.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -568,7 +869,30 @@ fun LibraryScreen(
         }
     }
 
+    // ---- 下拉重扫（chrome 形变式，无浮动指示器）----
+    // PullToRefreshBox 只管手势/阈值/触发；视觉反馈在 chrome 上：
+    // 手机 = 本文件玻璃头加号钮「+ ↔ 重扫箭头」形变；平板 = 侧栏刷新钮经
+    // LibraryPullRefresh 共享拉距跟手转。外壳包在折叠连接的外层——手势链
+    // （网格 → headerState.scrollConnection → PullToRefresh → 宿主）保证
+    // 「先展开头部，后蓄力刷新」，两段手势 1:1 跟手互不抢。
+    val pullState = rememberPullToRefreshState()
+    LaunchedEffect(Unit) {
+        snapshotFlow { pullState.distanceFraction }
+            .collect { LibraryPullRefresh.pullFraction = it }
+    }
+    DisposableEffect(Unit) {
+        onDispose { LibraryPullRefresh.pullFraction = 0f }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
+    PullToRefreshBox(
+        isRefreshing = scan.running,
+        onRefresh = { if (!scan.running) libraryRepository.rescanAll() },
+        state = pullState,
+        // chrome 就是指示器，不画浮动转圈
+        indicator = {},
+        modifier = Modifier.fillMaxSize(),
+    ) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -582,109 +906,244 @@ fun LibraryScreen(
                 .padding(start = 20.dp, end = 20.dp + chrome.railEndInset)
                 .padding(top = shelfGridTop),
         ) {
-            val currentTarget = target
-            if (currentTarget != null) {
-                val sortKey = targetSortKey(currentTarget)
-                val sortMode = prefs?.let {
-                    settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT_PREFIX + sortKey, SettingsKeys.SORT_RECENT)
-                } ?: SettingsKeys.SORT_RECENT
-                val targetBooks = sortBooks(
-                    // 分类过滤贯穿二级页：智能/我的/系列都只显示当前漫画/小说筛选下的成员
-                    booksOf(currentTarget, filteredBooks, categoryBookIds),
-                    sortMode,
-                )
-                val emptyBecauseFiltered = typeFilter != null &&
-                    targetBooks.isEmpty() &&
-                    booksOf(currentTarget, books, categoryBookIds).isNotEmpty()
-                val typeLabel = when (typeFilter) {
-                    "COMIC" -> "漫画"
-                    "NOVEL" -> "小说"
-                    else -> null
-                }
-                CategoryContentView(
-                    target = currentTarget,
-                    books = targetBooks,
-                    typeLabel = typeLabel,
-                    emptyBecauseFiltered = emptyBecauseFiltered,
-                    state = gridState,
-                    selected = selected,
-                    sortMode = sortMode,
-                    reportSettled = gridSettled,
-                    onSortChange = { mode ->
-                        scope.launch {
-                            settingsRepository.putString(
-                                SettingsKeys.LIBRARY_SORT_PREFIX + sortKey,
-                                mode,
+            // 书架 ↔ 书夹/系列二级页左右滑动转场：前进（null → 二级）新页从右
+            // 滑入、旧页向左滑出；返回反向。参数与 SettingsScreen 组间导航、
+            // InkvolApp Tab 切换逐字同款（280ms / FastOutSlowInEasing），三条链路
+            // 动画语言统一。首帧（含一镜到底返回恢复二级页）不触发过渡。
+            // 注意：内容 lambda 必须用 AnimatedContent 的参数 t——outgoing 内容
+            // 以旧值调用，误读外层 target 会把退场页渲染成新页。
+            AnimatedContent(
+                targetState = target,
+                transitionSpec = {
+                    val forward = initialState == null
+                    val spec = tween<IntOffset>(280, easing = FastOutSlowInEasing)
+                    slideInHorizontally(spec) { full -> if (forward) full else -full } togetherWith
+                        slideOutHorizontally(spec) { full -> if (forward) -full else full }
+                },
+                label = "libraryTargetNav",
+                modifier = Modifier.fillMaxSize(),
+            ) { t ->
+                when (t) {
+                    null -> {
+                        // 视图行横向固定（转场不随页滑动）+ 纵向跟随网格滚动：
+                        // 行做成 Box 覆盖层（不占布局空间），translationY = -网格已滚
+                        // 距离（graphicsLayer 的 draw 阶段读状态，不触发重组）；网格
+                        // item 0 是等高空占位（headerSpacerHeight）保留滚动空间 →
+                        // 上滑隐藏与原「行作为 item 0」逐像素一致。
+                        // 视图（书夹/系列/平铺）× 分类（全部/漫画/小说）切换：与 InkvolApp
+                        // Tab 转场、本文件二级页转场同语言的左右滑动（280ms /
+                        // FastOutSlowInEasing）。方向判定：视图档变了按 书夹→系列→平铺，
+                        // 否则（分类切换）按 全部→漫画→小说（见 libraryViewOrder /
+                        // libraryTypeOrder）。首帧（含二级页返回）不触发过渡。
+                        // 注意：内容 lambda 必须用 AnimatedContent 的参数 (vm, tf)——
+                        // outgoing 内容以旧值调用，误读外层 viewMode/typeFilter 会把
+                        // 退场页渲染成新页。九个组合各自持有独立 LazyGridState
+                        //（gridStates）：转场期间新旧两页并存，共用状态会串味，且每个
+                        // 组合记住自己的滚动位置、切回原位恢复。
+                        val headerSpacerDp = with(LocalDensity.current) {
+                            viewHeaderHeightPx.toDp()
+                        }
+                        // 行位移的驱动源 = 当前组合的网格（转场期间跟进入页）。
+                        val headerOverlayState by rememberUpdatedState(
+                            gridStates.getValue(viewMode to typeFilter),
+                        )
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clipToBounds()
+                                // 左右滑动切换视图：与点击 chips 同语义（触发同一段
+                                // 280ms 方向转场，不跟手平移）。左滑=下一视图、右滑=上一
+                                // 视图，两端不回绕。仲裁：被跟踪指针一旦被消费（书夹视图
+                                // LazyRow 横滚 / 分类卡拖拽排序 / 网格竖向滚动）立即放弃；
+                                // 方向占优 |dx| > |dy| × 1.5 且过 48dp 才触发，斜滑/竖滑
+                                // 不误触。currentViewMode 经 rememberUpdatedState 中转，
+                                // 手势协程不随视图切换重启。
+                                .pointerInput(Unit) {
+                                    val thresholdPx = 48.dp.toPx()
+                                    awaitEachGesture {
+                                        val down = awaitFirstDown(requireUnconsumed = false)
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes
+                                                .firstOrNull { it.id == down.id }
+                                                ?: return@awaitEachGesture
+                                            if (change.isConsumed) return@awaitEachGesture
+                                            if (!change.pressed) return@awaitEachGesture
+                                            val dx = change.position.x - down.position.x
+                                            val dy = change.position.y - down.position.y
+                                            if (kotlin.math.abs(dx) <= thresholdPx ||
+                                                kotlin.math.abs(dx) <= kotlin.math.abs(dy) * 1.5f
+                                            ) {
+                                                continue
+                                            }
+                                            val current = libraryViewOrder.indexOf(currentViewMode)
+                                            if (current < 0) return@awaitEachGesture
+                                            val target = if (dx < 0f) current + 1 else current - 1
+                                            if (target !in libraryViewOrder.indices) {
+                                                return@awaitEachGesture
+                                            }
+                                            change.consume()
+                                            val nextMode = libraryViewOrder[target]
+                                            scope.launch {
+                                                settingsRepository.putString(
+                                                    SettingsKeys.LIBRARY_VIEW,
+                                                    nextMode,
+                                                )
+                                            }
+                                            return@awaitEachGesture
+                                        }
+                                    }
+                                },
+                        ) {
+                            AnimatedContent(
+                                targetState = viewMode to typeFilter,
+                                transitionSpec = {
+                                    val (fromVm, fromTf) = initialState
+                                    val (toVm, toTf) = targetState
+                                    val forward = if (fromVm != toVm) {
+                                        libraryViewOrder.indexOf(toVm) > libraryViewOrder.indexOf(fromVm)
+                                    } else {
+                                        libraryTypeOrder.indexOf(toTf) > libraryTypeOrder.indexOf(fromTf)
+                                    }
+                                    val spec = tween<IntOffset>(280, easing = FastOutSlowInEasing)
+                                    slideInHorizontally(spec) { full -> if (forward) full else -full } togetherWith
+                                        slideOutHorizontally(spec) { full -> if (forward) -full else full }
+                                },
+                                label = "libraryGridNav",
+                                modifier = Modifier.fillMaxSize(),
+                            ) { (vm, tf) ->
+                                // 三个视图共用同一排序出口（一级全局档 library_sort /
+                                // library_sort_desc）：平铺直接是书列表；系列视图在
+                                // SeriesGrid 内按成员书聚合键再排；书夹视图页面无书
+                                // 排序语义（拼贴封面取前 4 跟随排序，行为无害）。
+                                val pageBooks = sortBooks(
+                                    when (tf) {
+                                        null -> books
+                                        else -> books.filter { it.type == tf }
+                                    },
+                                    sortMode,
+                                    sortDescending,
+                                )
+                                val pageGridState = gridStates.getValue(vm to tf)
+                                when (vm) {
+                                    SettingsKeys.VIEW_SERIES -> SeriesGrid(
+                                        books = pageBooks,
+                                        state = pageGridState,
+                                        sortMode = sortMode,
+                                        descending = sortDescending,
+                                        headerSpacerHeight = headerSpacerDp,
+                                        chromeBottom = chrome.contentBottomForPage,
+                                        onOpenSeries = { name -> target = LibraryTarget.Series(name) },
+                                    )
+
+                                    SettingsKeys.VIEW_FLAT -> Box(modifier = Modifier.fillMaxSize()) {
+                                        BookGrid(
+                                            books = pageBooks,
+                                            state = pageGridState,
+                                            headerSpacerHeight = headerSpacerDp,
+                                            selected = selected,
+                                            reportSettled = gridSettled,
+                                            chromeBottom = chrome.contentBottomForPage,
+                                            onClick = { book, rect ->
+                                                if (selected.isEmpty()) {
+                                                    onOpenBook(book, rect)
+                                                } else {
+                                                    selected = if (book.id in selected) selected - book.id else selected + book.id
+                                                }
+                                            },
+                                            onLongClick = { book ->
+                                                selected = if (book.id in selected) selected - book.id else selected + book.id
+                                            },
+                                        )
+                                    }
+
+                                    else -> BookcaseGrid(
+                                        books = pageBooks,
+                                        state = pageGridState,
+                                        headerSpacerHeight = headerSpacerDp,
+                                        categories = categories,
+                                        categoryBookIds = categoryBookIds,
+                                        chromeBottom = chrome.contentBottomForPage,
+                                        onOpenSystem = { kind -> target = LibraryTarget.System(kind) },
+                                        onOpenCategory = { category ->
+                                            target = LibraryTarget.User(category.id, category.name, category.color)
+                                        },
+                                        onEditCategory = { category ->
+                                            editor = CategoryEditorState(
+                                                id = category.id,
+                                                name = category.name,
+                                                color = category.color,
+                                            )
+                                        },
+                                        onNewCategory = { editor = CategoryEditorState() },
+                                        folderSortMode = folderSortMode,
+                                        folderSortDescending = folderSortDescending,
+                                        onReorderCategory = { orderedIds ->
+                                            libraryRepository.reorderCategories(orderedIds)
+                                            // 拖完自动切回自定义顺序档（文件管理器同款行为）
+                                            scope.launch {
+                                                settingsRepository.putString(
+                                                    SettingsKeys.LIBRARY_FOLDER_SORT,
+                                                    SettingsKeys.FOLDER_SORT_CUSTOM,
+                                                )
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+                            // 行覆盖层：组合序在网格之后 = 画在网格之上；
+                            // clipToBounds 负责滚出内容区即裁掉。onSizeChanged 回填
+                            // 行高供网格占位与消失阈值使用（字体缩放下自适应）。
+                            viewHeader(
+                                Modifier
+                                    .align(Alignment.TopStart)
+                                    .onSizeChanged { viewHeaderHeightPx = it.height.toFloat() }
+                                    .graphicsLayer {
+                                        translationY = -viewHeaderScrollPx(
+                                            headerOverlayState,
+                                            viewHeaderHeightPx,
+                                        )
+                                    },
                             )
                         }
-                    },
-                    onToggleSelect = { id ->
-                        selected = if (id in selected) selected - id else selected + id
-                    },
-                    onBack = { target = null },
-                    onOpenBook = onOpenBook,
-                    chromeBottom = chrome.contentBottomForPage,
-                )
-            } else {
-                when (viewMode) {
-                    SettingsKeys.VIEW_SERIES -> SeriesGrid(
-                        books = filteredBooks,
-                        state = gridState,
-                        viewHeader = viewHeader,
-                        chromeBottom = chrome.contentBottomForPage,
-                        onOpenSeries = { name -> target = LibraryTarget.Series(name) },
-                    )
-
-                    SettingsKeys.VIEW_FLAT -> Box(modifier = Modifier.weight(1f)) {
-                        BookGrid(
-                            books = filteredBooks,
-                            state = gridState,
-                            viewHeader = viewHeader,
-                            selected = selected,
-                            reportSettled = gridSettled,
-                            chromeBottom = chrome.contentBottomForPage,
-                            onClick = { book, rect ->
-                                if (selected.isEmpty()) {
-                                    onOpenBook(book, rect)
-                                } else {
-                                    selected = if (book.id in selected) selected - book.id else selected + book.id
-                                }
-                            },
-                            onLongClick = { book ->
-                                selected = if (book.id in selected) selected - book.id else selected + book.id
-                            },
-                        )
                     }
 
-                    else -> BookcaseGrid(
-                        books = filteredBooks,
-                        state = gridState,
-                        viewHeader = viewHeader,
-                        categories = categories,
-                        categoryBookIds = categoryBookIds,
-                        chromeBottom = chrome.contentBottomForPage,
-                        onOpenSystem = { kind -> target = LibraryTarget.System(kind) },
-                        onOpenCategory = { category ->
-                            target = LibraryTarget.User(category.id, category.name, category.color)
-                        },
-                        onEditCategory = { category ->
-                            editor = CategoryEditorState(
-                                id = category.id,
-                                name = category.name,
-                                color = category.color,
-                            )
-                        },
-                        onNewCategory = { editor = CategoryEditorState() },
-                        onReorderCategory = { fromId, toId ->
-                            libraryRepository.reorderCategories(
-                                categories.map { it.id }.movedIds(fromId, toId),
-                            )
-                        },
-                    )
+                    else -> {
+                        // 网格实例来自顶层 detailStates（普通 HashMap）：
+                        // ① AnimatedContent 退场页按旧 t 仍取旧实例，不会当场回顶；
+                        // ② 初值吃 LibraryDetailScroll（一镜到底返回恢复位置）；
+                        // ③ 顶层可访问 → 头部状态机/恢复逻辑都能按「当前显示的网格」取。
+                        // 标题行已上提到头部层（随折叠一起上移），这里只画网格/空态。
+                        val targetGridState = detailStateOf(t)
+                        // 排序与一级书架共用全局档（library_sort / library_sort_desc，
+                        // 全 App 一份排序，SSMH 同款）；方向也共用全局键。
+                        val targetBooks = sortBooks(
+                            // 分类过滤贯穿二级页：智能/我的/系列都只显示当前漫画/小说筛选下的成员
+                            booksOf(t, filteredBooks, categoryBookIds),
+                            sortMode,
+                            sortDescending,
+                        )
+                        val emptyBecauseFiltered = typeFilter != null &&
+                            targetBooks.isEmpty() &&
+                            booksOf(t, books, categoryBookIds).isNotEmpty()
+                        CategoryContentView(
+                            books = targetBooks,
+                            emptyBecauseFiltered = emptyBecauseFiltered,
+                            state = targetGridState,
+                            selected = selected,
+                            reportSettled = gridSettled,
+                            onToggleSelect = { id ->
+                                selected = if (id in selected) selected - id else selected + id
+                            },
+                            onOpenBook = onOpenBook,
+                            chromeBottom = chrome.contentBottomForPage,
+                        )
+                    }
                 }
             }
 
         }
+    }
     }
 
         GlassHeaderTitleBlock(
@@ -698,6 +1157,40 @@ fun LibraryScreen(
             endInset = chrome.railEndInset,
             modifier = Modifier.align(Alignment.TopCenter),
             actions = {
+                // 排序钮（加号左边）：仅平铺/系列视图显示（书夹视图页面无书排序语义，
+                // 与平板侧栏排序钮同规则）。玻璃圆钮与 primary 实底加号形成主次区分，
+                // 材质与侧栏 RailFab 同语言；与加号菜单互斥（开一个关另一个）。
+                // 书架页恒显示：菜单按视图分流（书夹视图一级 = 书夹卡排序菜单，
+                // 其余 = 全局书排序菜单），按钮只有一颗不增加数量。
+                if (showHeaderImport) {
+                    GlassRounded(
+                        backdrop = pageBackdrop,
+                        tier = GlassTier.Full,
+                        radius = 22.dp,
+                        blurRadius = GlassDimens.LightBlur,
+                        edge = GlassEdge.Outline,
+                        modifier = Modifier
+                            .size(44.dp)
+                            // 点击反馈（ripple）裁成圆形：clip 必须在 clickable 之前，
+                            // 否则波纹按矩形 bounds 展开（设计规范 §点击反馈几何一致性）
+                            .clip(CircleShape)
+                            .clickable {
+                                plusMenuOpen = false
+                                sortMenuOpen = true
+                            },
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Sort,
+                            contentDescription = "排序",
+                            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.82f),
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .size(19.dp),
+                        )
+                    }
+                    // 与加号的间距由 actions Row 的 spacedBy(8.dp) 提供，不再额外加
+                    // Spacer（此前 8+8+8=24dp 导致两钮离得过远）
+                }
                 if (showHeaderImport) {
                     Box(
                         modifier = Modifier
@@ -711,16 +1204,45 @@ fun LibraryScreen(
                         contentAlignment = Alignment.Center,
                     ) {
                         if (scan.running) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(20.dp),
-                                strokeWidth = 2.dp,
-                                color = MaterialTheme.colorScheme.onPrimary,
+                            // 重扫进行中：重扫箭头自旋（与下拉形变同一视觉语言，
+                            // 替代原加载小圈）
+                            val spin = rememberInfiniteTransition(label = "rescanSpin")
+                            val spinAngle by spin.animateFloat(
+                                initialValue = 0f,
+                                targetValue = 360f,
+                                animationSpec = infiniteRepeatable(
+                                    tween(900, easing = LinearEasing),
+                                ),
+                                label = "rescanAngle",
+                            )
+                            Icon(
+                                imageVector = Icons.Filled.Refresh,
+                                contentDescription = "重新扫描中",
+                                tint = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.graphicsLayer { rotationZ = spinAngle },
                             )
                         } else {
+                            // 下拉形变：+ 淡出旋出、重扫箭头旋入（拉距驱动，graphicsLayer
+                            // 读 LibraryPullRefresh，不进重组）；未拉动时恒为 +，零视觉变化
                             Icon(
                                 imageVector = Icons.Filled.Add,
                                 contentDescription = "导入",
                                 tint = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.graphicsLayer {
+                                    val f = LibraryPullRefresh.pullFraction
+                                    alpha = (1f - f).coerceIn(0f, 1f)
+                                    rotationZ = -f * 90f
+                                },
+                            )
+                            Icon(
+                                imageVector = Icons.Filled.Refresh,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.graphicsLayer {
+                                    val f = LibraryPullRefresh.pullFraction
+                                    alpha = f.coerceIn(0f, 1f)
+                                    rotationZ = f * 360f
+                                },
                             )
                         }
                     }
@@ -734,6 +1256,43 @@ fun LibraryScreen(
             backdrop = pageBackdrop,
             chrome = chrome,
         )
+
+        // ---- 二级页标题行（属于头部）----
+        // 它必须画在 header 层而不是 CategoryContentView 内：内容区的顶部让位由
+        // expandedTop - extent 派生（折满归 0），放在内容里折到头也只能停在屏幕最上、
+        // 不会离屏。放在这里并吃同一个 headerOffsetPx，就与书架标题/chips 刚性同移：
+        // 位置 = statusBarTop + 108 - extent，折满（extent = H，H 含本行 56dp）时整行
+        // 出屏，网格顶到屏幕最上。
+        val detailTitleTarget = target
+        if (detailTitleTarget != null) {
+            // 计数与二级页网格同源（排序不再由本行承载——全 App 一份全局排序，
+            // 入口只有侧栏/一级标题行的排序钮）
+            val detailBooks = booksOf(detailTitleTarget, filteredBooks, categoryBookIds)
+            val detailTypeLabel = when (typeFilter) {
+                "COMIC" -> "漫画"
+                "NOVEL" -> "小说"
+                else -> null
+            }
+            DetailTitleRow(
+                title = detailTypeLabel?.let { "${targetTitle(detailTitleTarget)} · $it" }
+                    ?: targetTitle(detailTitleTarget),
+                countText = if (selected.isEmpty()) {
+                    "${detailBooks.size} 本"
+                } else {
+                    "已选 ${selected.size}"
+                },
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .graphicsLayer { translationY = headerState.headerOffsetPx }
+                    .padding(top = headerState.statusBarTop + 108.dp)
+                    .padding(start = 20.dp, end = 20.dp + chrome.railEndInset),
+                onBack = {
+                    detailStates.remove(targetKeyOf(detailTitleTarget).orEmpty())
+                    LibraryDetailScroll.key = null
+                    target = null
+                },
+            )
+        }
 
     AnimatedVisibility(
         visible = selected.isNotEmpty() && !overlayShowing,
@@ -788,6 +1347,10 @@ fun LibraryScreen(
             plusMenuOpen = false
             libraryRepository.rescanAll()
         },
+        onManager = {
+            plusMenuOpen = false
+            onOpenLibraryManager()
+        },
         // 锚点 = 右上角导入钮：菜单从那个角放大出来，不从画面中心胀开。
         // 纵锚跟标题块用同一状态栏真源（挖孔屏等大 inset 设备按钮底边更靠下，
         // 写死的 84dp 会被菜单压住）：状态栏 + 6(标题上留白) + 3(44 按钮在 50 内容里居中)
@@ -799,6 +1362,78 @@ fun LibraryScreen(
             .widthIn(max = 260.dp)
             .fillMaxWidth(),
     )
+
+    // 手机端排序菜单：与加号菜单完全同位（同一 top / end / origin，菜单右缘贴屏
+    // 幕右 20dp）——贴排序钮左缘会把 260dp 宽的菜单整体拽向屏幕中部，与标题行
+    // 视觉脱节。互斥已有：打开本菜单先收加号菜单（点排序钮时），反之亦然。
+    // 内容按视图分流：书夹视图一级（无二级页）= 书夹卡排序菜单（独立记忆
+    // library_folder_sort）；平铺/系列/二级页 = 全局书排序菜单（library_sort）。
+    val folderSortMenuActive = viewMode == SettingsKeys.VIEW_FOLDER && target == null
+    if (folderSortMenuActive) {
+        FolderSortMenuOverlay(
+            visible = sortMenuOpen,
+            presence = overlayPresence,
+            backdrop = pageBackdrop,
+            mode = folderSortMode,
+            descending = folderSortDescending,
+            onDismiss = { sortMenuOpen = false },
+            onPick = { mode ->
+                sortMenuOpen = false
+                scope.launch {
+                    settingsRepository.putString(SettingsKeys.LIBRARY_FOLDER_SORT, mode)
+                }
+                scrollToTop.request()
+            },
+            onToggleOrder = {
+                scope.launch {
+                    settingsRepository.putString(
+                        SettingsKeys.LIBRARY_FOLDER_SORT_DESC,
+                        if (folderSortDescending) "0" else "1",
+                    )
+                }
+                scrollToTop.request()
+            },
+            alignment = Alignment.TopEnd,
+            origin = TransformOrigin(1f, 0f),
+            modifier = Modifier
+                .padding(top = headerState.statusBarTop + 61.dp, end = 20.dp)
+                .widthIn(max = 260.dp)
+                .fillMaxWidth(),
+        )
+    } else {
+        SortMenuOverlay(
+            visible = sortMenuOpen,
+            presence = overlayPresence,
+            backdrop = pageBackdrop,
+            mode = sortMode,
+            descending = sortDescending,
+            onDismiss = { sortMenuOpen = false },
+            onPick = { mode ->
+                sortMenuOpen = false
+                scope.launch {
+                    settingsRepository.putString(SettingsKeys.LIBRARY_SORT, mode)
+                }
+                // 切档后列表按新顺序重排：复用回顶总线（当前显示网格带动画滚回顶部
+                // + 头部展开），二级页打开时同样生效；滚动记忆随之归 0。
+                scrollToTop.request()
+            },
+        onToggleOrder = {
+            scope.launch {
+                settingsRepository.putString(
+                    SettingsKeys.LIBRARY_SORT_DESC,
+                    if (sortDescending) "0" else "1",
+                )
+            }
+            scrollToTop.request()
+        },
+        alignment = Alignment.TopEnd,
+        origin = TransformOrigin(1f, 0f),
+        modifier = Modifier
+            .padding(top = headerState.statusBarTop + 61.dp, end = 20.dp)
+            .widthIn(max = 260.dp)
+            .fillMaxWidth(),
+        )
+    }
 
     editorHeld?.let { state ->
         CategoryEditorOverlay(
@@ -874,6 +1509,7 @@ fun LibraryScreen(
         singleFileCount = selected.count { id ->
             books.firstOrNull { it.id == id }?.treeUri == SingleFileImporter.SINGLE_LIBRARY_URI
         },
+        syncEnabled = syncRepository?.state?.value?.enabled == true,
         onDismiss = { deleteSheetOpen = false },
         onRemoveOnly = {
             val ids = selected
@@ -896,15 +1532,18 @@ fun LibraryScreen(
 private fun BookcaseGrid(
     books: List<BookRecord>,
     state: LazyGridState,
-    viewHeader: @Composable () -> Unit,
+    headerSpacerHeight: androidx.compose.ui.unit.Dp,
     categories: List<CategoryRecord>,
     categoryBookIds: Map<Long, Set<String>>,
+    folderSortMode: String,
+    folderSortDescending: Boolean,
     chromeBottom: androidx.compose.ui.unit.Dp,
     onOpenSystem: (SystemCategory) -> Unit,
     onOpenCategory: (CategoryRecord) -> Unit,
     onEditCategory: (CategoryRecord) -> Unit,
     onNewCategory: () -> Unit,
-    onReorderCategory: (Long, Long) -> Unit,
+    /** 拖拽结束：把拖拽后的完整卡片顺序原样提交（固化为 sort_key）。 */
+    onReorderCategory: (List<Long>) -> Unit,
 ) {
     val unclassifiedCount = books.count { book ->
         categoryBookIds.values.none { book.id in it }
@@ -916,7 +1555,28 @@ private fun BookcaseGrid(
         if (dragState == null) orderedCategories = categories
     }
 
+    // 卡片数量键：与卡片角标同源（当前漫画/小说过滤后的成员数），不是 SQL 全量 bookCount
+    fun categoryCount(id: Long): Int = books.count { it.id in categoryBookIds[id].orEmpty() }
+
+    // 显示顺序 = 档位排序 × 方向；custom 档 = 拖拽序（orderedCategories）原样、
+    // 不受方向影响。拖拽中 orderedCategories 就是实时拖拽序，档位排序不参与。
+    val displayCategories = remember(orderedCategories, folderSortMode, folderSortDescending, books, categoryBookIds) {
+        val sorted = when (folderSortMode) {
+            SettingsKeys.FOLDER_SORT_NAME -> orderedCategories.sortedBy { it.name.lowercase() }
+            SettingsKeys.FOLDER_SORT_COUNT -> orderedCategories.sortedBy { categoryCount(it.id) }
+            else -> orderedCategories
+        }
+        if (folderSortMode != SettingsKeys.FOLDER_SORT_CUSTOM && folderSortDescending) {
+            sorted.reversed()
+        } else {
+            sorted
+        }
+    }
+
     fun startDrag(id: Long) {
+        // 拖拽基于当前显示顺序快照：从「按名称/按数量」档起手时先落到实际显示序，
+        // 避免列表跳回 sort_key 序的起手跳变；松手后提交该序并自动切回自定义档。
+        orderedCategories = displayCategories
         dragState = DragSortState(id, Offset.Zero, id, itemBounds.toMap())
     }
 
@@ -941,7 +1601,8 @@ private fun BookcaseGrid(
         val current = dragState
         val targetId = current?.targetId
         if (current?.id == id && targetId != null && targetId != id) {
-            onReorderCategory(id, targetId)
+            // 显示顺序原样固化（非 custom 档下显示序 ≠ sort_key 序，必须传完整序）
+            onReorderCategory(orderedCategories.map { it.id })
         }
         dragState = null
     }
@@ -955,7 +1616,7 @@ private fun BookcaseGrid(
         contentPadding = PaddingValues(bottom = chromeBottom + GlassDimens.ListBottomExtraScroll),
     ) {
         item(span = { GridItemSpan(maxLineSpan) }) {
-            viewHeader()
+            Spacer(Modifier.height(headerSpacerHeight))
         }
         item(span = { GridItemSpan(maxLineSpan) }) {
             SectionLabel("智能书夹")
@@ -1018,7 +1679,7 @@ private fun BookcaseGrid(
         item(span = { GridItemSpan(maxLineSpan) }) {
             SectionLabel("我的书夹")
         }
-        items(orderedCategories, key = { "cat_${it.id}" }) { category ->
+        items(displayCategories, key = { "cat_${it.id}" }) { category ->
             val dragging = dragState?.id == category.id
             val dropTarget = dragState?.targetId == category.id && !dragging
             Box(
@@ -1328,14 +1989,21 @@ private fun NewFolderCard(onClick: () -> Unit) {
 private fun SeriesGrid(
     books: List<BookRecord>,
     state: LazyGridState,
-    viewHeader: @Composable () -> Unit,
+    sortMode: String,
+    descending: Boolean,
+    headerSpacerHeight: androidx.compose.ui.unit.Dp,
     chromeBottom: androidx.compose.ui.unit.Dp,
     onOpenSeries: (String) -> Unit,
 ) {
-    val groups = remember(books) {
-        books.groupBy { book -> book.series?.takeIf { it.isNotBlank() } ?: book.title }
-            .toList()
-            .sortedBy { it.first }
+    // 系列卡排序 = 成员书聚合键（与一级书排序档同源）：收藏时间/最近阅读/进度取
+    // 成员 MAX，页数/大小取成员求和，标题档即系列名。方向规则与 sortBooks 一致。
+    val groups = remember(books, sortMode, descending) {
+        sortSeriesGroups(
+            books.groupBy { book -> book.series?.takeIf { it.isNotBlank() } ?: book.title }
+                .toList(),
+            sortMode,
+            descending,
+        )
     }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 150.dp),
@@ -1346,7 +2014,7 @@ private fun SeriesGrid(
         contentPadding = PaddingValues(bottom = chromeBottom + GlassDimens.ListBottomExtraScroll),
     ) {
         item(span = { GridItemSpan(maxLineSpan) }) {
-            viewHeader()
+            Spacer(Modifier.height(headerSpacerHeight))
         }
         items(groups, key = { it.first }) { (name, group) ->
             Column(
@@ -1393,7 +2061,7 @@ private fun SeriesGrid(
 private fun BookGrid(
     books: List<BookRecord>,
     state: LazyGridState,
-    viewHeader: @Composable () -> Unit,
+    headerSpacerHeight: androidx.compose.ui.unit.Dp,
     selected: Set<String>,
     reportSettled: Boolean,
     chromeBottom: androidx.compose.ui.unit.Dp,
@@ -1409,7 +2077,7 @@ private fun BookGrid(
         contentPadding = PaddingValues(bottom = chromeBottom + GlassDimens.ListBottomExtraScroll),
     ) {
         item(span = { GridItemSpan(maxLineSpan) }) {
-            viewHeader()
+            Spacer(Modifier.height(headerSpacerHeight))
         }
         items(books, key = { it.id }) { book ->
             BookCell(
@@ -1428,63 +2096,19 @@ private fun BookGrid(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun CategoryContentView(
-    target: LibraryTarget,
     books: List<BookRecord>,
-    typeLabel: String? = null,
     emptyBecauseFiltered: Boolean = false,
     state: LazyGridState,
     selected: Set<String>,
-    sortMode: String,
     reportSettled: Boolean,
-    onSortChange: (String) -> Unit,
     onToggleSelect: (String) -> Unit,
-    onBack: () -> Unit,
     onOpenBook: (BookRecord, ReaderOpenRect?) -> Unit,
     chromeBottom: androidx.compose.ui.unit.Dp,
 ) {
-    val glassNotice = LocalGlassNotice.current
     Column(modifier = Modifier.fillMaxSize()) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
-            }
-            Text(
-                text = typeLabel?.let { "${targetTitle(target)} · $it" } ?: targetTitle(target),
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onBackground,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f),
-            )
-            Text(
-                text = if (selected.isEmpty()) "${books.size} 本" else "已选 ${selected.size}",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-
-        Spacer(Modifier.height(8.dp))
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            TypeChip("最近添加", sortMode == SettingsKeys.SORT_RECENT) {
-                onSortChange(SettingsKeys.SORT_RECENT)
-            }
-            TypeChip("标题", sortMode == SettingsKeys.SORT_TITLE) {
-                onSortChange(SettingsKeys.SORT_TITLE)
-            }
-            TypeChip("文件大小", sortMode == SettingsKeys.SORT_SIZE) {
-                onSortChange(SettingsKeys.SORT_SIZE)
-            }
-        }
-
-        Spacer(Modifier.height(8.dp))
+        // 标题行（返回 / 名称 / 数量 / 排序）已上提到头部层（DetailTitleRow）：
+        // 它要随折叠一起上移出屏，放在内容区只能停在屏幕顶部。
+        // 标题行高 + 间距已由头部让位（DETAIL_TITLE_ROW_HEIGHT）承担。
 
         if (books.isEmpty()) {
             Surface(
@@ -1537,6 +2161,47 @@ private fun CategoryContentView(
             }
         }
 
+    }
+}
+
+/**
+ * 二级页标题行（属于头部）：返回钮 + 书夹/系列名 + 数量。
+ * 由 LibraryScreen 在 header 层渲染并吃同一个 headerOffsetPx，与书架标题/chips
+ * 刚性同移——折叠时整行随头部上移出屏，而不是停在内容区顶部。
+ * 高度 = IconButton 48 + 底部 8 = DETAIL_TITLE_ROW_HEIGHT（56dp）。
+ * 排序不在本行承载：全 App 一份全局排序，入口只有侧栏/一级标题行的排序钮。
+ */
+@Composable
+private fun DetailTitleRow(
+    title: String,
+    countText: String,
+    modifier: Modifier = Modifier,
+    onBack: () -> Unit,
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            // 底部 8dp 与网格 contentPadding(4dp) 合计 12dp，等于原「Spacer 8 + 4」间距
+            .padding(bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        IconButton(onClick = onBack) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+        }
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onBackground,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = countText,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -1994,6 +2659,7 @@ private fun DeleteConfirmOverlay(
     backdrop: Backdrop,
     count: Int,
     singleFileCount: Int,
+    syncEnabled: Boolean = false,
     onDismiss: () -> Unit,
     onRemoveOnly: () -> Unit,
     onDeleteFiles: () -> Unit,
@@ -2025,6 +2691,14 @@ private fun DeleteConfirmOverlay(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (syncEnabled) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "已开启同步：「连文件删除」将同步从所有设备的书架移除这些书；移入回收站仅影响本机。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
             Spacer(Modifier.height(16.dp))
             if (singleFileCount < count) {
                 Button(
@@ -2130,16 +2804,41 @@ private fun targetTitle(target: LibraryTarget): String = when (target) {
     is LibraryTarget.Series -> target.name
 }
 
-private fun targetSortKey(target: LibraryTarget): String = when (target) {
-    is LibraryTarget.User -> "user_${target.id}"
-    is LibraryTarget.System -> "system_${target.kind.name}"
-    is LibraryTarget.Series -> "series_${target.name}"
+/**
+ * 书架排序（6 档 × 升降序，功能逻辑对齐 SSMH 书夹排序）：
+ * 各档统一升序键后按 [descending] 反转；缺省（recent + 降序）= 旧版 SQL
+ * ORDER BY added_at DESC 的原样行为。title 用小写比较保证大小写稳定序。
+ */
+private fun sortBooks(books: List<BookRecord>, mode: String, descending: Boolean): List<BookRecord> {
+    val sorted = when (mode) {
+        SettingsKeys.SORT_TITLE -> books.sortedBy { it.title.lowercase() }
+        SettingsKeys.SORT_LAST_READ -> books.sortedBy { it.lastReadAt }
+        SettingsKeys.SORT_PAGES -> books.sortedBy { it.pageCount }
+        SettingsKeys.SORT_PROGRESS -> books.sortedBy { it.percent }
+        SettingsKeys.SORT_SIZE -> books.sortedBy { it.fileSize }
+        else -> books.sortedBy { it.addedAt } // SORT_RECENT 收藏时间
+    }
+    return if (descending) sorted.reversed() else sorted
 }
 
-private fun sortBooks(books: List<BookRecord>, mode: String): List<BookRecord> = when (mode) {
-    SettingsKeys.SORT_TITLE -> books.sortedBy { it.title.lowercase() }
-    SettingsKeys.SORT_SIZE -> books.sortedByDescending { it.fileSize }
-    else -> books.sortedByDescending { it.addedAt }
+/**
+ * 系列卡排序：成员书聚合键。收藏时间/最近阅读/阅读进度取成员最大值（一个系列
+ * 只要有一卷新/被读过就前移），页数/文件大小取求和（系列体量），标题档即系列名。
+ */
+private fun sortSeriesGroups(
+    groups: List<Pair<String, List<BookRecord>>>,
+    mode: String,
+    descending: Boolean,
+): List<Pair<String, List<BookRecord>>> {
+    val sorted = when (mode) {
+        SettingsKeys.SORT_TITLE -> groups.sortedBy { it.first.lowercase() }
+        SettingsKeys.SORT_LAST_READ -> groups.sortedBy { group -> group.second.maxOf { it.lastReadAt } }
+        SettingsKeys.SORT_PAGES -> groups.sortedBy { group -> group.second.sumOf { it.pageCount } }
+        SettingsKeys.SORT_PROGRESS -> groups.sortedBy { group -> group.second.maxOf { it.percent } }
+        SettingsKeys.SORT_SIZE -> groups.sortedBy { group -> group.second.sumOf { it.fileSize } }
+        else -> groups.sortedBy { group -> group.second.maxOf { it.addedAt } }
+    }
+    return if (descending) sorted.reversed() else sorted
 }
 
 private fun booksOf(

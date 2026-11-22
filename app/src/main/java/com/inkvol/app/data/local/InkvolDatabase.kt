@@ -14,6 +14,7 @@ import com.inkvol.app.data.model.NovelProgressRecord
 import com.inkvol.app.data.model.PurifyRuleRecord
 import com.inkvol.app.data.model.ReadingHistoryEntry
 import com.inkvol.app.data.model.ReadingStats
+import com.inkvol.app.data.model.SearchChapterRow
 import com.inkvol.app.data.model.TrashBook
 
 /**
@@ -22,7 +23,7 @@ import com.inkvol.app.data.model.TrashBook
  * - categories / book_categories：全局书夹（多对多）；
  * - progress / page_bookmarks：为 M3 阅读器预留，M2 只读 percent。
  */
-class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", null, 10) {
+class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", null, 11) {
 
     override fun onCreate(db: SQLiteDatabase) {
         createCoreTables(db)
@@ -30,6 +31,7 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
         createM4BTables(db)
         createM6Tables(db)
         createM63BTables(db)
+        createSyncTables(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -62,6 +64,24 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
             db.execSQL("DROP TABLE IF EXISTS book_list_items")
             db.execSQL("DROP TABLE IF EXISTS book_lists")
         }
+        // v11：M4.5 同步墓碑表（删除传播凭据）
+        if (oldVersion < 11) {
+            createSyncTables(db)
+        }
+    }
+
+    /** M4.5：同步墓碑表（跨设备删除传播；kind+key 唯一）。 */
+    private fun createSyncTables(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS sync_tombstones(
+                kind TEXT NOT NULL,
+                key TEXT NOT NULL,
+                deleted_at INTEGER NOT NULL,
+                PRIMARY KEY(kind, key)
+            )
+            """.trimIndent(),
+        )
     }
 
     private fun createCoreTables(db: SQLiteDatabase) {
@@ -631,9 +651,19 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
     private val bookSelect = """
         SELECT b.id, b.type, b.title, b.series, b.volume, b.writer, b.tags,
                b.page_count, b.format, b.file_size, b.cover_path, b.added_at,
-               l.doc_id, l.display_path, b.read_status, COALESCE(p.percent, 0), f.tree_uri
+               l.doc_id, l.display_path, b.read_status, COALESCE(p.percent, 0), f.tree_uri,
+               COALESCE(
+                   p.updated_at,
+                   (SELECT MAX(updated_at) FROM novel_progress WHERE book_id = b.id),
+                   0
+               )
         FROM books b
-        LEFT JOIN book_locations l ON l.book_id = b.id AND l.is_primary = 1
+        LEFT JOIN book_locations l ON l.rowid = (
+            SELECT rowid FROM book_locations
+            WHERE book_id = b.id AND is_primary = 1
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+        )
         LEFT JOIN folders f ON f.id = l.folder_id
         LEFT JOIN libraries lib ON lib.id = f.library_id
         LEFT JOIN progress p ON p.book_id = b.id
@@ -722,11 +752,14 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                     displayPath = cursor.getString(13) ?: "",
                     readStatus = cursor.getString(14) ?: BookRecord.READ_UNREAD,
                     percent = cursor.getDouble(15),
+                    lastReadAt = cursor.getLong(17),
                     treeUri = cursor.getString(16),
                 )
             }
         }
-        return result
+        // 兜底去重：位置一对多残留（如历史脏数据）不再让同一本书出现两行，
+        // 否则书架 LazyGrid 以 id 作 key 会重复崩溃。
+        return result.distinctBy { it.id }
     }
 
     // ---------------- 小说章节（M6.1-A） ----------------
@@ -775,6 +808,129 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                     byteStart = cursor.getLong(2),
                     byteEnd = cursor.getLong(3),
                     charCount = cursor.getInt(4),
+                )
+            }
+        }
+        return result
+    }
+
+    // ---------------- M7 全局搜索 ----------------
+
+    /**
+     * 章节标题命中：LIKE + 书籍级基础筛选（type/format/readStatus）。
+     * 书夹/文件夹/系列/作者/标签筛选在仓储层做（需要映射与逗号拆分）。
+     * JOIN 口径对齐 bookSelect：主位置 rowid 子查询去重 + 隐藏书库过滤。
+     */
+    fun querySearchChapters(
+        query: String,
+        type: String?,
+        formats: Set<String>,
+        readStatus: String?,
+    ): List<SearchChapterRow> {
+        val like = "%" + escapeLike(query) + "%"
+        val clauses = ArrayList<String>()
+        val args = ArrayList<String>()
+        clauses.add("nc.title LIKE ? ESCAPE '\\'")
+        args.add(like)
+        if (type != null) {
+            clauses.add("b.type = ?")
+            args.add(type)
+        }
+        if (readStatus != null) {
+            clauses.add("b.read_status = ?")
+            args.add(readStatus)
+        }
+        if (formats.isNotEmpty()) {
+            clauses.add("b.format IN (${formats.joinToString(",") { "?" }})")
+            args.addAll(formats)
+        }
+        val sql = """
+            SELECT b.id, b.title, b.cover_path, b.type, nc.idx, nc.title
+            FROM novel_chapters nc
+            JOIN books b ON b.id = nc.book_id AND b.deleted_at IS NULL
+            LEFT JOIN folders f ON f.id = (
+                SELECT folder_id FROM book_locations
+                WHERE book_id = b.id
+                ORDER BY last_seen_at DESC
+                LIMIT 1
+            )
+            LEFT JOIN libraries lib ON lib.id = f.library_id
+            WHERE (lib.hidden IS NULL OR lib.hidden = 0) AND ${clauses.joinToString(" AND ")}
+            ORDER BY b.added_at DESC, nc.idx
+        """.trimIndent()
+        val result = ArrayList<SearchChapterRow>()
+        readableDatabase.rawQuery(sql, args.toTypedArray()).use { cursor ->
+            while (cursor.moveToNext()) {
+                result += SearchChapterRow(
+                    bookId = cursor.getString(0),
+                    bookTitle = cursor.getString(1),
+                    coverPath = cursor.getString(2),
+                    bookType = cursor.getString(3),
+                    chapterIdx = cursor.getInt(4),
+                    chapterTitle = cursor.getString(5) ?: "",
+                )
+            }
+        }
+        return result
+    }
+
+    /** LIKE 通配符转义（配合 ESCAPE '\'）。 */
+    private fun escapeLike(raw: String): String = raw
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+
+    /** 书 → 所在文件夹 id 集（文件夹三态筛选用）。 */
+    fun queryBookFolderIds(): Map<String, Set<Long>> {
+        val map = HashMap<String, MutableSet<Long>>()
+        readableDatabase.rawQuery(
+            "SELECT book_id, folder_id FROM book_locations",
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                map.getOrPut(cursor.getString(0)) { mutableSetOf() }.add(cursor.getLong(1))
+            }
+        }
+        return map
+    }
+
+    /** 搜索期更新书目元数据（EPUB 回填）；null 表示不动该列。 */
+    fun updateBookMetadata(bookId: String, writer: String?, tags: String?) {
+        val values = ContentValues()
+        if (writer != null) values.put("writer", writer)
+        if (tags != null) values.put("tags", tags)
+        if (values.size() == 0) return
+        values.put("updated_at", System.currentTimeMillis())
+        writableDatabase.update("books", values, "id = ?", arrayOf(bookId))
+    }
+
+    data class EpubBackfillRow(
+        val id: String,
+        val docId: String,
+        val fileSize: Long,
+    )
+
+    /**
+     * EPUB 元数据回填候选：该文件夹下 writer 与 tags 都为空的 EPUB。
+     * 哨兵约定：解析后无任何元数据的书写 tags=''（非 NULL），下次不再命中。
+     */
+    fun queryEpubBackfillCandidates(folderId: Long): List<EpubBackfillRow> {
+        val result = ArrayList<EpubBackfillRow>()
+        readableDatabase.rawQuery(
+            """
+            SELECT DISTINCT b.id, l.doc_id, b.file_size
+            FROM books b
+            JOIN book_locations l ON l.book_id = b.id
+            WHERE l.folder_id = ? AND b.type = 'NOVEL' AND b.format = 'EPUB'
+              AND b.writer IS NULL AND b.tags IS NULL AND b.deleted_at IS NULL
+            """.trimIndent(),
+            arrayOf(folderId.toString()),
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                result += EpubBackfillRow(
+                    id = cursor.getString(0),
+                    docId = cursor.getString(1),
+                    fileSize = cursor.getLong(2),
                 )
             }
         }
@@ -1344,7 +1500,12 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                    COALESCE(MAX(COALESCE(rs.ended_at, rs.started_at)), 0)
             FROM books b
             JOIN reading_sessions rs ON rs.book_id = b.id
-            LEFT JOIN book_locations l ON l.book_id = b.id AND l.is_primary = 1
+            LEFT JOIN book_locations l ON l.rowid = (
+                SELECT rowid FROM book_locations
+                WHERE book_id = b.id AND is_primary = 1
+                ORDER BY last_seen_at DESC
+                LIMIT 1
+            )
             LEFT JOIN folders f ON f.id = l.folder_id
             LEFT JOIN libraries lib ON lib.id = f.library_id
             LEFT JOIN progress p ON p.book_id = b.id
@@ -1498,6 +1659,155 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
         }
         return result
     }
+
+    // ---------- M4.5 同步（WebDAV）----------
+
+    data class TombstoneRow(val kind: String, val key: String, val deletedAt: Long)
+
+    /** doc 构建用书籍行（仅非回收站书；bookId 即内容指纹，跨设备一致）。 */
+    data class SyncBookRow(
+        val id: String,
+        val title: String,
+        val format: String,
+        val fileSize: Long,
+        val readStatus: String,
+    )
+
+    data class SyncProgressRow(
+        val page: Int,
+        val percent: Double,
+        val finished: Int,
+        val sessionSeconds: Int,
+        val updatedAt: Long,
+    )
+
+    data class SyncComicBookmarkRow(
+        val pageIndex: Int,
+        val createdAt: Long,
+        val note: String?,
+    )
+
+    data class SyncSessionRow(
+        val startedAt: Long,
+        val endedAt: Long?,
+        val durationMs: Long,
+        val pagesRead: Int,
+    )
+
+    fun addSyncTombstones(items: List<TombstoneRow>) {
+        if (items.isEmpty()) return
+        val sql = writableDatabase
+        sql.beginTransaction()
+        try {
+            items.forEach { row ->
+                sql.insertWithOnConflict(
+                    "sync_tombstones",
+                    null,
+                    ContentValues().apply {
+                        put("kind", row.kind)
+                        put("key", row.key)
+                        put("deleted_at", row.deletedAt)
+                    },
+                    SQLiteDatabase.CONFLICT_REPLACE,
+                )
+            }
+            sql.setTransactionSuccessful()
+        } finally {
+            sql.endTransaction()
+        }
+    }
+
+    fun querySyncTombstones(): List<TombstoneRow> {
+        val result = ArrayList<TombstoneRow>()
+        readableDatabase.rawQuery(
+            "SELECT kind, key, deleted_at FROM sync_tombstones",
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                result += TombstoneRow(cursor.getString(0), cursor.getString(1), cursor.getLong(2))
+            }
+        }
+        return result
+    }
+
+    /** 清理过期墓碑（30 天），返回删除行数。 */
+    fun purgeSyncTombstones(before: Long): Int =
+        writableDatabase.delete("sync_tombstones", "deleted_at < ?", arrayOf(before.toString()))
+
+    fun querySyncBookRows(): List<SyncBookRow> {
+        val result = ArrayList<SyncBookRow>()
+        readableDatabase.rawQuery(
+            "SELECT id, title, format, file_size, read_status FROM books WHERE deleted_at IS NULL",
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                result += SyncBookRow(
+                    id = cursor.getString(0),
+                    title = cursor.getString(1),
+                    format = cursor.getString(2),
+                    fileSize = cursor.getLong(3),
+                    readStatus = cursor.getString(4),
+                )
+            }
+        }
+        return result
+    }
+
+    fun queryProgressRow(bookId: String): SyncProgressRow? =
+        readableDatabase.rawQuery(
+            "SELECT page, percent, finished, session_seconds, updated_at FROM progress WHERE book_id = ?",
+            arrayOf(bookId),
+        ).use { cursor ->
+            if (cursor.moveToFirst()) {
+                SyncProgressRow(cursor.getInt(0), cursor.getDouble(1), cursor.getInt(2), cursor.getInt(3), cursor.getLong(4))
+            } else null
+        }
+
+    fun queryComicBookmarksRow(bookId: String): List<SyncComicBookmarkRow> {
+        val result = ArrayList<SyncComicBookmarkRow>()
+        readableDatabase.rawQuery(
+            "SELECT page_index, created_at, note FROM page_bookmarks WHERE book_id = ? ORDER BY page_index",
+            arrayOf(bookId),
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                result += SyncComicBookmarkRow(
+                    pageIndex = cursor.getInt(0),
+                    createdAt = cursor.getLong(1),
+                    note = if (cursor.isNull(2)) null else cursor.getString(2),
+                )
+            }
+        }
+        return result
+    }
+
+    /** 会话列表（新→旧），上限截断防 doc 无限膨胀；旧会话留本地不计入同步。 */
+    fun querySyncSessions(bookId: String, limit: Int = 200): List<SyncSessionRow> {
+        val result = ArrayList<SyncSessionRow>()
+        readableDatabase.rawQuery(
+            """
+            SELECT started_at, ended_at, duration_ms, pages_read
+            FROM reading_sessions WHERE book_id = ?
+            ORDER BY started_at DESC LIMIT ?
+            """.trimIndent(),
+            arrayOf(bookId, limit.toString()),
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                result += SyncSessionRow(
+                    startedAt = cursor.getLong(0),
+                    endedAt = if (cursor.isNull(1)) null else cursor.getLong(1),
+                    durationMs = cursor.getLong(2),
+                    pagesRead = cursor.getInt(3),
+                )
+            }
+        }
+        return result
+    }
+
+    /** 供同步事务内使用的级联删除包装（不走自带事务，由调用方统一管理）。 */
+    fun cascadeDeleteBooksInTransaction(sql: SQLiteDatabase, bookIds: Collection<String>) {
+        bookIds.forEach { deleteBookCascade(sql, it) }
+    }
+
 
     fun updateBooksMetadata(
         ids: Collection<String>,

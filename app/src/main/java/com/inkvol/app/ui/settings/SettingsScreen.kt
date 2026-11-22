@@ -3,6 +3,11 @@ package com.inkvol.app.ui.settings
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import com.inkvol.app.data.sync.CryptoBox
+import com.inkvol.app.data.sync.DavException
+import com.inkvol.app.data.sync.SyncFiles
+import com.inkvol.app.data.sync.SyncRepository
+import com.inkvol.app.data.sync.WebDavClient
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -107,6 +112,10 @@ import kotlinx.coroutines.launch
 fun SettingsScreen(
     settingsRepository: SettingsRepository,
     libraryRepository: LibraryRepository,
+    // M4.5 同步（AppContainer 装配；null = 未装配）
+    syncRepository: SyncRepository? = null,
+    // M6.3-D 收口：设置首页 back = 切回书架 tab
+    onBackToLibrary: () -> Unit,
     onOpenLibraryManager: () -> Unit,
     onOpenPanelSpike: () -> Unit,
 ) {
@@ -118,6 +127,19 @@ fun SettingsScreen(
         drawRect(pageBackground)
         drawContent()
     })
+    // ---- M4.5 同步状态与弹层 ----
+    val syncUi = if (syncRepository != null) {
+        syncRepository.state.collectAsStateWithLifecycle(
+            initialValue = SyncRepository.SyncUiState(),
+        ).value
+    } else {
+        SyncRepository.SyncUiState()
+    }
+    var syncConfigOpen by remember { mutableStateOf(false) }
+    var syncLogOpen by remember { mutableStateOf(false) }
+    var syncDeviceNameOpen by remember { mutableStateOf(false) }
+    var syncClearConfirmOpen by remember { mutableStateOf(false) }
+    var syncCloudBooksOpen by remember { mutableStateOf(false) }
     val backupRepository = remember(libraryRepository, settingsRepository) {
         BackupRepository(context, libraryRepository, settingsRepository)
     }
@@ -174,6 +196,12 @@ fun SettingsScreen(
     var openChoice by remember { mutableStateOf<ChoiceSpec?>(null) }
     // M6.3-C：净化规则面板
     var purifyPanelOpen by remember { mutableStateOf(false) }
+    // M6.3-D 收口：back 链——分组详情 → 设置首页 → 书架 tab。
+    // 互斥 enabled 避免与 overlay 层（净化/备份）的 BackHandler 抢优先级。
+    BackHandler(enabled = selectedGroupId != null) { selectedGroupId = null }
+    BackHandler(enabled = selectedGroupId == null && !purifyPanelOpen) {
+        onBackToLibrary()
+    }
 
     // M6.1-D 设置页收尾：小说字体管理 / 分格缓存清理
     var panelCacheCount by remember { mutableStateOf(0) }
@@ -203,6 +231,16 @@ fun SettingsScreen(
         context = context,
         savedCount = savedCount,
         panelCacheCount = panelCacheCount,
+        syncUi = syncUi,
+        onOpenSyncConfig = { syncConfigOpen = true },
+        onOpenSyncLog = { syncLogOpen = true },
+        onOpenSyncDeviceName = { syncDeviceNameOpen = true },
+        onClearSyncConfig = { syncClearConfirmOpen = true },
+        onOpenCloudBooks = { syncCloudBooksOpen = true },
+        onSyncNow = {
+            syncRepository?.syncNowAsync("手动")
+            glassNotice.show("开始同步…")
+        },
         onExportBackup = { if (!backupBusy) exportLauncher.launch("inkvol-backup.json") },
         onRestoreBackup = {
             if (!backupBusy) {
@@ -352,6 +390,61 @@ fun SettingsScreen(
                     }
                 },
             )
+        }
+
+        // ---- M4.5 同步弹层 ----
+        if (syncRepository != null) {
+            SyncConfigDialog(
+                visible = syncConfigOpen,
+                repository = settingsRepository,
+                syncRepository = syncRepository,
+                onDismiss = { syncConfigOpen = false },
+                onNotice = { glassNotice.show(it) },
+            )
+            SyncLogDialog(
+                visible = syncLogOpen,
+                syncRepository = syncRepository,
+                onDismiss = { syncLogOpen = false },
+            )
+            SyncDeviceNameDialog(
+                visible = syncDeviceNameOpen,
+                repository = settingsRepository,
+                syncRepository = syncRepository,
+                onDismiss = { syncDeviceNameOpen = false },
+            )
+            SyncCloudBooksDialog(
+                visible = syncCloudBooksOpen,
+                syncRepository = syncRepository,
+                onDismiss = { syncCloudBooksOpen = false },
+                onNotice = { glassNotice.show(it) },
+            )
+            if (syncClearConfirmOpen) {
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { syncClearConfirmOpen = false },
+                    title = { Text("清除同步配置？") },
+                    text = {
+                        Text("将删除本机的服务器、账号与应用密码配置并停用同步。云端数据与其它设备不受影响；重新配置后可重新配对。")
+                    },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            syncClearConfirmOpen = false
+                            scope.launch {
+                                settingsRepository.putString(SettingsKeys.SYNC_SERVER, "")
+                                settingsRepository.putString(SettingsKeys.SYNC_ACCOUNT, "")
+                                settingsRepository.putString(SettingsKeys.SYNC_PASSWORD_ENC, "")
+                                settingsRepository.putString(SettingsKeys.SYNC_DEVICE_NAME, "")
+                                settingsRepository.putBoolean(SettingsKeys.SYNC_ENABLED, false)
+                                settingsRepository.putString(SettingsKeys.SYNC_LAST_MODIFIED, "")
+                                syncRepository.refreshState()
+                                glassNotice.show("已清除同步配置")
+                            }
+                        }) { Text("清除", color = MaterialTheme.colorScheme.error) }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { syncClearConfirmOpen = false }) { Text("取消") }
+                    },
+                )
+            }
         }
 
         // M6.3-C：净化规则管理面板（遮罩点击关闭，无涟漪）
@@ -891,6 +984,13 @@ private fun buildSettingsGroups(
     context: Context,
     savedCount: Int,
     panelCacheCount: Int,
+    syncUi: SyncRepository.SyncUiState,
+    onOpenSyncConfig: () -> Unit,
+    onOpenSyncLog: () -> Unit,
+    onOpenSyncDeviceName: () -> Unit,
+    onClearSyncConfig: () -> Unit,
+    onOpenCloudBooks: () -> Unit,
+    onSyncNow: () -> Unit,
     onExportBackup: () -> Unit,
     onRestoreBackup: () -> Unit,
     onOpenLibraryManager: () -> Unit,
@@ -929,6 +1029,30 @@ private fun buildSettingsGroups(
             kotlinx.serialization.json.Json.encodeToString(
                 com.inkvol.app.data.model.NovelReadingPrefs.serializer(),
                 next,
+            ),
+        )
+    }
+
+    // 漫画阅读全局布局默认（reader_global_prefs）：智能分格档的真源。
+    // 全局快照未建立时默认「关闭」（省内存）。
+    fun globalComicPanelMode(): String = runCatching {
+        com.inkvol.app.data.model.decodeBookPrefs(
+            stringOf(SettingsKeys.READER_GLOBAL_PREFS, ""),
+            SettingsKeys.PANEL_OFF,
+        )?.panelMode
+    }.getOrNull() ?: SettingsKeys.PANEL_OFF
+
+    fun putGlobalComicPanelMode(mode: String) {
+        val current = runCatching {
+            com.inkvol.app.data.model.decodeBookPrefs(
+                stringOf(SettingsKeys.READER_GLOBAL_PREFS, ""),
+                SettingsKeys.PANEL_OFF,
+            )
+        }.getOrNull() ?: com.inkvol.app.data.model.BookReadingPrefs()
+        putString(
+            SettingsKeys.READER_GLOBAL_PREFS,
+            com.inkvol.app.data.model.encodeBookPrefs(
+                current.copy(panelMode = mode, panelModeExplicit = true),
             ),
         )
     }
@@ -1065,18 +1189,19 @@ private fun buildSettingsGroups(
                         SettingChoice(SettingsKeys.DOUBLE_PAGE_OFF, "关闭"),
                     ),
                 ),
-                choice(
+                // 智能分格默认写进全局阅读快照（与阅读器面板同一真源）；
+                // 未单独记忆的书全部跟随它。
+                ChoiceSpec(
                     id = "reader_panel_default",
                     title = "智能分格默认",
-                    subtitle = "新书与未单独设置过的书使用该档位；关闭可省内存",
-                    key = SettingsKeys.READER_PANEL_DEFAULT,
-                    default = SettingsKeys.PANEL_OFF,
+                    subtitle = "所有未单独记忆的书使用该档位；关闭可省内存",
+                    value = globalComicPanelMode(),
                     options = listOf(
                         SettingChoice(SettingsKeys.PANEL_OFF, "关闭"),
                         SettingChoice(SettingsKeys.PANEL_AUTO, "自动"),
                         SettingChoice(SettingsKeys.PANEL_ON, "始终开启"),
                     ),
-                ),
+                ) { next -> putGlobalComicPanelMode(next) },
                 InfoSpec(
                     id = "panel_cache_count",
                     title = "分格缓存",
@@ -1197,7 +1322,7 @@ private fun buildSettingsGroups(
         SettingsGroupSpec(
             id = "novel",
             title = "小说阅读",
-            subtitle = "全局默认排版、字体与主题",
+            subtitle = "全局默认排版、字体与背景",
             specs = run {
                 val defaults = globalPrefs()
                 val fontOptions = listOf(
@@ -1308,7 +1433,7 @@ private fun buildSettingsGroups(
                     },
                     ChoiceSpec(
                         id = "novel_global_theme",
-                        title = "默认主题",
+                        title = "默认背景",
                         subtitle = "纸白 / 米黄 / 护眼绿 / 墨黑",
                         value = defaults.theme,
                         options = listOf(
@@ -1319,8 +1444,20 @@ private fun buildSettingsGroups(
                         ),
                     ) { next -> putGlobal(defaults.copy(theme = next)) },
                     ChoiceSpec(
+                        id = "novel_page_transition",
+                        title = "动画",
+                        subtitle = "点击翻页的过渡效果，独立于漫画；拖拽与跳页不受影响",
+                        value = stringOf(SettingsKeys.NOVEL_PAGE_TRANSITION, SettingsKeys.PAGE_TRANSITION_CURL),
+                        options = listOf(
+                            SettingChoice(SettingsKeys.PAGE_TRANSITION_INSTANT, "无动画"),
+                            SettingChoice(SettingsKeys.PAGE_TRANSITION_SLIDE, "平移"),
+                            SettingChoice(SettingsKeys.PAGE_TRANSITION_COVER, "覆盖"),
+                            SettingChoice(SettingsKeys.PAGE_TRANSITION_CURL, "仿真"),
+                        ),
+                    ) { next -> putString(SettingsKeys.NOVEL_PAGE_TRANSITION, next) },
+                    ChoiceSpec(
                         id = "novel_global_paging",
-                        title = "默认翻页方式",
+                        title = "默认方向",
                         subtitle = "左右翻页或上下翻页",
                         value = defaults.pagingMode,
                         options = listOf(
@@ -1404,6 +1541,137 @@ private fun buildSettingsGroups(
             ),
         ),
         SettingsGroupSpec(
+            id = "sync",
+            title = "同步",
+            subtitle = "多设备进度与标注（WebDAV）",
+            specs = run {
+                val statusText = when {
+                    !syncUi.configured -> "未配置"
+                    !syncUi.enabled -> "已停用"
+                    syncUi.syncing -> "同步中…"
+                    syncUi.lastOkAt > 0L -> "上次 " + java.text.SimpleDateFormat(
+                        "MM-dd HH:mm",
+                        java.util.Locale.getDefault(),
+                    ).format(java.util.Date(syncUi.lastOkAt))
+                    else -> "已就绪"
+                }
+                buildList {
+                    add(
+                        InfoSpec(
+                            id = "sync_status",
+                            title = "同步状态",
+                            subtitle = syncUi.lastResult.ifBlank {
+                                if (syncUi.serverHost.isNotBlank()) syncUi.serverHost else "坚果云或任意 WebDAV 服务器"
+                            },
+                            value = statusText,
+                        ),
+                    )
+                    add(
+                        ActionSpec(
+                            id = "sync_server",
+                            title = "同步服务配置",
+                            subtitle = "服务器、账号、应用密码与同步目录",
+                            value = if (syncUi.configured) "修改" else "配置",
+                            onAction = onOpenSyncConfig,
+                        ),
+                    )
+                    if (syncUi.configured) {
+                        add(
+                            toggle(
+                                id = "sync_auto",
+                                title = "自动同步",
+                                subtitle = "保存进度后 2 分钟内自动同步，退后台补同步",
+                                key = SettingsKeys.SYNC_AUTO,
+                                default = true,
+                            ),
+                        )
+                        add(
+                            toggle(
+                                id = "sync_wifi_only",
+                                title = "仅在 WiFi 下自动同步",
+                                subtitle = "移动数据下暂停自动同步，手动同步不受限",
+                                key = SettingsKeys.SYNC_WIFI_ONLY,
+                                default = true,
+                            ),
+                        )
+                        add(
+                            toggle(
+                                id = "sync_files_single",
+                                title = "同步单文件导入书籍",
+                                subtitle = "书籍文件保存到云端，其它设备自动下载导入",
+                                key = SettingsKeys.SYNC_FILES_SINGLE,
+                                default = true,
+                            ),
+                        )
+                        add(
+                            toggle(
+                                id = "sync_files_all",
+                                title = "全部同步",
+                                subtitle = "扩展到所有单文件书籍（ZIP/EPUB 等）；文件夹漫画不参与",
+                                key = SettingsKeys.SYNC_FILES_ALL,
+                                default = false,
+                            ),
+                        )
+                        add(
+                            ActionSpec(
+                                id = "sync_cloud_books",
+                                title = "云端书籍",
+                                subtitle = "查看云端文件，下载本地缺失的书籍",
+                                value = "查看",
+                                onAction = onOpenCloudBooks,
+                            ),
+                        )
+                        add(
+                            toggle(
+                                id = "sync_enabled",
+                                title = "启用同步",
+                                subtitle = "关闭后停止全部自动与手动同步",
+                                key = SettingsKeys.SYNC_ENABLED,
+                                default = false,
+                            ),
+                        )
+                        add(
+                            ActionSpec(
+                                id = "sync_now",
+                                title = "立即同步",
+                                subtitle = "拉取其它设备并推送本机进度（绕过 WiFi 门禁）",
+                                value = if (syncUi.syncing) "同步中" else "执行",
+                                enabled = !syncUi.syncing && syncUi.enabled,
+                                onAction = onSyncNow,
+                            ),
+                        )
+                        add(
+                            ActionSpec(
+                                id = "sync_device_name",
+                                title = "设备名",
+                                subtitle = "同步记录里显示的本机名称",
+                                value = syncUi.deviceName.ifBlank { "默认" },
+                                onAction = onOpenSyncDeviceName,
+                            ),
+                        )
+                        add(
+                            ActionSpec(
+                                id = "sync_log",
+                                title = "同步记录",
+                                subtitle = "最近 20 次同步的时间、方向与结果",
+                                value = "查看",
+                                onAction = onOpenSyncLog,
+                            ),
+                        )
+                        add(
+                            ActionSpec(
+                                id = "sync_clear",
+                                title = "清除同步配置",
+                                subtitle = "删除本机配置；可选同时删除云端本机文件",
+                                value = "清除",
+                                onAction = onClearSyncConfig,
+                            ),
+                        )
+                    }
+                }
+            },
+        ),
+        SettingsGroupSpec(
             id = "storage",
             title = "存储与备份",
             subtitle = "空间、备份恢复、清理",
@@ -1479,5 +1747,340 @@ private fun buildSettingsGroups(
                 ),
             ),
         ),
+    )
+}
+
+// ---- M4.5 同步弹层 ----
+
+@Composable
+private fun SyncConfigDialog(
+    visible: Boolean,
+    repository: SettingsRepository,
+    syncRepository: SyncRepository,
+    onDismiss: () -> Unit,
+    onNotice: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var server by remember { mutableStateOf("") }
+    var account by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var basePath by remember { mutableStateOf("/Inkvol/") }
+    var testing by remember { mutableStateOf(false) }
+    var testResult by remember { mutableStateOf("") }
+    var loaded by remember { mutableStateOf(false) }
+
+    LaunchedEffect(visible) {
+        if (visible && !loaded) {
+            val prefs = repository.snapshotPreferences()
+            server = repository.stringOf(prefs, SettingsKeys.SYNC_SERVER, "")
+                .ifBlank { "https://dav.jianguoyun.com/dav/" }
+            account = repository.stringOf(prefs, SettingsKeys.SYNC_ACCOUNT, "")
+            basePath = repository.stringOf(prefs, SettingsKeys.SYNC_BASE_PATH, "/Inkvol/")
+            loaded = true
+        }
+    }
+
+    if (!visible) return
+
+    fun normalizeBasePath(raw: String): String = raw.trim().let {
+        (if (it.startsWith("/")) it else "/$it").let { p -> if (p.endsWith("/")) p else "$p/" }
+    }
+
+    fun runTest() {
+        val pwd = password
+        val acct = account.trim()
+        val srv = server.trim()
+        if (srv.isBlank() || acct.isBlank()) {
+            testResult = "请先填写服务器与账号"
+            return
+        }
+        testing = true
+        testResult = ""
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            val outcome = runCatching {
+                val client = WebDavClient(srv, normalizeBasePath(basePath), acct, pwd)
+                client.list("")
+                client.makeCollection("")
+                client.makeCollection(SyncRepository.DEVICE_DIR)
+                client.makeCollection(SyncRepository.BOOK_DIR)
+            }
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                testing = false
+                testResult = outcome.fold(
+                    onSuccess = { "连接成功，目录已就绪" },
+                    onFailure = {
+                        when (val e = it as? DavException) {
+                            null -> "网络错误：${it.message ?: "未知"}"
+                            else -> if (e.statusCode == 401) "账号或应用密码错误（401）" else "失败（HTTP ${e.statusCode}）：${e.message ?: ""}"
+                        }
+                    },
+                )
+            }
+        }
+    }
+
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("同步服务配置") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = server,
+                    onValueChange = { server = it },
+                    label = { Text("服务器 URL（https）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = account,
+                    onValueChange = { account = it },
+                    label = { Text("账号") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("应用密码") },
+                    singleLine = true,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "坚果云：网页端「账户信息 → 安全选项 → 添加应用密码」生成，勿用登录密码",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = basePath,
+                    onValueChange = { basePath = it },
+                    label = { Text("同步目录") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                TextButton(onClick = { runTest() }, enabled = !testing) {
+                    Text(if (testing) "测试中…" else "测试连接")
+                }
+                if (testResult.isNotBlank()) {
+                    Text(
+                        testResult,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (testResult.startsWith("连接成功")) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.error
+                        },
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !testing && server.startsWith("https://") &&
+                    account.isNotBlank() && password.isNotBlank(),
+                onClick = {
+                    scope.launch {
+                        repository.putString(SettingsKeys.SYNC_SERVER, server.trim())
+                        repository.putString(SettingsKeys.SYNC_ACCOUNT, account.trim())
+                        repository.putString(SettingsKeys.SYNC_BASE_PATH, normalizeBasePath(basePath))
+                        if (password.isNotBlank()) {
+                            repository.putString(SettingsKeys.SYNC_PASSWORD_ENC, CryptoBox.encrypt(password))
+                        }
+                        repository.putBoolean(SettingsKeys.SYNC_ENABLED, true)
+                        syncRepository.refreshState()
+                        onNotice("已保存，开始首次同步…")
+                        syncRepository.syncNowAsync("首次同步")
+                        onDismiss()
+                    }
+                },
+            ) { Text("保存并启用") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+@Composable
+private fun SyncLogDialog(
+    visible: Boolean,
+    syncRepository: SyncRepository,
+    onDismiss: () -> Unit,
+) {
+    if (!visible) return
+    val entries = remember { syncRepository.syncLog() }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("同步记录") },
+        text = {
+            if (entries.isEmpty()) {
+                Text("暂无同步记录")
+            } else {
+                LazyColumn(
+                    modifier = Modifier.heightIn(max = 360.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    items(entries) { entry ->
+                        Column {
+                            Text(
+                                text = buildString {
+                                    append(java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(entry.at)))
+                                    append(if (entry.ok) "  成功" else "  失败")
+                                    if (entry.ok) {
+                                        append(" · 拉取 ${entry.pulled} · 推送 ${entry.pushed}")
+                                        if (entry.conflicts > 0) append(" · 冲突 ${entry.conflicts}")
+                                    } else {
+                                        append(" · ").append(entry.message ?: entry.errorKind ?: "")
+                                    }
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (entry.ok) {
+                                    MaterialTheme.colorScheme.onSurface
+                                } else {
+                                    MaterialTheme.colorScheme.error
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
+    )
+}
+
+@Composable
+private fun SyncDeviceNameDialog(
+    visible: Boolean,
+    repository: SettingsRepository,
+    syncRepository: SyncRepository,
+    onDismiss: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var name by remember { mutableStateOf("") }
+    LaunchedEffect(visible) {
+        if (visible) {
+            name = syncRepository.state.value.deviceName
+        }
+    }
+    if (!visible) return
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("设备名") },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                label = { Text("留空使用默认（厂商+型号）") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                scope.launch {
+                    repository.putString(SettingsKeys.SYNC_DEVICE_NAME, name.trim())
+                    syncRepository.refreshState()
+                    onDismiss()
+                }
+            }) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
+@Composable
+private fun SyncCloudBooksDialog(
+    visible: Boolean,
+    syncRepository: SyncRepository,
+    onDismiss: () -> Unit,
+    onNotice: (String) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    var loading by remember { mutableStateOf(false) }
+    var books by remember { mutableStateOf<List<SyncFiles.CloudBookInfo>>(emptyList()) }
+    var error by remember { mutableStateOf("") }
+    var downloading by remember { mutableStateOf(false) }
+
+    suspend fun refresh() {
+        loading = true
+        error = ""
+        syncRepository.listCloudBooks().fold(
+            onSuccess = { books = it },
+            onFailure = { error = it.message ?: "读取失败" },
+        )
+        loading = false
+    }
+
+    LaunchedEffect(visible) {
+        if (visible) refresh()
+    }
+
+    if (!visible) return
+
+    fun downloadMissing() {
+        if (downloading) return
+        downloading = true
+        scope.launch {
+            val missing = books.filter { !it.existsLocally }
+            var ok = 0
+            missing.forEach { info ->
+                syncRepository.downloadCloudBook(info).fold(
+                    onSuccess = { ok++ },
+                    onFailure = { },
+                )
+            }
+            downloading = false
+            onNotice("已下载导入 $ok 本")
+            refresh()
+        }
+    }
+
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("云端书籍") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                val missing = books.count { !it.existsLocally }
+                Text(
+                    if (loading) "读取中…" else "云端 ${books.size} 本 · 本地缺失 $missing 本",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (error.isNotBlank()) {
+                    Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                }
+                LazyColumn(
+                    modifier = Modifier.heightIn(max = 300.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    items(books) { info ->
+                        Row(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                text = info.fileName,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.weight(1f),
+                                maxLines = 1,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = if (info.existsLocally) "本地已有" else "云端独有",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (info.existsLocally) {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = books.any { !it.existsLocally } && !downloading && error.isBlank(),
+                onClick = { downloadMissing() },
+            ) { Text(if (downloading) "下载中…" else "下载缺失") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
     )
 }

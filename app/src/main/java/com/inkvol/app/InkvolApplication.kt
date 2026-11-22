@@ -7,14 +7,26 @@ import coil3.SingletonImageLoader
 import com.inkvol.app.data.repository.LibraryRepository
 import com.inkvol.app.data.scan.ScanScheduler
 import com.inkvol.app.data.settings.SettingsRepository
+import com.inkvol.app.data.sync.SyncRepository
+import com.inkvol.app.data.sync.SyncScheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
-/** 手写依赖容器：M0 只保留设置与书架两个本地依赖，不引入任何网络组件。 */
+/** 手写依赖容器：本地依赖 + M4.5 WebDAV 同步（可选模块，同步未启用零网络行为）。 */
 class AppContainer(application: Application) {
     val settingsRepository = SettingsRepository(application)
-    val libraryRepository = LibraryRepository(application)
+    val libraryRepository = LibraryRepository(application, settingsRepository)
+    val syncRepository = SyncRepository(application, settingsRepository, libraryRepository)
+    val syncScheduler = SyncScheduler(application, settingsRepository, syncRepository)
+
+    init {
+        // 同步挂钩：进度保存 → 防抖自动同步；书籍级联硬删（多选删除/书库移除/回收站清除）→ 墓碑 + 传播。
+        libraryRepository.syncOnProgressSaved = { syncScheduler.onProgressSaved() }
+        libraryRepository.syncOnBooksPurged = { ids -> syncRepository.onBooksPurged(ids) }
+        syncRepository.refreshState()
+        syncScheduler.onAppReady()
+    }
 }
 
 class InkvolApplication : Application(), SingletonImageLoader.Factory {

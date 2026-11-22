@@ -69,6 +69,31 @@ class ReaderOpenSession(
 val LocalReaderOpenController = staticCompositionLocalOf<ReaderOpenController?> { null }
 
 /**
+ * 阅读器屏（漫画 / 小说）当前是否还有实例挂着（引用计数）。
+ *
+ * 一镜到底返回的垫层需要判断「真实阅读器还在不在」：路由 pop 后 NavHost 卸载组件
+ * 与 `currentRoute` 状态更新不同步（后者滞后 2~3 帧，见 §9.18），用路由判断会让垫层
+ * 与阅读器生命周期错位——垫层早撤则真实阅读器正文/顶栏透出叠在书架上（「踩顶栏 /
+ * 退出堆叠」），晚撤则书架被底色盖住。这里改用组件生命周期做唯一判据。
+ */
+object ReaderSurfaceAlive {
+    private var count = 0
+
+    var alive by mutableStateOf(false)
+        private set
+
+    fun enter() {
+        count++
+        alive = true
+    }
+
+    fun exit() {
+        count = (count - 1).coerceAtLeast(0)
+        alive = count > 0
+    }
+}
+
+/**
  * 一镜到底状态机的唯一真源。
  * 由 ReaderOpenViewModel 持有，避免旋转重建丢 session。
  */
@@ -112,6 +137,35 @@ class ReaderOpenController {
     /** 预解码的第一页；overlay 用它和封面做同层交叉。 */
     var contentBitmap by mutableStateOf<ImageBitmap?>(null)
         private set
+
+    /**
+     * 小说正文首屏快照（打开动画的「终态内容」）。
+     * 与 [contentBitmap] 分开存：打开阶段先用封面起飞（不等排版），快照到达后由 overlay
+     * 在容器内做「封面 → 正文」交叉；返回阶段仍用 contentBitmap（updateNovelContent 刷新为当前页）。
+     */
+    var pageBitmap by mutableStateOf<ImageBitmap?>(null)
+        private set
+
+    /**
+     * 打开阶段最终呈现的内容层：小说优先正文页快照（交接帧与 Reader 首帧同构），
+     * 快照未就绪时回落到占位内容（封面）；漫画没有 pageBitmap，恒为首页。
+     * overlay 在它之上用 [openCoverBitmap] 做「封面 → 正文」交叉。
+     */
+    val finalContentBitmap: ImageBitmap? get() = pageBitmap ?: contentBitmap
+
+    /**
+     * 打开阶段的交叉封面层：只有小说、且正文页快照已就绪时才有值
+     * （漫画打开阶段不画封面；小说快照未就绪时 [finalContentBitmap] 本身就是封面，无需叠加）。
+     */
+    val openCoverBitmap: ImageBitmap? get() =
+        if (isNovel && pageBitmap != null) coverBitmap else null
+
+    /** 飞行容器填充色：漫画黑底 / 小说正文底色。 */
+    val flightContainerColor: Int
+        get() = if (isNovel) novelBackgroundColor else 0xFF000000.toInt()
+
+    /** 飞行目标是否铺满全屏（小说正文铺满；漫画按页比例 letterbox）。 */
+    val flightFullScreen: Boolean get() = isNovel
 
     var session by mutableStateOf<ReaderOpenSession?>(null)
         private set
@@ -297,6 +351,8 @@ class ReaderOpenController {
         if (bookId != session.book.id) return false
         if (phase != ReaderOpenPhase.Preparing && phase != ReaderOpenPhase.Opening) return false
         novelSession = session
+        // 正文首屏快照单独留存：打开动画的「终态内容」，供封面 → 正文交叉使用
+        pageBitmap = session.firstPageBitmap
         coverBitmap = cover ?: coverBitmap
         if (contentBitmap == null) {
             contentBitmap = session.firstPageBitmap
@@ -366,6 +422,7 @@ class ReaderOpenController {
         novelSession = null
         coverBitmap = null
         contentBitmap = null
+        pageBitmap = null
     }
 
     fun beginClose(
@@ -439,7 +496,7 @@ class ReaderOpenController {
         rootHeightPx: Float,
     ): ReaderOpenRect {
         // 小说正文铺满全屏，目标矩形从一开始就是根矩形，避免飞行中途改道。
-        if (isNovel) {
+        if (flightFullScreen) {
             return ReaderOpenRect(0f, 0f, rootWidthPx, rootHeightPx)
         }
         val aspect = coverAspect

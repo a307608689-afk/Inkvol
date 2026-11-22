@@ -134,7 +134,10 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.inkvol.app.data.model.BookReadingPrefs
 import com.inkvol.app.data.model.BookRecord
+import com.inkvol.app.data.model.decodeBookPrefs
+import com.inkvol.app.data.model.encodeBookPrefs
 import com.inkvol.app.data.repository.LibraryRepository
 import com.inkvol.app.data.settings.SettingsKeys
 import com.inkvol.app.ui.components.LocalReaderOpenController
@@ -144,6 +147,7 @@ import com.inkvol.app.ui.reader.panel.ReaderPanelEditorSheet
 import com.inkvol.app.util.Fingerprint
 import com.inkvol.app.ui.components.ReaderOpenRect
 import com.inkvol.app.ui.components.ReaderOpenSession
+import com.inkvol.app.ui.components.ReaderSurfaceAlive
 import com.inkvol.app.ui.components.glass.GlassDefaults
 import com.inkvol.app.ui.components.glass.GlassDimens
 import com.inkvol.app.ui.components.glass.GlassEdge
@@ -245,6 +249,8 @@ fun ReaderScreen(
     }
 
     DisposableEffect(Unit) {
+        // 一镜到底返回垫层的唯一判据：阅读器组件是否还挂着（路由状态滞后 2~3 帧不可用）
+        ReaderSurfaceAlive.enter()
         val window = (context as? Activity)?.window
         val controller = window?.let { WindowCompat.getInsetsController(it, view) }
         val hideBars = Runnable {
@@ -259,6 +265,7 @@ fun ReaderScreen(
         view.post(hideBars)
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onDispose {
+            ReaderSurfaceAlive.exit()
             view.removeCallbacks(hideBars)
             // 退出后只恢复导航栏（底栏 inset 需要）；状态栏由书架玻璃头按滚动状态
             // 单点控制——这里 show statusBars 会在滚动隐藏态下造成「闪现后又被隐藏」。
@@ -344,15 +351,34 @@ private fun ReaderContent(
 ) {
     val count = loader.source.pageCount.coerceAtLeast(1)
     val prefs by settingsRepository.preferences.collectAsStateWithLifecycle(initialValue = null)
+    // 本书快照：仅「单独记忆」开启时读取/写入
     val savedBookPrefsRaw = prefs?.let {
         settingsRepository.stringOf(it, SettingsKeys.readerBookKey(book.id), "")
     }
-    // 全局智能分格初始默认（默认关闭）：供新书与未单独设置过的书使用
-    val panelDefault = prefs?.let {
-        settingsRepository.stringOf(it, SettingsKeys.READER_PANEL_DEFAULT, SettingsKeys.PANEL_OFF)
-    } ?: SettingsKeys.PANEL_OFF
-    val savedBookPrefs = remember(savedBookPrefsRaw, panelDefault) {
-        decodeBookPrefs(savedBookPrefsRaw, panelDefault)
+    // 全局布局默认：所有未单独记忆的书读它、改它（编码与本书快照同构）
+    val globalBookPrefsRaw = prefs?.let {
+        settingsRepository.stringOf(it, SettingsKeys.READER_GLOBAL_PREFS, "")
+    }
+    // 单独记忆开关：null = 用户从未选择过（老书按已有快照自动迁移为开）
+    val soloStored = prefs?.let {
+        settingsRepository.booleanOrNull(it, SettingsKeys.readerBookSoloKey(book.id))
+    }
+    // 智能分格：全局快照未建立时硬默认「关闭」（不再从旧 panelDefault 键播种）
+    val globalPanelMode = remember(globalBookPrefsRaw) {
+        decodeBookPrefs(globalBookPrefsRaw)?.panelMode ?: SettingsKeys.PANEL_OFF
+    }
+    val effectiveSolo = soloStored ?: (savedBookPrefsRaw?.isNotBlank() == true)
+    // 单独记忆开 → 本书快照（缺则回退全局作起点）；关 → 全局跟随（本书旧快照忽略）。
+    // 未显式改过分格档的书，其分格档跟随全局，故 defaultPanelMode 传全局档。
+    val savedBookPrefs = remember(
+        savedBookPrefsRaw,
+        globalBookPrefsRaw,
+        globalPanelMode,
+        effectiveSolo,
+    ) {
+        val perBook = decodeBookPrefs(savedBookPrefsRaw, globalPanelMode)
+        val global = decodeBookPrefs(globalBookPrefsRaw, globalPanelMode)
+        if (effectiveSolo) perBook ?: global else global ?: perBook
     }
     val gestures = remember(prefs) {
         buildGestureSettings(prefs, settingsRepository)
@@ -377,9 +403,11 @@ private fun ReaderContent(
     var splitSpreads by remember(book.id) { mutableStateOf(false) }
     var repair by remember(book.id) { mutableIntStateOf(0) }
     var pageOverlap by remember(book.id) { mutableIntStateOf(0) }
-    var panelMode by remember(book.id) { mutableStateOf(panelDefault) }
-    // 是否在阅读器内显式改过分格档位：未显式设置的书实时跟随全局默认
+    var panelMode by remember(book.id) { mutableStateOf(globalPanelMode) }
+    // 是否在阅读器内显式改过分格档位：未显式设置的书跟随全局分格档
     var panelModeTouched by remember(book.id) { mutableStateOf(false) }
+    // 「此本书单独记忆」：关（默认）= 全局跟随；开 = 本书排版独立保存
+    var prefsSolo by remember(book.id) { mutableStateOf(effectiveSolo) }
     var chromeVisible by remember { mutableStateOf(false) }
     var quickPanel by remember { mutableStateOf(false) }
     var thumbnailsOpen by remember { mutableStateOf(false) }
@@ -437,7 +465,7 @@ private fun ReaderContent(
         }
     }
 
-    // 每本书首次加载已保存偏好；之后用户改动实时落库。
+    // 首次加载生效偏好（单独记忆 → 本书快照；否则 → 全局默认）；之后用户改动实时落库。
     // 关键：prefs 首帧为 null（DataStore 尚未发射），此时不能当作"本书无存档"——
     // 否则会提前把 bookPrefsLoaded 置真（存档被永久跳过），随后保存 effect 用初值覆盖存档，
     // 表现为「书内打开智能分格，退出重进又变回关闭」。
@@ -454,14 +482,14 @@ private fun ReaderContent(
             panelMode = saved.panelMode
             panelModeTouched = saved.panelModeExplicit
         }
-        // 无存档的新书：直接吃全局默认
-        if (savedBookPrefs == null) panelMode = panelDefault
+        // 无任何快照：吃旧的分格默认档
+        if (savedBookPrefs == null) panelMode = globalPanelMode
+        prefsSolo = effectiveSolo
+        // 无损迁移：老书已有本书快照、但从未选择过「单独记忆」→ 记为开，保留原有独立排版
+        if (soloStored == null && savedBookPrefsRaw?.isNotBlank() == true) {
+            settingsRepository.putBoolean(SettingsKeys.readerBookSoloKey(book.id), true)
+        }
         bookPrefsLoaded = true
-    }
-    // 未在阅读器内显式设置过的书实时跟随全局默认（含 prefs 首帧 null → 实际值）
-    LaunchedEffect(panelDefault, bookPrefsLoaded) {
-        if (!bookPrefsLoaded || panelModeTouched) return@LaunchedEffect
-        panelMode = panelDefault
     }
     LaunchedEffect(
         bookPrefsLoaded,
@@ -473,23 +501,38 @@ private fun ReaderContent(
         pageOverlap,
         panelMode,
         panelModeTouched,
+        prefsSolo,
     ) {
         if (!bookPrefsLoaded) return@LaunchedEffect
-        settingsRepository.putString(
-            SettingsKeys.readerBookKey(book.id),
-            encodeBookPrefs(
-                BookReadingPrefs(
-                    vertical = vertical,
-                    rtl = rtl,
-                    trimMargins = trimMargins,
-                    splitSpreads = splitSpreads,
-                    repair = repair,
-                    pageOverlap = pageOverlap,
-                    panelMode = panelMode,
-                    panelModeExplicit = panelModeTouched,
-                ),
-            ),
+        val snapshot = BookReadingPrefs(
+            vertical = vertical,
+            rtl = rtl,
+            trimMargins = trimMargins,
+            splitSpreads = splitSpreads,
+            repair = repair,
+            pageOverlap = pageOverlap,
+            panelMode = panelMode,
+            panelModeExplicit = panelModeTouched,
         )
+        if (prefsSolo) {
+            // 单独记忆：只写本书快照（旧快照保留，关闭开关时忽略但不删除）
+            settingsRepository.putString(
+                SettingsKeys.readerBookKey(book.id),
+                encodeBookPrefs(snapshot),
+            )
+            // M4.5：per-book 偏好变更时间戳（同步合并 LWW 依据）
+            settingsRepository.putLong(
+                SettingsKeys.bookPrefTsKey(book.id),
+                System.currentTimeMillis(),
+            )
+        } else {
+            // 全局跟随：写全局默认，所有未单独记忆的书下次打开自动生效。
+            // 分格档在全局快照里恒为显式（它就是权威值，不再回落到旧 panelDefault）。
+            val encoded = encodeBookPrefs(snapshot.copy(panelModeExplicit = true))
+            if (encoded != globalBookPrefsRaw) {
+                settingsRepository.putString(SettingsKeys.READER_GLOBAL_PREFS, encoded)
+            }
+        }
     }
 
     LaunchedEffect(book.id, vertical) {
@@ -931,6 +974,12 @@ private fun ReaderContent(
         val currentToggleChrome: () -> Unit by rememberUpdatedState {
             chromeVisible = !chromeVisible
         }
+        // 覆盖档滑动翻页门条件：仅「覆盖」动画档启用（instant/slide 档保留原生拖拽）。
+        // rememberUpdatedState 中转：快捷面板就地切翻页动画档后手势循环读到的恒是新档位
+        // （pointerInput 协程持有首组 lambda，页面动画档位不能直接捕获）。
+        val coverSwipeActive: Boolean by rememberUpdatedState(
+            pageTransitionMode == SettingsKeys.PAGE_TRANSITION_COVER,
+        )
 
         BackHandler {
             when {
@@ -1014,6 +1063,39 @@ private fun ReaderContent(
                                             awaitFirstDown(requireUnconsumed = false)
                                         }
                                     if (secondDown == null) currentToggleChrome()
+                                }
+                            }
+                        }
+                    }
+                    .pointerInput(
+                        gestures.master,
+                        gestures.tapPaging,
+                        rtl,
+                        vertical,
+                    ) {
+                        // 覆盖档滑动翻页：横向滑动超过阈值触发一次与单击相同的翻页动画
+                        // （不跟手，触发前页面不移动）。与上面的点击判定并列成独立手势：
+                        // 本层 consume 后，点击判定的「无消费完整抬起」检查立即让位，不会
+                        // 误判成点击翻页。门条件（覆盖档）实时读 coverSwipeActive；方向
+                        // 语义与 reverseLayout=rtl 的原生平移一致：LTR 向左滑=下一页、
+                        // RTL 向右滑=下一页（与「rtl 左缘点击=下一页」同侧）。放大态平移/
+                        // 长按放大镜/边缘亮度色温/捏合均为子层手势先消费，本层看到
+                        // consumed 即放弃，不与它们竞争。
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            if (!coverSwipeActive) return@awaitEachGesture
+                            while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Main)
+                                if (event.changes.any { it.isConsumed }) return@awaitEachGesture
+                                val change = event.changes.firstOrNull { it.id == down.id }
+                                    ?: return@awaitEachGesture
+                                if (!change.pressed) return@awaitEachGesture
+                                val dx = change.position.x - down.position.x
+                                val dy = change.position.y - down.position.y
+                                if (abs(dx) > 48.dp.toPx() && abs(dx) > abs(dy) * 1.5f) {
+                                    event.changes.forEach { it.consume() }
+                                    currentTapFlip(if (rtl) dx > 0f else dx < 0f)
+                                    return@awaitEachGesture
                                 }
                             }
                         }
@@ -1113,6 +1195,10 @@ private fun ReaderContent(
                         state = pagerState,
                         reverseLayout = rtl,
                         beyondViewportPageCount = 2,
+                        // 覆盖档关闭原生拖拽平移：滑动=触发一次翻页动画（不跟手），由根层
+                        // 滑动手势接管；instant/slide 档拖拽不变。放大态平移由 ReaderPage
+                        // 内部手势处理，不依赖 Pager 滚动，不受此开关影响。
+                        userScrollEnabled = !coverEnabled,
                         modifier = Modifier.fillMaxSize(),
                     ) { index ->
                         val pageBody: @Composable () -> Unit = {
@@ -1210,7 +1296,12 @@ private fun ReaderContent(
                                                     (position - leaving) * size.width
                                             }
                                         }
-                                    },
+                                    }
+                                    // 页容器补不透明黑底：页内容（ContentScale.Fit 位图）之外的
+                                    // 留白此前透明，动画期间透出被补偿钉住的离开页画面造成叠印。
+                                    // 黑底放在 graphicsLayer 内侧，随页位移走；静止时与阅读器根层
+                                    // 黑底重合不可见，instant/slide 档走 pageBody() 直渲染不受影响。
+                                    .background(Color.Black),
                             ) { pageBody() }
                         } else {
                             pageBody()
@@ -1283,6 +1374,7 @@ private fun ReaderContent(
             ReaderQuickPanel(
                 visible = quickPanel,
                 presence = readerOverlays,
+                prefsSolo = prefsSolo,
                 vertical = vertical,
                     rtl = rtl,
                     doublePageMode = doublePageMode,
@@ -1315,6 +1407,37 @@ private fun ReaderContent(
                     onSetPanelMode = {
                         panelModeTouched = true
                         panelMode = it
+                    },
+                    onToggleSolo = { enable ->
+                        scope.launch {
+                            val snapshot = withContext(Dispatchers.IO) {
+                                settingsRepository.snapshotPreferences()
+                            }
+                            settingsRepository.putBoolean(
+                                SettingsKeys.readerBookSoloKey(book.id),
+                                enable,
+                            )
+                            if (enable) {
+                                // 打开瞬间：沿用本书历史快照（保留此前单独调过的偏好），
+                                // 无快照则以当前值（=全局值）为起点，随后落盘成为本书快照。
+                                val perBook = settingsRepository.stringOf(
+                                    snapshot,
+                                    SettingsKeys.readerBookKey(book.id),
+                                    "",
+                                )
+                                decodeBookPrefs(perBook, globalPanelMode)?.let { saved ->
+                                    vertical = saved.vertical
+                                    rtl = saved.rtl
+                                    trimMargins = saved.trimMargins
+                                    splitSpreads = saved.splitSpreads
+                                    repair = saved.repair
+                                    pageOverlap = saved.pageOverlap
+                                    panelMode = saved.panelMode
+                                    panelModeTouched = saved.panelModeExplicit
+                                }
+                            }
+                            prefsSolo = enable
+                        }
                     },
                     onApplyProfile = { profile ->
                         when (profile) {
@@ -2349,62 +2472,6 @@ private fun buildGestureSettings(
     )
 }
 
-private data class BookReadingPrefs(
-    val vertical: Boolean,
-    val rtl: Boolean,
-    val trimMargins: Boolean,
-    val splitSpreads: Boolean,
-    val repair: Int = 0,
-    val pageOverlap: Int = 0,
-    val panelMode: String = SettingsKeys.PANEL_OFF,
-    // index 8：用户是否在阅读器内显式改过分格档位；false = 跟随全局默认
-    val panelModeExplicit: Boolean = false,
-)
-
-private fun decodeBookPrefs(
-    raw: String?,
-    defaultPanelMode: String = SettingsKeys.PANEL_OFF,
-): BookReadingPrefs? {
-    if (raw.isNullOrBlank()) return null
-    val parts = raw.split('|')
-    val explicit = parts.getOrNull(8) == "1"
-    val storedPanelMode = when (parts.getOrNull(7)?.toIntOrNull()) {
-        0 -> SettingsKeys.PANEL_OFF
-        2 -> SettingsKeys.PANEL_ON
-        else -> SettingsKeys.PANEL_AUTO
-    }
-    return BookReadingPrefs(
-        vertical = parts.getOrNull(0) == "1",
-        rtl = parts.getOrNull(1) != "0",
-        // 旧格式 index 2 是 doublePage（已迁移为全局设置 reader_double_page），跳过不读
-        trimMargins = parts.getOrNull(3) == "1",
-        splitSpreads = parts.getOrNull(4) == "1",
-        repair = parts.getOrNull(5)?.toIntOrNull()?.coerceIn(0, 2) ?: 0,
-        pageOverlap = parts.getOrNull(6)?.toIntOrNull()?.coerceIn(0, 24) ?: 0,
-        // 未显式设置过的书（含旧存档无 index 8）一律吃全局默认
-        panelMode = if (explicit) storedPanelMode else defaultPanelMode,
-        panelModeExplicit = explicit,
-    )
-}
-
-private fun encodeBookPrefs(prefs: BookReadingPrefs): String = listOf(
-    if (prefs.vertical) "1" else "0",
-    if (prefs.rtl) "1" else "0",
-    // doublePage 占位（恒 0），保持旧编码格式对齐，避免旧存档错位解析
-    "0",
-    if (prefs.trimMargins) "1" else "0",
-    if (prefs.splitSpreads) "1" else "0",
-    prefs.repair.toString(),
-    prefs.pageOverlap.toString(),
-    when (prefs.panelMode) {
-        SettingsKeys.PANEL_AUTO -> "1"
-        SettingsKeys.PANEL_ON -> "2"
-        else -> "0"
-    },
-    // index 8：显式设置标记（旧存档无此段 → 视为跟随全局默认）
-    if (prefs.panelModeExplicit) "1" else "0",
-).joinToString("|")
-
 private fun splitBitmap(source: Bitmap): List<Bitmap> {
     val halfWidth = source.width / 2
     if (halfWidth <= 0) return listOf(source)
@@ -2784,6 +2851,7 @@ private fun ThumbCell(
 private fun ReaderQuickPanel(
     visible: Boolean,
     presence: GlassOverlayPresence,
+    prefsSolo: Boolean,
     vertical: Boolean,
     rtl: Boolean,
     doublePageMode: String,
@@ -2806,6 +2874,7 @@ private fun ReaderQuickPanel(
     onSetRepair: (Int) -> Unit,
     onSetOverlap: (Int) -> Unit,
     onSetPanelMode: (String) -> Unit,
+    onToggleSolo: (Boolean) -> Unit,
     onApplyProfile: (ReaderProfile) -> Unit,
     onDismiss: () -> Unit,
     backdrop: Backdrop,
@@ -2955,6 +3024,13 @@ private fun ReaderQuickPanel(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                Spacer(Modifier.height(8.dp))
+                // 单独记忆：开 = 本书排版独立保存（改动只影响本书）；
+                // 关（默认）= 跟随全局默认，面板改动对所有书一起生效。整行单击切换。
+                PanelRow(
+                    "单独记忆",
+                    if (prefsSolo) "开启" else "关闭",
+                ) { onToggleSolo(!prefsSolo) }
                 Spacer(Modifier.height(16.dp))
                 Text(
                     text = "亮度：左缘上下滑 · 色温：右缘上下滑 · 设置/分享在顶栏 · 缩略图在底栏",

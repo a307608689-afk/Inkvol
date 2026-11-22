@@ -18,6 +18,11 @@ data class BookRecord(
     val displayPath: String,
     val readStatus: String = READ_UNREAD,
     val percent: Double = 0.0,
+    /**
+     * 最近阅读时间（漫画 progress.updated_at 与小说 novel_progress.updated_at 取 MAX），
+     * 未读过恒 0——书架「最近阅读」排序档的数据源，SQL 里保证有值。
+     */
+    val lastReadAt: Long = 0,
     /** SAF 树 URI；单文件导入为 inkvol://single-file */
     val treeUri: String? = null,
 ) {

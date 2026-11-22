@@ -73,6 +73,8 @@ class LibraryScanner(
         scanDirectory(rootDocId, rootName, parentSeries = null, depth = 0, depthLimit = depthLimit)
         pruneArchiveCache()
         db.markFolderScanned(folderId)
+        // M7：EPUB 元数据幂等回填（writer/tags 双空的 EPUB 重解析 OPF；每次扫描顺带，候选为空零开销）
+        backfillEpubMetadata()
         if (accessible) {
             val covers = db.removeMissingLocations(folderId, scanStart)
             covers.forEach { path -> runCatching { File(path).delete() } }
@@ -217,17 +219,27 @@ class LibraryScanner(
         try {
             val fingerprint = Fingerprint.ofArchive(entry.size) { openDocument(entry.docId) }
             val title = entry.name.substringBeforeLast('.')
-            val isEpub = SourceRules.extensionOf(entry.name) == "epub"
+            val ext = SourceRules.extensionOf(entry.name)
+            val isEpub = ext == "epub"
+            val isMobi = ext == "mobi"
             // M6.3-C 净化：启用中的规则在解析时按行过滤（广告/水印/推广行不入副本）
             val purifyRegexes = db.queryPurifyRules(enabledOnly = true)
                 .map { runCatching { Regex(it.pattern) }.getOrNull() }
                 .filterNotNull()
             val parsedChapters: List<com.inkvol.app.data.model.NovelChapterRecord>
             val parsedCoverPath: String?
+            var parsedEpubMeta: EpubParser.Meta? = null
             if (isEpub) {
                 // EPUB 需要 ZipFile 随机访问，先落一份缓存副本
                 val local = copyToCache(entry, fingerprint)
                 val parsed = EpubParser.parse(context, fingerprint, local, purifyRegexes)
+                parsedChapters = parsed.chapters
+                parsedCoverPath = parsed.coverPath
+                parsedEpubMeta = EpubParser.Meta(writer = parsed.writer, tags = parsed.tags)
+            } else if (isMobi) {
+                // MOBI 需要随机访问记录表，先落一份缓存副本
+                val local = copyToCache(entry, fingerprint)
+                val parsed = MobiParser.parse(context, fingerprint, local, purifyRegexes)
                 parsedChapters = parsed.chapters
                 parsedCoverPath = parsed.coverPath
             } else {
@@ -237,17 +249,24 @@ class LibraryScanner(
                 parsedChapters = parsed.chapters
                 parsedCoverPath = null
             }
-            val format = if (isEpub) "EPUB" else "TXT"
+            val format = when {
+                isEpub -> "EPUB"
+                isMobi -> "MOBI"
+                else -> "TXT"
+            }
             val coverPath = parsedCoverPath
                 ?: NovelCoverGenerator.save(context, fingerprint, title, parsedChapters.size)
+            // M7：EPUB 带出 OPF 元数据（dc:creator/dc:subject）；TXT/MOBI 无元数据
+            val novelWriter = if (isEpub) (parsedEpubMeta?.writer) else null
+            val novelTags = if (isEpub) (parsedEpubMeta?.tags) else null
             val book = BookRecord(
                 id = fingerprint,
                 type = "NOVEL",
                 title = title,
                 series = series,
                 volume = null,
-                writer = null,
-                tags = null,
+                writer = novelWriter,
+                tags = novelTags,
                 pageCount = parsedChapters.size,
                 format = format,
                 fileSize = entry.size,
@@ -318,6 +337,41 @@ class LibraryScanner(
             FileOutputStream(target).use { output -> input.copyTo(output) }
         }
         return target
+    }
+
+    /**
+     * M7：EPUB 元数据回填。候选 = 本文件夹下 writer/tags 双空的 EPUB；
+     * 命中则更新，解析后全空写 tags='' 哨兵防重复回填。单本失败只记日志不中断扫描。
+     */
+    private fun backfillEpubMetadata() {
+        val candidates = db.queryEpubBackfillCandidates(folderId)
+        if (candidates.isEmpty()) return
+        var filled = 0
+        candidates.forEach { candidate ->
+            runCatching {
+                val entry = DocEntry(
+                    docId = candidate.docId,
+                    name = "${candidate.id}.epub",
+                    isDirectory = false,
+                    size = candidate.fileSize,
+                )
+                val local = copyToCache(entry, candidate.id)
+                val meta = EpubParser.parseMetadata(local)
+                val writer = meta?.writer
+                val tags = meta?.tags
+                if (writer == null && tags == null) {
+                    db.updateBookMetadata(candidate.id, null, "")
+                } else {
+                    db.updateBookMetadata(candidate.id, writer, tags)
+                }
+                filled++
+            }.onFailure { error ->
+                Log.w("InkvolScan", "epub metadata backfill failed: ${candidate.id}", error)
+            }
+        }
+        if (filled > 0) {
+            Log.i("InkvolScan", "epub metadata backfilled $filled/${candidates.size}")
+        }
     }
 
     private data class Probe(

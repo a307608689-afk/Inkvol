@@ -107,15 +107,18 @@ import androidx.navigation.compose.rememberNavController
 import com.inkvol.app.data.repository.LibraryRepository
 import com.inkvol.app.data.settings.SettingsKeys
 import com.inkvol.app.data.settings.SettingsRepository
+import com.inkvol.app.data.sync.SyncRepository
 import com.inkvol.app.ui.components.glass.GlassBottomBar
 import com.inkvol.app.ui.components.glass.GlassChromeInsets
 import com.inkvol.app.ui.components.glass.GlassDimens
 import com.inkvol.app.ui.components.glass.GlassEdge
 import com.inkvol.app.ui.components.glass.GlassMotion
 import com.inkvol.app.ui.components.glass.GlassRail
+import com.inkvol.app.ui.components.glass.FolderSortMenuOverlay
 import com.inkvol.app.ui.components.glass.PlusMenuOverlay
 import com.inkvol.app.ui.components.glass.RailActions
 import com.inkvol.app.ui.components.glass.RailVariant
+import com.inkvol.app.ui.components.glass.SortMenuOverlay
 import com.inkvol.app.ui.components.GlassNoticeBus
 import com.inkvol.app.ui.components.GlassNoticeHost
 import com.inkvol.app.ui.components.LocalGlassNotice
@@ -124,10 +127,12 @@ import com.inkvol.app.ui.components.LocalReaderActive
 import com.inkvol.app.ui.components.LocalReaderOpenController
 import com.inkvol.app.ui.components.LocalScrollToTop
 import com.inkvol.app.ui.components.LibraryGridScroll
+import com.inkvol.app.ui.components.LibraryPullRefresh
 import com.inkvol.app.ui.components.LibraryStatusBar
 import com.inkvol.app.ui.components.PageOverlayController
 import com.inkvol.app.ui.components.ReaderOpenController
 import com.inkvol.app.ui.components.ReaderOpenPhase
+import com.inkvol.app.ui.components.ReaderSurfaceAlive
 import com.inkvol.app.ui.components.ReaderOpenRect
 import com.inkvol.app.ui.components.ReaderOpenViewModel
 import com.inkvol.app.ui.components.ScrollToTopBus
@@ -140,7 +145,10 @@ import com.inkvol.app.ui.history.HistoryScreen
 import com.inkvol.app.ui.library.LibraryManagerScreen
 import com.inkvol.app.ui.reader.panel.PanelSpikeScreen
 import com.inkvol.app.ui.library.LibraryScreen
+import com.inkvol.app.ui.library.LibraryTarget
+import com.inkvol.app.ui.library.LibraryUiState
 import com.inkvol.app.ui.navigation.TopDestination
+import com.inkvol.app.ui.search.SearchScreen
 import com.inkvol.app.ui.novel.NovelChapterPreviewScreen
 import com.inkvol.app.ui.novel.NovelReaderScreen
 import com.inkvol.app.ui.reader.ReaderScreen
@@ -166,6 +174,13 @@ import kotlin.math.roundToInt
 private const val CLOSING_SOURCE_WAIT_MS = 800L
 
 /**
+ * 小说打开：封面 → 正文页的交叉时长（ms）。
+ * 与 [CLOSING_SOURCE_WAIT_MS] 无关：0.98 处最多再等正文快照 150ms，
+ * 140ms 的交叉必须能在这段窗口内播完（实测 140 足够，肉眼无硬切）。
+ */
+private const val READER_OPEN_CROSS_MS = 140f
+
+/**
  * Inkvol 宿主壳：玻璃采集层 + chrome 显隐状态机 + 三 Tab 导航。
  *
  * 结构对齐 SSMH 的 SsmhApp，但砍掉了所有网络/站点依赖：
@@ -177,6 +192,8 @@ private const val CLOSING_SOURCE_WAIT_MS = 800L
 fun InkvolApp(
     settingsRepository: SettingsRepository,
     libraryRepository: LibraryRepository,
+    /** M4.5 同步仓库（AppContainer 装配；在读书探针注入用）。 */
+    syncRepository: SyncRepository? = null,
     /** Widget 冷启动 / singleTop 唤起时请求打开的书籍 ID。 */
     pendingReaderBookId: String? = null,
     onPendingReaderConsumed: () -> Unit = {},
@@ -213,7 +230,19 @@ fun InkvolApp(
         val noticeBus = remember { GlassNoticeBus() }
         val readerOpenViewModel: ReaderOpenViewModel = viewModel()
         val readerOpen = readerOpenViewModel.controller
+        // M4.5：在读书探针——合并时跳过在读书的进度（标注/书签仍合并，防阅读中被远端覆盖）
+        androidx.compose.runtime.SideEffect {
+            syncRepository?.openBookProbe = {
+                readerOpen.bookId.takeIf { readerOpen.phase != ReaderOpenPhase.Idle }
+            }
+        }
         val prefs by settingsRepository.preferences.collectAsStateWithLifecycle(initialValue = null)
+        // 重扫进行中 → chrome 共享（平板侧栏刷新钮自旋）。宿主常驻组合：
+        // 书架页不在前台（如停在设置页）期间扫描结束也不会漏写复位。
+        val scanState by libraryRepository.scan.collectAsStateWithLifecycle()
+        LaunchedEffect(scanState.running) {
+            LibraryPullRefresh.rescanActive = scanState.running
+        }
         val openSpeed = prefs?.let {
             settingsRepository.stringOf(it, SettingsKeys.READER_OPEN_SPEED, SettingsKeys.OPEN_SPEED_FAST)
         } ?: SettingsKeys.OPEN_SPEED_FAST
@@ -230,10 +259,34 @@ fun InkvolApp(
         }
         // 侧栏加号三选菜单（询问档 / 长按强制弹出）
         var railPlusMenuOpen by remember { mutableStateOf(false) }
+        // 侧栏排序菜单（书架页平铺/系列视图的第 2 颗动作钮；排序状态与一级书架
+        // 同一持久化真源 LIBRARY_SORT / LIBRARY_SORT_DESC，写库后 prefs flow 自动
+        // 回流到 LibraryScreen 的派生值，无需额外桥接）
+        var railSortMenuOpen by remember { mutableStateOf(false) }
         // 与手机端加号同源：「加号默认动作」设置全局生效，未配置（ask）弹三选菜单
         val plusAction = prefs?.let {
             settingsRepository.stringOf(it, SettingsKeys.PLUS_ACTION, SettingsKeys.PLUS_ASK)
         } ?: SettingsKeys.PLUS_ASK
+        // 书架视图档（旧 "booklist" 值回落书夹视图，与 LibraryScreen 同款处理）：
+        // 决定侧栏排序钮显隐（仅书架 tab + 平铺/系列视图）。
+        val libraryViewMode = prefs?.let {
+            val stored = settingsRepository.stringOf(it, SettingsKeys.LIBRARY_VIEW, SettingsKeys.VIEW_FOLDER)
+            if (stored == "booklist") SettingsKeys.VIEW_FOLDER else stored
+        } ?: SettingsKeys.VIEW_FOLDER
+        // 一级书架排序状态快照（菜单选中态渲染用；写入走 putString 全局键）
+        val railSortMode = prefs?.let {
+            settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT, SettingsKeys.SORT_RECENT)
+        } ?: SettingsKeys.SORT_RECENT
+        val railSortDescending = prefs?.let {
+            settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT_DESC, "1")
+        } != "0"
+        // 书夹卡排序档位快照（书夹视图一级的菜单渲染用；独立于书排序）
+        val railFolderSortMode = prefs?.let {
+            settingsRepository.stringOf(it, SettingsKeys.LIBRARY_FOLDER_SORT, SettingsKeys.FOLDER_SORT_CUSTOM)
+        } ?: SettingsKeys.FOLDER_SORT_CUSTOM
+        val railFolderSortDescending = prefs?.let {
+            settingsRepository.stringOf(it, SettingsKeys.LIBRARY_FOLDER_SORT_DESC, "0")
+        } == "1"
 
         fun runRailPlusAction() {
             when (plusAction) {
@@ -390,6 +443,7 @@ fun InkvolApp(
             val readyForNav = readerOpen.contentBitmap != null || readerOpen.readerReady
             if (readerOpen.phase == ReaderOpenPhase.Opening &&
                 (currentRoute == TopDestination.Library.route ||
+                    currentRoute == TopDestination.Search.route ||
                     currentRoute == TopDestination.History.route) &&
                 readyForNav
             ) {
@@ -399,6 +453,15 @@ fun InkvolApp(
                     .first { it >= navThreshold }
                     .let {
                         if (readerOpen.phase == ReaderOpenPhase.Opening) {
+                            // 小说：容器已铺满（progress=1）时再等正文首屏快照最多 150ms，
+                            // 让「封面 → 正文」交叉在 overlay 上播完，交接帧才是正文页
+                            //（否则会按封面交出去，切路由瞬间硬切）。超时则按封面交接，
+                            // 由 Reader 首帧淡入兜底。
+                            if (readerOpen.isNovel && readerOpen.pageBitmap == null) {
+                                withTimeoutOrNull(150) {
+                                    snapshotFlow { readerOpen.pageBitmap != null }.first { it }
+                                }
+                            }
                             val route = if (readerOpen.isNovel) {
                                 "novel-reader/${readerOpen.bookId}"
                             } else {
@@ -465,9 +528,6 @@ fun InkvolApp(
             }
         }
 
-        // 小说返回：状态栏延迟到 Closing 完成后再恢复，避免返场动画期间标题跳动。
-        var pendingNovelBarRestore by remember { mutableStateOf(false) }
-
         val closeReaderOpen: (String) -> Unit = { reason ->
         if (readerOpen.phase == ReaderOpenPhase.Preparing) {
             // 尚未起飞：直接取消，不播反向动画。
@@ -483,10 +543,10 @@ fun InkvolApp(
                     val controller = WindowCompat.getInsetsController(window, view)
                     controller.systemBarsBehavior =
                         WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
-                    if (readerOpen.isNovel) {
-                        // 小说：返回动画期间保持沉浸，Idle 后再恢复。
-                        pendingNovelBarRestore = true
-                    } else if (LibraryStatusBar.visible) {
+                    // 漫画 / 小说统一：立即按「进书前状态」恢复，inset 回归动画落在
+                    // Closing 期间（由书架 header 的冻结让位吸收）。小说原先延迟到
+                    // Idle 才恢复，会出现「返回动画放完、状态栏才冒出来」的跳动。
+                    if (LibraryStatusBar.visible) {
                         controller.show(WindowInsetsCompat.Type.systemBars())
                     } else {
                         controller.show(WindowInsetsCompat.Type.navigationBars())
@@ -535,25 +595,6 @@ fun InkvolApp(
                 delay(300)
                 // 路由已变时 effect 会被取消，这里的重申不会误伤书架。
                 controller?.hide(WindowInsetsCompat.Type.systemBars())
-            }
-        }
-
-        // 小说返回：Closing 完成（Idle）后再恢复系统栏，返场动画期间保持沉浸。
-        LaunchedEffect(readerOpen.phase) {
-            if (readerOpen.phase == ReaderOpenPhase.Idle && pendingNovelBarRestore) {
-                pendingNovelBarRestore = false
-                runCatching {
-                    val window = (context as? android.app.Activity)?.window
-                    if (window != null) {
-                        val controller = WindowCompat.getInsetsController(window, view)
-                        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
-                        if (LibraryStatusBar.visible) {
-                            controller.show(WindowInsetsCompat.Type.systemBars())
-                        } else {
-                            controller.show(WindowInsetsCompat.Type.navigationBars())
-                        }
-                    }
-                }
             }
         }
 
@@ -640,6 +681,7 @@ fun InkvolApp(
         BackHandler(
             enabled = readerOpen.phase == ReaderOpenPhase.Opening &&
                 (currentRoute == TopDestination.Library.route ||
+                    currentRoute == TopDestination.Search.route ||
                     currentRoute == TopDestination.History.route),
         ) {
             closeReaderOpen("Back")
@@ -705,6 +747,7 @@ fun InkvolApp(
                             navController = navController,
                             settingsRepository = settingsRepository,
                             libraryRepository = libraryRepository,
+                            syncRepository = syncRepository,
                             showHeaderImport = !fullRail,
                             readerActive = currentRoute?.startsWith("reader/") == true ||
                                 currentRoute?.startsWith("novel-reader/") == true,
@@ -769,6 +812,14 @@ fun InkvolApp(
                                 onRescan = { libraryRepository.rescanAll() },
                                 onToTop = { scrollToTopBus.request() },
                                 onImportLongClick = { railPlusMenuOpen = true },
+                                // 排序钮 = 书架 tab 恒显示（一颗钮）：书夹视图一级弹
+                                // 书夹卡排序菜单，平铺/系列/二级页弹全局书排序菜单，
+                                // 分流见下方菜单渲染处。
+                                onSort = if (topLevel == TopDestination.Library) {
+                                    { railSortMenuOpen = true }
+                                } else {
+                                    null
+                                },
                             )
                         } else {
                             null
@@ -799,6 +850,10 @@ fun InkvolApp(
                             railPlusMenuOpen = false
                             libraryRepository.rescanAll()
                         },
+                        onManager = {
+                            railPlusMenuOpen = false
+                            navController.navigate("library-manager")
+                        },
                         alignment = Alignment.TopEnd,
                         origin = TransformOrigin(1f, 0f),
                         modifier = Modifier
@@ -812,11 +867,103 @@ fun InkvolApp(
                     )
                 }
 
+                // 侧栏排序菜单：锚在动作槽第 2 颗钮（排序，加号下方）左侧，从右上角
+                // 放大出来。top = 状态栏 + 16(槽顶距) + 44(首颗钮) + 10(间距) = 70dp，
+                // 与排序钮顶缘对齐；end 与侧栏加号菜单同公式。菜单显隐随排序钮显隐
+                // （onSort 为 null 时不可能打开，visible 双保险防残留）。
+                // 内容按视图分流：书夹视图一级（无二级页）= 书夹卡排序菜单（独立记忆
+                // library_folder_sort）；其余 = 全局书排序菜单（library_sort）。
+                // 分流判据读 LibraryUiState.target（mutableStateOf，书架页实时同步），
+                // 二级页打开/关闭即时切换菜单内容。
+                if (showRail) {
+                    val folderSortMenuActive = libraryViewMode == SettingsKeys.VIEW_FOLDER &&
+                        LibraryUiState.target == null
+                    if (folderSortMenuActive) {
+                        FolderSortMenuOverlay(
+                            visible = railSortMenuOpen && showRail &&
+                                topLevel == TopDestination.Library,
+                            presence = null,
+                            backdrop = backdrop,
+                            mode = railFolderSortMode,
+                            descending = railFolderSortDescending,
+                            onDismiss = { railSortMenuOpen = false },
+                            onPick = { mode ->
+                                railSortMenuOpen = false
+                                refreshScope.launch {
+                                    settingsRepository.putString(SettingsKeys.LIBRARY_FOLDER_SORT, mode)
+                                }
+                                scrollToTopBus.request()
+                            },
+                            onToggleOrder = {
+                                refreshScope.launch {
+                                    settingsRepository.putString(
+                                        SettingsKeys.LIBRARY_FOLDER_SORT_DESC,
+                                        if (railFolderSortDescending) "0" else "1",
+                                    )
+                                }
+                                scrollToTopBus.request()
+                            },
+                            alignment = Alignment.TopEnd,
+                            origin = TransformOrigin(1f, 0f),
+                            modifier = Modifier
+                                .windowInsetsPadding(WindowInsets.statusBars)
+                                .padding(
+                                    top = 70.dp,
+                                    end = GlassDimens.RailWidth + GlassDimens.RailMargin + 12.dp,
+                                )
+                                .widthIn(max = 260.dp)
+                                .fillMaxWidth(),
+                        )
+                    } else {
+                        SortMenuOverlay(
+                            visible = railSortMenuOpen && showRail &&
+                                topLevel == TopDestination.Library,
+                            presence = null,
+                            backdrop = backdrop,
+                            mode = railSortMode,
+                            descending = railSortDescending,
+                            onDismiss = { railSortMenuOpen = false },
+                            onPick = { mode ->
+                                railSortMenuOpen = false
+                                refreshScope.launch {
+                                    settingsRepository.putString(SettingsKeys.LIBRARY_SORT, mode)
+                                }
+                                // 切档后列表按新顺序重排：复用回顶总线（当前显示网格带动画
+                                // 滚回顶部 + 头部展开），二级页打开时同样生效。
+                                scrollToTopBus.request()
+                            },
+                            onToggleOrder = {
+                                refreshScope.launch {
+                                    settingsRepository.putString(
+                                        SettingsKeys.LIBRARY_SORT_DESC,
+                                        if (railSortDescending) "0" else "1",
+                                    )
+                                }
+                                scrollToTopBus.request()
+                            },
+                            alignment = Alignment.TopEnd,
+                            origin = TransformOrigin(1f, 0f),
+                            modifier = Modifier
+                                .windowInsetsPadding(WindowInsets.statusBars)
+                                .padding(
+                                    top = 70.dp,
+                                    end = GlassDimens.RailWidth + GlassDimens.RailMargin + 12.dp,
+                                )
+                                .widthIn(max = 260.dp)
+                                .fillMaxWidth(),
+                        )
+                    }
+                }
+
                 ReaderOpenOverlay(
                     controller = readerOpen,
                     timeline = readerOpenTimeline,
+                    // 垫层判据 = 阅读器组件是否还挂着（`currentRoute` 滞后 2~3 帧不可用，
+                    // 会让垫层与阅读器生命周期错位：垫层早撤 → 真实阅读器正文/顶栏透出
+                    // 叠在书架上，即「踩顶栏 / 退出堆叠」）。
                     novelReaderMounted = readerOpen.isNovel &&
-                        currentRoute?.startsWith("novel-reader/") == true,
+                        readerOpen.phase == ReaderOpenPhase.Closing &&
+                        ReaderSurfaceAlive.alive,
                 )
 
                 GlassNoticeHost(
@@ -843,6 +990,7 @@ private fun InkvolNavHost(
     navController: NavHostController,
     settingsRepository: SettingsRepository,
     libraryRepository: LibraryRepository,
+    syncRepository: SyncRepository? = null,
     showHeaderImport: Boolean,
     readerActive: Boolean,
     readerOpenViewModel: ReaderOpenViewModel,
@@ -904,7 +1052,9 @@ private fun InkvolNavHost(
                     LibraryScreen(
                         settingsRepository = settingsRepository,
                         libraryRepository = libraryRepository,
+                        syncRepository = syncRepository,
                         showHeaderImport = showHeaderImport,
+                        onOpenLibraryManager = { navController.navigate("library-manager") },
                         onOpenBook = { book, rect ->
                             if (readerOpen.phase == ReaderOpenPhase.Idle) {
                                 // C 层锚点：跨方向恢复时把书架视口定位到这本书，
@@ -945,6 +1095,97 @@ private fun InkvolNavHost(
                 }
             }
             composable(
+                TopDestination.Search.route,
+                // 一镜到底由宿主 overlay 状态机接管，进出 reader 路由不做动画
+                exitTransition = {
+                    if (targetState.destination.route?.startsWith("reader/") == true ||
+                        targetState.destination.route?.startsWith("novel-reader/") == true
+                    ) {
+                        ExitTransition.None
+                    } else {
+                        tabExit(tabShift(initialState.destination.route, targetState.destination.route))
+                    }
+                },
+                popEnterTransition = {
+                    if (initialState.destination.route?.startsWith("reader/") == true ||
+                        initialState.destination.route?.startsWith("novel-reader/") == true
+                    ) {
+                        EnterTransition.None
+                    } else {
+                        tabEnter(tabShift(initialState.destination.route, targetState.destination.route))
+                    }
+                },
+            ) {
+                // Tab back 收口：结果态退初始态由 SearchScreen 内部 BackHandler 处理
+                //（组合顺序在后注册，优先级更高），初始态走这里回书架 Tab
+                androidx.activity.compose.BackHandler(enabled = readerOpen.phase == ReaderOpenPhase.Idle) {
+                    navController.popBackStack(TopDestination.Library.route, inclusive = false)
+                }
+                SearchScreen(
+                    repository = libraryRepository,
+                    onOpenBook = { book, rect ->
+                        if (readerOpen.phase == ReaderOpenPhase.Idle) {
+                            if (book.type == "NOVEL") {
+                                val cutout = WindowInsetsCompat.toWindowInsetsCompat(view.rootWindowInsets)
+                                    .getInsets(WindowInsetsCompat.Type.displayCutout())
+                                readerOpenViewModel.startNovelOpen(
+                                    book = book,
+                                    sourceRect = rect,
+                                    rootWidthPx = view.width.coerceAtLeast(1),
+                                    rootHeightPx = view.height.coerceAtLeast(1),
+                                    repository = libraryRepository,
+                                    settingsRepository = settingsRepository,
+                                    textMeasurer = novelTextMeasurer,
+                                    density = density,
+                                    cutoutLeftPx = cutout.left,
+                                    cutoutTopPx = cutout.top,
+                                    cutoutRightPx = cutout.right,
+                                    cutoutBottomPx = cutout.bottom,
+                                )
+                            } else if (!animationsEnabled) {
+                                navController.navigate("reader/${book.id}")
+                            } else {
+                                readerOpenViewModel.startOpen(
+                                    book = book,
+                                    repository = libraryRepository,
+                                    sourceRect = rect,
+                                    rootWidthPx = view.width.coerceAtLeast(1),
+                                    rootHeightPx = view.height.coerceAtLeast(1),
+                                )
+                            }
+                        }
+                    },
+                    onOpenNovelAt = { book, chapterIdx, charPos ->
+                        if (readerOpen.phase == ReaderOpenPhase.Idle) {
+                            val cutout = WindowInsetsCompat.toWindowInsetsCompat(view.rootWindowInsets)
+                                .getInsets(WindowInsetsCompat.Type.displayCutout())
+                            readerOpenViewModel.startNovelOpen(
+                                book = book,
+                                sourceRect = null,
+                                rootWidthPx = view.width.coerceAtLeast(1),
+                                rootHeightPx = view.height.coerceAtLeast(1),
+                                repository = libraryRepository,
+                                settingsRepository = settingsRepository,
+                                textMeasurer = novelTextMeasurer,
+                                density = density,
+                                cutoutLeftPx = cutout.left,
+                                cutoutTopPx = cutout.top,
+                                cutoutRightPx = cutout.right,
+                                cutoutBottomPx = cutout.bottom,
+                                locateChapter = chapterIdx,
+                                locateChar = charPos,
+                            )
+                        }
+                    },
+                    onOpenCategory = { target ->
+                        // 书夹/系列跳转：直写进程级书架状态再切 Tab（恢复时 LibraryScreen 首帧直读）
+                        LibraryUiState.typeFilter = null
+                        LibraryUiState.target = target
+                        navController.popBackStack(TopDestination.Library.route, inclusive = false)
+                    },
+                )
+            }
+            composable(
                 TopDestination.History.route,
                 // 一镜到底由宿主 overlay 状态机接管，进出 reader 路由不做动画
                 exitTransition = {
@@ -966,9 +1207,10 @@ private fun InkvolNavHost(
                     }
                 },
             ) {
-                // 一镜到底 Opening/Closing 在历史页 UI 上播放时，
-                // 不能让「再按一次退出」抢走系统返回。
-                TabExitBackHandler(enabled = readerOpen.phase == ReaderOpenPhase.Idle)
+                // M6.3-D 收口：历史 tab back 回书架 tab（原为双击退出提示）
+                androidx.activity.compose.BackHandler(enabled = readerOpen.phase == ReaderOpenPhase.Idle) {
+                    navController.popBackStack(TopDestination.Library.route, inclusive = false)
+                }
                 HistoryScreen(
                     repository = libraryRepository,
                     onOpenBook = { entry, rect ->
@@ -1008,10 +1250,18 @@ private fun InkvolNavHost(
                 )
             }
             composable(TopDestination.Settings.route) {
-                TabExitBackHandler()
+                // M6.3-D 收口：设置 tab back 回书架 tab（原为双击退出提示）。
+                // 设置内部（分组详情/面板）的 back 由 SettingsScreen 内部处理。
+                androidx.activity.compose.BackHandler {
+                    navController.popBackStack(TopDestination.Library.route, inclusive = false)
+                }
                 SettingsScreen(
                     settingsRepository = settingsRepository,
                     libraryRepository = libraryRepository,
+                    syncRepository = syncRepository,
+                    onBackToLibrary = {
+                        navController.popBackStack(TopDestination.Library.route, inclusive = false)
+                    },
                     onOpenLibraryManager = { navController.navigate("library-manager") },
                     onOpenPanelSpike = { navController.navigate("panel-spike") },
                 )
@@ -1020,6 +1270,7 @@ private fun InkvolNavHost(
                 LibraryManagerScreen(
                     repository = libraryRepository,
                     onBack = { navController.popBackStack() },
+                    syncRepository = syncRepository,
                 )
             }
             composable(route = "panel-spike") {
@@ -1134,7 +1385,7 @@ private fun ReaderOpenOverlay(
     val contentReady = controller.contentBitmap != null || controller.readerReady
     val coverBitmap = controller.coverBitmap
     val coverPath = controller.coverPath
-    val novelFlight = controller.isNovel
+    val novelFlight = controller.flightFullScreen
 
     // 打开阶段不再使用封面位图：点击瞬间飞行物就是「迷你阅读器」（黑底 + 首页含黑边）。
     // 封面只参与返回交叉；封面预解码失败时返回阶段走 AsyncImage 兜底。
@@ -1156,6 +1407,23 @@ private fun ReaderOpenOverlay(
                 if (controller.phase == ReaderOpenPhase.Opening) {
                     pageFadeStartMs = SystemClock.uptimeMillis()
                 }
+            }
+        }
+    }
+
+    // 小说打开：封面 → 正文交叉。
+    // 起点 = 「正文页快照就绪」且「progress 已过 45%」的时刻：先让封面随卡片放大
+    //（保留视觉锚点），后半程 140ms 交叉到正文页；交接帧（markVisible 撤 overlay）
+    // 画的是正文页，与 Reader 首帧同构，不再「封面硬切正文」。
+    var openCrossStartMs by remember { mutableStateOf(Long.MAX_VALUE) }
+    LaunchedEffect(controller.phase, controller.pageBitmap) {
+        if (controller.phase == ReaderOpenPhase.Opening &&
+            controller.isNovel &&
+            controller.pageBitmap != null
+        ) {
+            snapshotFlow { timeline.progress.value }.first { it >= 0.45f }
+            if (openCrossStartMs == Long.MAX_VALUE) {
+                openCrossStartMs = SystemClock.uptimeMillis()
             }
         }
     }
@@ -1212,12 +1480,19 @@ private fun ReaderOpenOverlay(
         } else {
             0f
         }
-        // 漫画：迷你阅读器黑底；小说：正文背景色容器。
-        val containerColor = if (novelFlight) {
-            Color(controller.novelBackgroundColor)
-        } else {
-            Color.Black
+        // 打开阶段小说封面层（交叉用）：正文页快照就绪且过了 45% 行程后，140ms 淡出。
+        // 快照始终未就绪时保持 1（叠加层为空，画面还是「封面当内容」的旧行为）。
+        val openCoverAlpha = when {
+            closing || !novelFlight -> 0f
+            controller.openCoverBitmap == null || openCrossStartMs == Long.MAX_VALUE -> 1f
+            else -> {
+                val t = ((SystemClock.uptimeMillis() - openCrossStartMs) / READER_OPEN_CROSS_MS)
+                    .coerceIn(0f, 1f)
+                1f - (t * t * (3f - 2f * t))
+            }
         }
+        // 漫画：迷你阅读器黑底；小说：正文背景色容器。
+        val containerColor = Color(controller.flightContainerColor)
         // 返回首帧小说路由可能尚未真正退栈：先铺满不透明正文底色，避免容器外
         // 透出仍在挂载的真实阅读器正文（表现为「背景叠着小说内容」）。
         if (closing && novelFlight && novelReaderMounted) {
@@ -1255,7 +1530,9 @@ private fun ReaderOpenOverlay(
                     }
                 }
                 if (pageAlpha > 0.001f) {
-                    controller.contentBitmap?.let { pageBitmap ->
+                    // 打开阶段的内容层走「终态内容」getter：Step 1 与 contentBitmap 等价，
+                    // 封面 → 正文交叉上线后这里会拿到正文页快照（交接帧与 Reader 首帧同构）。
+                    controller.finalContentBitmap?.let { pageBitmap ->
                         drawReaderBitmap(
                             bitmap = pageBitmap,
                             rect = pageRect,
@@ -1271,6 +1548,18 @@ private fun ReaderOpenOverlay(
                             bitmap = bmp,
                             rect = pageRect,
                             alpha = coverAlpha,
+                            radiusPx = 0f,
+                            fillWidthTop = false,
+                        )
+                    }
+                }
+                // 打开阶段小说封面层：叠在正文页之上做交叉淡出（画在最后 = 最上层）
+                if (openCoverAlpha > 0.001f) {
+                    controller.openCoverBitmap?.let { bmp ->
+                        drawReaderBitmap(
+                            bitmap = bmp,
+                            rect = pageRect,
+                            alpha = openCoverAlpha,
                             radiusPx = 0f,
                             fillWidthTop = false,
                         )
@@ -1456,6 +1745,7 @@ private fun readerHandoffAlpha(progress: Float): Float = readerStage(progress, 0
 /** 顶层 Tab 的顺序；阅读器不参与左右滑动方向计算。 */
 private val tabOrder = listOf(
     TopDestination.Library.route,
+    TopDestination.Search.route,
     TopDestination.History.route,
     TopDestination.Settings.route,
 )
@@ -1472,6 +1762,11 @@ private fun tabShift(initialRoute: String?, targetRoute: String?): Int? {
             targetRoute != null && targetRoute in settingsSubRoutes -> 1
         initialRoute != null && initialRoute in settingsSubRoutes &&
             targetRoute == TopDestination.Settings.route -> -1
+        // 书架加号 → 书库管理：从书架进=向前，回书架=向后（与设置入口同语言）
+        initialRoute == TopDestination.Library.route &&
+            targetRoute == "library-manager" -> 1
+        initialRoute == "library-manager" &&
+            targetRoute == TopDestination.Library.route -> -1
         else -> null
     }
 }

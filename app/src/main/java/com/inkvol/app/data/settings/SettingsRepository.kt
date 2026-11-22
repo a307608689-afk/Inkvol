@@ -73,14 +73,27 @@ class SettingsRepository(private val context: Context) {
         context.inkvolSettings.edit { it[intPreferencesKey(key)] = value }
     }
 
+    suspend fun putLong(key: String, value: Long) {
+        context.inkvolSettings.edit { it[longPreferencesKey(key)] = value }
+    }
+
     fun booleanOf(prefs: Preferences, key: String, default: Boolean): Boolean =
         prefs[booleanPreferencesKey(key)] ?: default
+
+    /** 三态读取：键不存在返回 null（默认 false 无法区分「没写过」与「写过 false」）。 */
+    fun booleanOrNull(prefs: Preferences, key: String): Boolean? =
+        prefs.asMap().containsKey(booleanPreferencesKey(key))
+            .takeIf { it }
+            ?.let { prefs[booleanPreferencesKey(key)] }
 
     fun stringOf(prefs: Preferences, key: String, default: String): String =
         prefs[stringPreferencesKey(key)] ?: default
 
     fun intOf(prefs: Preferences, key: String, default: Int): Int =
         prefs[intPreferencesKey(key)] ?: default
+
+    fun longOf(prefs: Preferences, key: String, default: Long): Long =
+        prefs[longPreferencesKey(key)] ?: default
 
     fun readerOpenDurationMs(speed: String?): Int = when (speed) {
         SettingsKeys.OPEN_SPEED_FASTER -> 240

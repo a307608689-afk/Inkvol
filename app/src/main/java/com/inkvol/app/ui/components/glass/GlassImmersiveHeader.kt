@@ -135,8 +135,13 @@ class GlassHeaderState internal constructor(
     val scrollConnection: NestedScrollConnection,
     private val expandImpl: () -> Unit,
 ) {
-    /** 已折叠高度（px），0 = 完全展开 */
-    val extentPx: Float get() = extentState.value
+    /**
+     * 已折叠高度（px），0 = 完全展开。
+     * 读取处夹到 [0, expandedTop]：头部内容高度是动态的（二级页会多算一行标题行，
+     * 进出二级页时 H 变化 ±一行高），夹紧可保证任何时序下头部都不会多滑 / 让位变负。
+     */
+    val extentPx: Float
+        get() = extentState.value.coerceIn(0f, with(density) { expandedTop.toPx() })
 
     /** 头部组整体上移量（px，负数 = 向上）；只在 graphicsLayer 里读，不参与重组 */
     val headerOffsetPx: Float get() = -extentPx
@@ -178,12 +183,20 @@ fun rememberGlassHeaderState(
     frozenStatusBarTop: Dp? = null,
     /** 一镜到底 Closing 期间挂起状态栏控制与手势消费 */
     closingHold: Boolean = false,
+    /**
+     * 页面尚未完成恢复（一镜到底返回后书架网格/二级页还在落位）时挂起状态栏控制。
+     * Closing 只覆盖反向动画那 ~280ms，恢复（逐帧重申 + 数据稳定）会延续到 Idle 之后；
+     * 这期间 atTop/方向显隐读到的是瞬态位置，先 show 后 hide 就是用户看到的「状态栏跳一下」。
+     */
+    statusBarHold: Boolean = false,
     /** 头部内容高度（不含状态栏）：书架 = 标题块 + 分类行 38 + 呼吸 = 118dp */
     headerContentHeight: Dp = HEADER_CONTENT_HEIGHT,
     /** 是否用进程级 holder 做跨路由恢复（阅读器往返）：非书架页传 false */
     useLibraryHolder: Boolean = true,
     /** 本页是否接管系统状态栏隐显（false = 恒显，适合设置这类工具页） */
     statusBarAutoHide: Boolean = true,
+    /** 条目总数（用于「在顶部」判定守卫：未组合/空数据的网格不算触顶） */
+    totalItemCount: () -> Int = { gridState.layoutInfo.totalItemsCount },
 ): GlassHeaderState = rememberGlassHeaderStateCore(
     stateKey = gridState,
     positionProvider = {
@@ -195,9 +208,11 @@ fun rememberGlassHeaderState(
     resetKey = resetKey,
     frozenStatusBarTop = frozenStatusBarTop,
     closingHold = closingHold,
+    statusBarHold = statusBarHold,
     headerContentHeight = headerContentHeight,
     useLibraryHolder = useLibraryHolder,
     statusBarAutoHide = statusBarAutoHide,
+    totalItemCount = totalItemCount,
 )
 
 /**
@@ -211,10 +226,12 @@ fun rememberGlassHeaderState(
     resetKey: Any? = null,
     frozenStatusBarTop: Dp? = null,
     closingHold: Boolean = false,
+    statusBarHold: Boolean = false,
     /** 只有标题块：12(上留白) + 62(标题两行) + 4(下留白) + 10(呼吸) = 88dp */
     headerContentHeight: Dp = 88.dp,
     useLibraryHolder: Boolean = false,
     statusBarAutoHide: Boolean = true,
+    totalItemCount: () -> Int = { listState.layoutInfo.totalItemsCount },
 ): GlassHeaderState = rememberGlassHeaderStateCore(
     stateKey = listState,
     positionProvider = {
@@ -226,9 +243,11 @@ fun rememberGlassHeaderState(
     resetKey = resetKey,
     frozenStatusBarTop = frozenStatusBarTop,
     closingHold = closingHold,
+    statusBarHold = statusBarHold,
     headerContentHeight = headerContentHeight,
     useLibraryHolder = useLibraryHolder,
     statusBarAutoHide = statusBarAutoHide,
+    totalItemCount = totalItemCount,
 )
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -242,9 +261,11 @@ private fun rememberGlassHeaderStateCore(
     resetKey: Any?,
     frozenStatusBarTop: Dp?,
     closingHold: Boolean,
+    statusBarHold: Boolean,
     headerContentHeight: Dp,
     useLibraryHolder: Boolean,
     statusBarAutoHide: Boolean,
+    totalItemCount: () -> Int,
 ): GlassHeaderState {
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
@@ -252,9 +273,24 @@ private fun rememberGlassHeaderStateCore(
     // ---- 几何：H = 状态栏 + 头部内容高 ----
     // 基准取「忽略可见性」的状态栏高度：状态栏随滚动隐显时 H 保持恒定，
     // 折叠位移不会因为 inset 变化而抖动（状态栏显示态下与实时值相等）。
-    val stableStatusBarTop = WindowInsets.statusBarsIgnoringVisibility
+    val liveStableTop = WindowInsets.statusBarsIgnoringVisibility
         .asPaddingValues()
         .calculateTopPadding()
+    // 记忆化兜底：一镜到底返回时页面是新组合的，首帧 insets 可能尚未派发
+    // （statusBarsIgnoringVisibility 报 0）→ 标题/让位先塌掉一个状态栏高度、下一帧
+    // 又回来，观感是「标题跳到状态栏位置然后再下来」。用书架活跃期持续写入的进程级
+    // 记忆值补这一次（设备真无状态栏时记忆值也是 0，无副作用）。
+    val rememberedTopPx = if (useLibraryHolder) LibraryStatusBar.statusBarTopPx else 0f
+    val stableStatusBarTop = if (liveStableTop.value > 0f || rememberedTopPx <= 0f) {
+        liveStableTop
+    } else {
+        rememberedTopPx.dp
+    }
+    LaunchedEffect(liveStableTop.value) {
+        if (useLibraryHolder && liveStableTop.value > 0f) {
+            LibraryStatusBar.statusBarTopPx = liveStableTop.value
+        }
+    }
     val statusBarTop = frozenStatusBarTop ?: stableStatusBarTop
     val expandedTop = statusBarTop + headerContentHeight
     val expandedTopPx = with(density) { expandedTop.toPx() }
@@ -273,25 +309,42 @@ private fun rememberGlassHeaderStateCore(
                 LibraryGridScroll.index > 0 || LibraryGridScroll.offset > 60
             )
     }
+    // 折叠量比例通道（书架）：部分折叠也能原样恢复，且天然吸收状态栏/头部高度变化
+    // （二级页头部多一行标题行，H 会变）。
+    val restoreFraction = remember {
+        if (useLibraryHolder) LibraryGridScroll.extentFraction else null
+    }
     // 列表页的保存通道：-1 = 无保存态（首次进入）
     val savedExtent = rememberSaveable { mutableStateOf(-1f) }
     val savedFullyCollapsed = rememberSaveable { mutableStateOf(false) }
     val extentState = remember {
         mutableStateOf(
             when {
+                restoreFraction != null -> restoreFraction * expandedTopPx
                 collapsedBefore -> expandedTopPx
                 savedExtent.value >= 0f -> savedExtent.value
                 else -> 0f
             }
         )
     }
-    // 恢复的「全折叠」px 与保存时的状态栏 inset 绑定：若保存/恢复之间 inset 变了
-    // （旋转等），对齐一次真实 H；部分折叠不对齐，按保存值原样落位。
-    val alignPending = remember { mutableStateOf(collapsedBefore || savedFullyCollapsed.value) }
+    // 恢复的对齐：
+    //  - 比例通道：本身是比例，除非首帧 H 还未就绪（=0）才需补算一次；
+    //  - px 通道（旧布尔/列表页 saveable）：与原 H 绑定，恢复后对齐一次真实 H。
+    val alignPending = remember {
+        mutableStateOf(
+            if (restoreFraction != null) expandedTopPx <= 0f
+            else collapsedBefore || savedFullyCollapsed.value
+        )
+    }
     LaunchedEffect(expandedTopPx) {
-        if (alignPending.value && expandedTopPx > 0f) {
-            extentState.value = expandedTopPx
+        if (expandedTopPx <= 0f) return@LaunchedEffect
+        if (alignPending.value) {
+            extentState.value = restoreFraction?.let { it * expandedTopPx } ?: expandedTopPx
             alignPending.value = false
+        } else if (extentState.value > expandedTopPx) {
+            // 头部高度变小（退出二级页：标题行不再计入头部）时夹回上限，
+            // 否则头部会多滑一段、让位为负。
+            extentState.value = expandedTopPx
         }
     }
 
@@ -393,7 +446,9 @@ private fun rememberGlassHeaderStateCore(
     // 必须跟着列表实例重建：书夹目录页与分类页是两个不同的 LazyGridState，
     // 不重建会一直读旧的（停在顶部）→ atTop 恒真 → 状态栏永远强制显示
     val atTop by remember(stateKey) {
-        derivedStateOf { positionProvider() < 8 }
+        // 空数据 / 未组合（如一镜到底返回二级页时一级网格未参与组合）不算触顶：
+        // 否则 showActions 会被 atTop 恒真压成显示，与进书前的隐藏态打架。
+        derivedStateOf { positionProvider() < 8 && totalItemCount() > 0 }
     }
     // resetKey 变化时重建方向监听（初始为显示），避免沿用上一处的隐藏状态。
     // 一镜到底返回以 LibraryStatusBar.visible（进书前的真实显隐）做初值：
@@ -420,21 +475,31 @@ private fun rememberGlassHeaderStateCore(
     // 书架活跃期间把状态栏真实显隐持续写入进程级 holder：进书瞬间最后写入的值即
     // 「进书前状态」——返回时 closeReaderOpen 按它恢复系统栏、方向显隐以它做初值。
     val readerActiveNow = LocalReaderActive.current
-    LaunchedEffect(showActions, readerActiveNow) {
-        // 只有书架会把这个值当「进书前状态」读回去，其它页不要污染它
-        if (!readerActiveNow && useLibraryHolder) LibraryStatusBar.visible = showActions
+    LaunchedEffect(showActions, readerActiveNow, statusBarHold) {
+        // 只有书架会把这个值当「进书前状态」读回去，其它页不要污染它。
+        // statusBarHold（恢复中）期间不写：此时 atTop/方向读到的是瞬态位置，
+        // 写进去会把「进书前状态」覆盖成错误值（返回后状态栏乱跳的源头之一）。
+        if (!readerActiveNow && useLibraryHolder && !statusBarHold) {
+            LibraryStatusBar.visible = showActions
+        }
     }
 
     // ---- 状态栏随滚动隐显 ----
     val view = LocalView.current
     val readerActive = LocalReaderActive.current
-    val readerActiveState = rememberUpdatedState(readerActive)
     DisposableEffect(Unit) {
         onDispose {
             // 折叠态落进进程级 holder：返回书架（含一镜到底）时首帧就按它恢复
             if (useLibraryHolder) {
                 LibraryGridScroll.collapsed =
                     extentState.value >= expandedTopPxState.value - 0.5f
+                // 比例通道：部分折叠也原样恢复（布尔只能表达「折满/未折满」，
+                // 中途离开会被当成展开，返回时顶部让位突然长出来 = 整页下跳）。
+                LibraryGridScroll.extentFraction = if (expandedTopPxState.value > 0f) {
+                    (extentState.value / expandedTopPxState.value).coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
             } else {
                 // 列表页折叠量写进 rememberSaveable 保存通道：本效果挂在页面内容里，
                 // onDispose 先于外层 SaveableStateProvider 的保存执行，这里写入的值
@@ -443,12 +508,29 @@ private fun rememberGlassHeaderStateCore(
                 savedFullyCollapsed.value =
                     extentState.value >= expandedTopPxState.value - 0.5f
             }
-            // 阅读器持有系统栏控制权时不要抢回状态栏
-            if (!readerActiveState.value) {
-                runCatching {
-                    WindowCompat.getInsetsController(view.context.findHeaderWindow(), view)
-                        .show(WindowInsetsCompat.Type.statusBars())
-                }
+        }
+    }
+    // 入场预置：书架（holder 页）入场首帧按进程级 holder 直接落状态栏，不等恢复落位。
+    // 此前退场页 onDispose 的迟到 show（NavHost 转场结束才 dispose，晚于本页落位
+    // hide）会把「切回书架后的隐藏态」持续顶回显示——退场 show 已移除，改为每个
+    // 顶层页入场自己声明状态栏状态：
+    // - holder 隐藏 → TRANSIENT hide：最终态必是隐藏，瞬态滚动位置不影响该结论，
+    //   无需等 gridSettled，顺带消除「切回到落位之间状态栏亮一下」的短闪；
+    // - holder 显示 → BEHAVIOR_DEFAULT show：对称处理，防上一页隐藏态残留。
+    // 历史/设置/搜索页入场由各自的显隐 effect 恒 show，书库管理页自管，无需此预置。
+    // 阅读器持有控制权 / 一镜到底 Closing 期间不动：closeReaderOpen 已按 holder
+    // 恢复系统栏，小说返回的恢复由宿主 pendingNovelBarRestore 在 Idle 接管。
+    LaunchedEffect(Unit) {
+        if (!useLibraryHolder || readerActive || closingHold) return@LaunchedEffect
+        runCatching {
+            val controller = WindowCompat.getInsetsController(view.context.findHeaderWindow(), view)
+            if (LibraryStatusBar.visible) {
+                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+                controller.show(WindowInsetsCompat.Type.statusBars())
+            } else {
+                controller.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(WindowInsetsCompat.Type.statusBars())
             }
         }
     }
@@ -459,8 +541,12 @@ private fun rememberGlassHeaderStateCore(
     //   返回书架的 show 会被系统当作临时唤出——状态栏闪现几秒后自动缩回。
     // - closingHold=true（一镜到底 Closing）挂起：返回首帧 gridState 是 NavHost
     //   旧快照 (0,0)，atTop 误判 true 会先 show，滚动恢复落位后又 hide——闪现。
-    LaunchedEffect(showActions, readerActive, closingHold, statusBarAutoHide) {
-        if (readerActive || closingHold) return@LaunchedEffect
+    // - statusBarHold=true（页面恢复未完成）继续挂起：Closing 只覆盖反向动画那一段，
+    //   网格/二级页的恢复（逐帧重申 + 数据稳定）会延续到 Idle 之后，这期间显隐判定
+    //   同样不可信。要求「进书前没隐藏 → 返回不隐藏；进书前隐藏 → 返回还隐藏」，
+    //   就必须等恢复落位后再动系统栏。
+    LaunchedEffect(showActions, readerActive, closingHold, statusBarHold, statusBarAutoHide) {
+        if (readerActive || closingHold || statusBarHold) return@LaunchedEffect
         runCatching {
             val controller = WindowCompat.getInsetsController(view.context.findHeaderWindow(), view)
             if (!statusBarAutoHide) {

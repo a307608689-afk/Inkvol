@@ -1,5 +1,9 @@
 package com.inkvol.app.ui.library
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.view.Window
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
@@ -35,8 +39,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.inkvol.app.data.import.SingleFileImporter
@@ -63,8 +71,21 @@ fun LibraryManagerScreen(
     repository: LibraryRepository,
     onBack: () -> Unit,
     initialTab: String = "libraries",
+    // M4.5 同步（用于移除确认卡的同步范围提示）
+    syncRepository: com.inkvol.app.data.sync.SyncRepository? = null,
 ) {
     val chrome = LocalGlassChrome.current
+    // 页面自己声明状态栏状态（GlassImmersiveHeader 退场 show 已移除，每个顶层页
+    // 入场自管）：本页无玻璃头状态机，入场恒显示（BEHAVIOR_DEFAULT 持久生效，
+    // 防上一页的 TRANSIENT 行为残留把 show 变成「几秒后自动缩回」）。
+    val managerView = LocalView.current
+    LaunchedEffect(Unit) {
+        runCatching {
+            val controller = WindowCompat.getInsetsController(managerView.context.findManagerWindow(), managerView)
+            controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+            controller.show(WindowInsetsCompat.Type.statusBars())
+        }
+    }
     val libraries by repository.libraries.collectAsStateWithLifecycle()
     val trash by repository.trashBooks.collectAsStateWithLifecycle()
     val duplicates by repository.duplicateGroups.collectAsStateWithLifecycle()
@@ -186,11 +207,17 @@ fun LibraryManagerScreen(
                 onDismissRequest = { removeTarget = null },
                 title = { Text("移除「${target.name}」？") },
                 text = {
+                    val syncLine = if (syncRepository?.state?.value?.enabled == true) {
+                        "\n\n已开启同步：本次移除的书将同步从所有设备的书架移除，云端对应数据一并清理。"
+                    } else {
+                        ""
+                    }
                     Text(
                         text = "移除后将不再扫描该文件夹，书架中来自它的书会同步移除" +
                             "（阅读进度、书签、分类归属一并清除）；同一本书若还存在于其它文件夹则保留。" +
                             "手机里的源文件不会被删除；回收站中属于它的书会被彻底清除。" +
-                            "之后重新导入同一文件夹，将作为新书重新进入书架。",
+                            "之后重新导入同一文件夹，将作为新书重新进入书架。" +
+                            syncLine,
                         style = MaterialTheme.typography.bodySmall,
                     )
                 },
@@ -467,4 +494,11 @@ private fun EmptyCard(title: String, message: String) {
             )
         }
     }
+}
+
+/** 从 Compose 的 LocalView 向上找到宿主 Window（状态栏控制用，SearchScreen 同款）。 */
+private fun Context.findManagerWindow(): Window = when (this) {
+    is Activity -> window
+    is ContextWrapper -> baseContext.findManagerWindow()
+    else -> error("无法定位宿主 Window")
 }

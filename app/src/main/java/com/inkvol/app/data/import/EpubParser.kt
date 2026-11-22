@@ -28,7 +28,51 @@ object EpubParser {
         val textFile: File,
         val chapters: List<NovelChapterRecord>,
         val coverPath: String?,
+        /** M7：OPF dc:creator / dc:subject（搜索筛选用；无元数据为 null）。 */
+        val writer: String? = null,
+        val tags: String? = null,
     )
+
+    /** 回填用轻量元数据（writer/tags），解析失败返回 null。 */
+    data class Meta(
+        val writer: String?,
+        val tags: String?,
+    )
+
+    /** M7：只读 OPF 元数据，不动正文/章节（存量 EPUB 扫描回填用）。 */
+    fun parseMetadata(zipFile: File): Meta? = runCatching {
+        ZipFile(zipFile).use { zip ->
+            val container = zip.entryText("META-INF/container.xml") ?: return@use null
+            val opfPath = container
+                .let { Regex("<rootfile[^>]*full-path=\"([^\"]+)\"").find(it)?.groupValues?.get(1) }
+                ?: return@use null
+            val opfEntry = findEntry(zip, opfPath) ?: return@use null
+            val opfText = zip.entryText(opfEntry.name) ?: return@use null
+            parseOpfMeta(opfText)
+        }
+    }.getOrNull()
+
+    /** dc:creator → writer（取第一个）；dc:subject → tags（逗号拼接，ComicInfo 同款）。 */
+    private fun parseOpfMeta(opfText: String): Meta {
+        val writers = Regex(
+            "<dc:creator\\b[^>]*>([\\s\\S]*?)</dc:creator>",
+            RegexOption.IGNORE_CASE,
+        ).findAll(opfText)
+            .map { unescape(it.groupValues[1]).trim() }
+            .filter { it.isNotEmpty() }
+            .toList()
+        val subjects = Regex(
+            "<dc:subject\\b[^>]*>([\\s\\S]*?)</dc:subject>",
+            RegexOption.IGNORE_CASE,
+        ).findAll(opfText)
+            .map { unescape(it.groupValues[1]).trim() }
+            .filter { it.isNotEmpty() }
+            .toList()
+        return Meta(
+            writer = writers.firstOrNull(),
+            tags = subjects.joinToString(", ").ifBlank { null },
+        )
+    }
 
     /** 正文里的图片标记行；NovelTextPager 把它解析为图片块。 */
     fun imageMarker(relativePath: String): String = "[IMG:$relativePath]"
@@ -46,7 +90,7 @@ object EpubParser {
     private val IMG_TAG = Regex("<img\\b[^>]*>|<image\\b[^>]*>", RegexOption.IGNORE_CASE)
     private val BR_TAG = Regex("<br\\s*/?>", RegexOption.IGNORE_CASE)
     private val ANY_TAG = Regex("<[^>]+>")
-    private val H_TAG = Regex("<h([1-6])\\b[^>]*>([\\s\\S]*?)</h\\1>", RegexOption.IGNORE_CASE)
+    val H_TAG = Regex("<h([1-6])\\b[^>]*>([\\s\\S]*?)</h\\1>", RegexOption.IGNORE_CASE)
     private val HEAD_TAG = Regex("<head\\b[\\s\\S]*?</head>", RegexOption.IGNORE_CASE)
     private val DROP_TAG = Regex(
         "<(script|style|svg|aside)\\b[\\s\\S]*?</\\1>|<!--[\\s\\S]*?-->",
@@ -80,6 +124,7 @@ object EpubParser {
         data class SpineTask(val href: String, val entryName: String, val chapterDir: String, val html: String)
         val tasks = ArrayList<SpineTask>()
         var tocTitles: Map<String, String> = emptyMap()
+        var opfMeta: Meta? = null
         runCatching {
             ZipFile(zipFile).use { zip ->
                 val container = zip.entryText("META-INF/container.xml")
@@ -90,6 +135,7 @@ object EpubParser {
                     ?: throw IllegalArgumentException("EPUB 缺少 OPF：$opfPath")
                 val opfText = zip.entryText(opfEntry.name) ?: ""
                 val opfDir = opfEntry.name.substringBeforeLast('/', "")
+                opfMeta = parseOpfMeta(opfText)
 
                 val manifest = parseManifest(opfText)
                 tocTitles = buildTocTitles(zip, manifest, opfDir)
@@ -188,6 +234,8 @@ object EpubParser {
             textFile = textFile,
             chapters = chapters,
             coverPath = coverPath,
+            writer = opfMeta?.writer,
+            tags = opfMeta?.tags,
         )
     }
 
@@ -411,7 +459,7 @@ object EpubParser {
         return out.joinToString("\n").trim()
     }
 
-    private fun chapterTitle(html: String): String? {
+    fun chapterTitle(html: String): String? {
         val heading = H_TAG.find(html)?.groupValues?.get(2)
             ?.let { unescape(it) }
             ?.trim()

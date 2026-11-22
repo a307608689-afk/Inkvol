@@ -1,8 +1,18 @@
 package com.inkvol.app.ui.components.glass
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -27,6 +37,7 @@ import androidx.compose.foundation.layout.statusBarsIgnoringVisibility
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.VerticalAlignTop
@@ -47,6 +58,7 @@ import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import com.inkvol.app.ui.components.LibraryPullRefresh
 import com.inkvol.app.ui.navigation.TopDestination
 import com.kyant.backdrop.Backdrop
 import kotlin.math.roundToInt
@@ -61,13 +73,18 @@ import kotlin.math.roundToInt
  */
 enum class RailVariant { Full, Compact }
 
-/** 平板侧栏顶部动作槽的三个默认动作。 */
+/** 平板侧栏顶部动作槽的默认动作。 */
 data class RailActions(
     val onImport: () -> Unit,
     val onRescan: () -> Unit,
     val onToTop: () -> Unit,
     /** 导入钮长按：与手机加号对齐，强制弹出三选菜单（null = 无长按行为）。 */
     val onImportLongClick: (() -> Unit)? = null,
+    /**
+     * 排序钮（第 2 颗，加号下方）：null = 不渲染该钮（书架页外的 Tab、书夹视图）
+     * ，动作槽回落三颗且其余钮不跳位（AnimatedVisibility 收放）。
+     */
+    val onSort: (() -> Unit)? = null,
 )
 
 /**
@@ -236,7 +253,26 @@ private fun RailActionColumn(
             lensEnabled,
             onLongClick = actions.onImportLongClick,
         )
-        RailFab(Icons.Outlined.Refresh, "重新扫描", actions.onRescan, backdrop, lensEnabled)
+        // 排序钮（加号下方第 2 颗）：仅书架页的平铺/系列视图可见。显隐走
+        // AnimatedVisibility 渐隐渐收，避免视图切换时其余钮硬跳位。
+        AnimatedVisibility(
+            visible = actions.onSort != null,
+            enter = fadeIn(tween(160)) + expandVertically(tween(160)),
+            exit = fadeOut(tween(120)) + shrinkVertically(tween(120)),
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                actions.onSort?.let { onSort ->
+                    RailFab(Icons.AutoMirrored.Filled.Sort, "排序", onSort, backdrop, lensEnabled)
+                }
+            }
+        }
+        // 刷新钮兼任「下拉重扫」的指示器：拉距跟手旋转 + 扫描中自旋（经进程级
+        // LibraryPullRefresh 共享，LibraryScreen 的 PullToRefreshBox 写入）
+        RailFab(
+            Icons.Outlined.Refresh, "重新扫描", actions.onRescan, backdrop, lensEnabled,
+            spinning = LibraryPullRefresh.rescanActive,
+            pullFraction = { LibraryPullRefresh.pullFraction },
+        )
         RailFab(Icons.Outlined.VerticalAlignTop, "回到顶部", actions.onToTop, backdrop, lensEnabled)
     }
 }
@@ -252,6 +288,10 @@ fun RailFab(
     edge: GlassEdge = GlassEdge.Outline,
     modifier: Modifier = Modifier,
     onLongClick: (() -> Unit)? = null,
+    /** 重扫进行中：图标无限自旋（扫描反馈）。 */
+    spinning: Boolean = false,
+    /** 下拉重扫拉距（0..1）；graphicsLayer 内调用读取，不进重组。 */
+    pullFraction: () -> Float = { 0f },
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
@@ -264,6 +304,18 @@ fun RailFab(
         label = "railFabScale",
     )
     val scheme = MaterialTheme.colorScheme
+    // 自旋角只在 spinning 时创建动画；graphicsLayer 内读取，不进重组
+    val spinAngle = if (spinning) {
+        val spin = rememberInfiniteTransition(label = "railRescanSpin")
+        spin.animateFloat(
+            initialValue = 0f,
+            targetValue = 360f,
+            animationSpec = infiniteRepeatable(tween(900, easing = LinearEasing)),
+            label = "railRescanAngle",
+        )
+    } else {
+        null
+    }
 
     GlassRounded(
         backdrop = backdrop,
@@ -291,7 +343,10 @@ fun RailFab(
             tint = scheme.onSurface.copy(alpha = 0.82f),
             modifier = Modifier
                 .align(Alignment.Center)
-                .size(19.dp),
+                .size(19.dp)
+                .graphicsLayer {
+                    rotationZ = spinAngle?.value ?: (pullFraction() * 360f)
+                },
         )
     }
 }

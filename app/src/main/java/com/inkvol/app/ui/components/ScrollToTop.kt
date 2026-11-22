@@ -1,5 +1,9 @@
 package com.inkvol.app.ui.components
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -36,6 +40,22 @@ object LibraryGridScroll {
     var offset: Int = 0
 
     /**
+     * 离开书架时的视图档 × 分类档（一级网格的「组合键」）。
+     * 恢复目标是「事实」而不是推导：之前用 initialViewMode（进书架时的 prefs 快照）+
+     * LibraryUiState.typeFilter 反推，只要两者与离开时的实时值不同源（prefs 首帧为
+     * null / 书架内切过视图），恢复就作用在一个没组合的网格上 → 回顶且 settled 卡住。
+     */
+    var viewMode: String? = null
+    var typeFilter: String? = null
+
+    /**
+     * 离开时的折叠量（0..1，extent / expandedTop）。
+     * 只记「是否完全折叠」的布尔会让部分折叠返回时被强制展开——顶部让位瞬间长出来
+     * （「整页下跳 + 顶部露白」）。按比例记录可天然吸收状态栏/头部高度变化。
+     */
+    var extentFraction: Float? = null
+
+    /**
      * 离开书架时头部是否处于折叠态。
      * 折叠现在由「前置滚动消费」实现，列表滚动位置可能仍是 (0,0)，
      * 光看 index/offset 判断不出折叠态，故单独记一位。
@@ -57,6 +77,19 @@ object LibraryGridScroll {
 }
 
 /**
+ * 书架二级页（书夹 / 系列 / 智能书夹）的滚动位置（进程级单例）。
+ * 与 LibraryGridScroll 同范式：进阅读器时落值、返回首帧直接构造 LazyGridState 恢复。
+ * 同一时刻只会有一个二级页存活，所以单槽位即可；[key] 用于确认「恢复的还是同一个
+ * 二级页」，显式返回一级时清空（保留「退出再进自然回顶」的既有语义）。
+ */
+object LibraryDetailScroll {
+    /** 目标键：user:<id> / system:<kind> / series:<name> */
+    var key: String? = null
+    var index: Int = 0
+    var offset: Int = 0
+}
+
+/**
  * 书架的「状态栏是否可见」进程级记录：
  * 玻璃头在书架活跃期间持续写入真实显隐；返回书架时 closeReaderOpen 按它恢复系统栏、
  * 方向显隐状态以它做初值——保证「进书时隐藏→返回仍隐藏」「进书时显示→返回仍显示」，
@@ -64,4 +97,28 @@ object LibraryGridScroll {
  */
 object LibraryStatusBar {
     var visible: Boolean = true
+
+    /**
+     * 状态栏高度（px，书架活跃期间持续写入）。
+     * 一镜到底返回时页面是新组合的，首帧 insets 可能还没派发
+     * （`statusBarsIgnoringVisibility` 报 0），会让标题/让位先塌一个状态栏高度再回来
+     * （「标题跳到状态栏位置然后再下来」）。玻璃头在 insets 有效时把这个值记住，
+     * 首帧为 0 时用它兜底。
+     */
+    var statusBarTopPx: Float = 0f
+}
+
+/**
+ * 书架「下拉重扫」的进度共享（进程级单例，LibraryStatusBar 同款模式）：
+ * LibraryScreen 的 PullToRefreshBox 写入拉距，chrome 读取做箭头形变/旋转——
+ * 手机 = 玻璃头加号钮「+ ↔ 重扫箭头」形变；平板 = 侧栏刷新钮跟手转。
+ * 旋转/透明度一律在 graphicsLayer 内读取，不进重组。
+ */
+object LibraryPullRefresh {
+
+    /** 0..1 下拉蓄力进度（PullToRefreshState.distanceFraction 透传）。 */
+    var pullFraction by mutableFloatStateOf(0f)
+
+    /** 重扫进行中（宿主从 repository scan.running 同步；含后台扫描）。 */
+    var rescanActive by mutableStateOf(false)
 }

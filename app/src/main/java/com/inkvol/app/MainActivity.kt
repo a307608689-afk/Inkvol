@@ -45,6 +45,7 @@ class MainActivity : ComponentActivity() {
                 InkvolApp(
                     settingsRepository = container.settingsRepository,
                     libraryRepository = container.libraryRepository,
+                    syncRepository = container.syncRepository,
                     pendingReaderBookId = pendingReaderBookId,
                     onPendingReaderConsumed = { pendingReaderBookId = null },
                 )
@@ -57,6 +58,12 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         val bookId = intent.getStringExtra(EXTRA_OPEN_READER_BOOK_ID)
         if (!bookId.isNullOrBlank()) pendingReaderBookId = bookId
+    }
+
+    /** M4.5：退后台补同步（有持久 dirty 且自动同步开启时）。 */
+    override fun onStop() {
+        super.onStop()
+        (application as InkvolApplication).container.syncScheduler.onBackground()
     }
 
     companion object {

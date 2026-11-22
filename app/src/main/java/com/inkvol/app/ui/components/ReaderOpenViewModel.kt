@@ -79,6 +79,9 @@ class ReaderOpenViewModel : ViewModel() {
         cutoutTopPx: Int = 0,
         cutoutRightPx: Int = 0,
         cutoutBottomPx: Int = 0,
+        locateChapter: Int = -1,
+        locateChar: Int = -1,
+        locateLen: Int = 0,
     ) {
         preloadJob?.cancel()
         controller.beginOpen(
@@ -108,6 +111,9 @@ class ReaderOpenViewModel : ViewModel() {
                 cutoutTopPx,
                 cutoutRightPx,
                 cutoutBottomPx,
+                locateChapter,
+                locateChar,
+                locateLen,
             )
         }
     }
@@ -125,10 +131,23 @@ class ReaderOpenViewModel : ViewModel() {
         cutoutTopPx: Int,
         cutoutRightPx: Int,
         cutoutBottomPx: Int,
+        locateChapter: Int = -1,
+        locateChar: Int = -1,
+        locateLen: Int = 0,
     ) {
         try {
             val snapshot = withContext(Dispatchers.IO) { settingsRepository.snapshotPreferences() }
-            val raw = settingsRepository.stringOf(snapshot, SettingsKeys.novelBookKey(book.id), "")
+            val perBook = settingsRepository.stringOf(snapshot, SettingsKeys.novelBookKey(book.id), "")
+            val global = settingsRepository.stringOf(snapshot, SettingsKeys.NOVEL_GLOBAL_PREFS, "")
+            // M6.4-D 与 Reader 读取同源：单独记忆开 → 本书快照；关 → 全局跟随（缺则兜底本书快照/默认）。
+            val raw = if (
+                settingsRepository.booleanOf(snapshot, SettingsKeys.novelBookSoloKey(book.id), false) &&
+                perBook.isNotBlank()
+            ) {
+                perBook
+            } else {
+                global.ifBlank { perBook }
+            }
             val prefs = if (raw.isBlank()) {
                 NovelReadingPrefs()
             } else {
@@ -147,9 +166,19 @@ class ReaderOpenViewModel : ViewModel() {
 
             val chapters = repository.novelChapters(book.id)
             val progress = repository.novelProgress(book.id)
-            val chapterIndex = progress?.chapterIndex
-                ?.coerceIn(0, (chapters.lastIndex).coerceAtLeast(0)) ?: 0
-            val pendingRestoreOffset = progress?.charOffset ?: -1
+            // M7 搜索定位：locateChapter 命中时覆盖进度推导——打开该章并定位到命中偏移
+            val hasLocate = locateChapter in 0..chapters.lastIndex && locateChar >= 0
+            val chapterIndex = if (hasLocate) {
+                locateChapter
+            } else {
+                progress?.chapterIndex
+                    ?.coerceIn(0, (chapters.lastIndex).coerceAtLeast(0)) ?: 0
+            }
+            val pendingRestoreOffset = if (hasLocate) {
+                locateChar
+            } else {
+                progress?.charOffset ?: -1
+            }
             val chapter = chapters.getOrNull(chapterIndex)
             val chapterText = chapter?.let { repository.readNovelChapter(book.id, it) }.orEmpty()
 
@@ -182,7 +211,13 @@ class ReaderOpenViewModel : ViewModel() {
                 endPadDp = cutoutSafeDp(prefs.pagePadding.dp, rawRightDp)
             }
             val topPadDp = cutoutSafeDp(24.dp, rawTopDp)
-            val bottomPadDp = cutoutSafeDp(24.dp, rawBottomDp)
+            // 与 NovelReaderScreen 同款横竖屏分支：竖屏 32 兜底手势条（M6.3-E-H 03/05），
+            // 横屏手势条在侧边，基准与 top 对齐（M6.3-E-H 06）——分页预算与 Reader 完全同源。
+            val bottomPadDp = if (landscape) {
+                cutoutSafeDp(24.dp, rawBottomDp)
+            } else {
+                cutoutSafeDp(32.dp, rawBottomDp)
+            }
 
             // 双页档判定与 NovelReaderScreen 的 useDouble 同一规则（横向翻页 + 始终 or 横屏）。
             val useDouble = prefs.pagingMode != SettingsKeys.NOVEL_PAGE_VERTICAL &&
@@ -197,7 +232,17 @@ class ReaderOpenViewModel : ViewModel() {
             val gutterPx = with(density) { NOVEL_SPREAD_GUTTER.toPx().roundToInt() }
             val halfPageWidthPx = ((textWidthPx - gutterPx) / 2).coerceAtLeast(1)
             val paginateWidthPx = if (useDouble) halfPageWidthPx else textWidthPx
-            val maxPages = if (progress != null) Int.MAX_VALUE else if (useDouble) 2 else 1
+            val maxPages = if (hasLocate || progress != null) Int.MAX_VALUE else if (useDouble) 2 else 1
+            val anchorChar = if (hasLocate) locateChar else progress?.charOffset ?: -1
+            // 章首（anchorChar == 0）/ 无进度时不截断：`stopAfterCharOffset` 的停页条件是
+            // 「当前页已覆盖该偏移」，而 0 落在 EPUB/MOBI 的「第X章 标题」块里 → 排完标题块
+            // 立刻停页，首屏分页只剩「仅章节名」的 1 页（快照余量平分还会把它摆到屏幕中间）；
+            // 随后整章分页给第 1 页补上正文 → 视觉上就是「先跳第X章、再跳正文」。
+            // TXT 没有独立标题块、0 落在正文段内，所以不触发。
+            val stopAfter = anchorChar.takeIf { it > 0 } ?: -1
+            // 章首不截断时也只排首屏：`maxPages` 的停页发生在 flushPage 之后，页是完整的；
+            // 而 stopAfterCharOffset 会在块中间停（首屏只剩「章节名」那一页不完整的内容）。
+            val pageLimit = if (stopAfter > 0) maxPages else if (useDouble) 2 else 1
             val pagination = withContext(Dispatchers.Default) {
                 NovelTextPager.paginate(
                     chapterText = chapterText,
@@ -207,13 +252,13 @@ class ReaderOpenViewModel : ViewModel() {
                     heightPx = textHeightPx,
                     density = density,
                     textMeasurer = textMeasurer,
-                    maxPages = maxPages,
-                    stopAfterCharOffset = progress?.charOffset ?: -1,
+                    maxPages = pageLimit,
+                    stopAfterCharOffset = stopAfter,
                 )
             }
-            val page = if (progress != null) {
+            val page = if (anchorChar >= 0) {
                 pagination.pages.firstOrNull { p ->
-                    p.charStart <= progress.charOffset && progress.charOffset < p.charEnd
+                    p.charStart <= anchorChar && anchorChar < p.charEnd
                 } ?: pagination.pages.firstOrNull()
             } else {
                 pagination.pages.firstOrNull()
@@ -248,6 +293,7 @@ class ReaderOpenViewModel : ViewModel() {
                         startPadPx = with(density) { startPadDp.toPx() },
                         endPadPx = with(density) { endPadDp.toPx() },
                         topPadPx = with(density) { topPadDp.toPx() },
+                        bottomPadPx = with(density) { bottomPadDp.toPx() },
                         secondPage = targetSpread.getOrNull(1),
                         halfWidthPx = halfPageWidthPx,
                         gutterPx = with(density) { NOVEL_SPREAD_GUTTER.toPx() },
@@ -265,6 +311,7 @@ class ReaderOpenViewModel : ViewModel() {
                         startPadPx = with(density) { startPadDp.toPx() },
                         endPadPx = with(density) { endPadDp.toPx() },
                         topPadPx = with(density) { topPadDp.toPx() },
+                        bottomPadPx = with(density) { bottomPadDp.toPx() },
                     )
                 }
             }
@@ -279,6 +326,8 @@ class ReaderOpenViewModel : ViewModel() {
                 firstPagination = pagination,
                 firstPageBitmap = bitmap,
                 paginationWidthPx = paginateWidthPx,
+                locateChar = if (hasLocate) locateChar else -1,
+                locateLen = locateLen,
             )
             controller.attachNovelSession(session, cover)
         } catch (error: CancellationException) {

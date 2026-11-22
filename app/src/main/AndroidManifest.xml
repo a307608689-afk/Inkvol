@@ -2,9 +2,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!--
-      v1.0 纯本地形态：不声明 INTERNET / ACCESS_NETWORK_STATE。
-      可选同步模块（M4.5）启用时再单独评估权限与隐私口径。
+      纯本地形态保持零存储权限。
+      M4.5 同步模块：INTERNET / ACCESS_NETWORK_STATE 仅服务于用户显式开启的
+      WebDAV 同步（访问用户在设置中指定的服务器），同步功能默认关闭。
     -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:name=".InkvolApplication"

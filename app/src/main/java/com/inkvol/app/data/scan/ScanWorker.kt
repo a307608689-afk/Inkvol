@@ -50,6 +50,10 @@ class ScanWorker(
                 }
         }
         Log.i(TAG, "background scan done added=$scanned failed=$failed")
+        // M6.3-D 收口：后台扫描完成通知 UI 层刷新
+        // （书架的书籍列表是手动 refresh 的快照，不主动刷新会让新书/筛选统计滞后）
+        (applicationContext as? com.inkvol.app.InkvolApplication)?.container
+            ?.libraryRepository?.refresh()
         return Result.success()
     }
 

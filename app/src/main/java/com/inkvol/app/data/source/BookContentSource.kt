@@ -177,7 +177,7 @@ class PdfSource(private val file: File) : BookContentSource {
 object SourceRules {
     private val imageExtensions = setOf("jpg", "jpeg", "png", "webp", "bmp", "gif", "avif")
     private val archiveExtensions = setOf("zip", "cbz", "rar", "cbr", "7z", "cb7", "pdf")
-    private val novelExtensions = setOf("txt", "epub")
+    private val novelExtensions = setOf("txt", "epub", "mobi")
 
     fun isImageName(name: String): Boolean =
         name.substringAfterLast('.', "").lowercase() in imageExtensions
@@ -215,6 +215,14 @@ object SourceRules {
             bytes[2] == 0x44.toByte() && bytes[3] == 0x46.toByte()
         ) {
             return "PDF"
+        }
+        if (bytes.size >= 68 &&
+            bytes[60] == 0x42.toByte() && bytes[61] == 0x4F.toByte() &&
+            bytes[62] == 0x4F.toByte() && bytes[63] == 0x4B.toByte() &&
+            bytes[64] == 0x4D.toByte() && bytes[65] == 0x4F.toByte() &&
+            bytes[66] == 0x42.toByte() && bytes[67] == 0x49.toByte()
+        ) {
+            return "MOBI"
         }
         return null
     }

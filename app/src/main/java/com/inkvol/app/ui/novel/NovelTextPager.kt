@@ -20,7 +20,7 @@ data class NovelTextBlock(
     val imagePath: String? = null,
 )
 
-/** 一个分页切片；slice 可能把长段落拆到下一页。 */
+/** 一个分页切片；段落跨页时把段落拆到下一页。 */
 data class NovelTextSlice(
     val text: String,
     val charStart: Int,
@@ -34,6 +34,8 @@ data class NovelTextPage(
     val slices: List<NovelTextSlice>,
     val charStart: Int,
     val charEnd: Int,
+    /** 渲染视角内容高度（Σ 片高 + 每片一个段距——含渲染侧「垫高 Spacer 与首片」之间的段距，与 spacedBy 渲染口径一致）；渲染侧用它把分页余数平分上下。0 = 未统计。 */
+    val contentHeightPx: Int = 0,
 )
 
 data class NovelPagination(
@@ -72,22 +74,70 @@ object NovelTextPager {
             textIndent = TextIndent(firstLine = (prefs.indentChars * prefs.fontSize).sp),
         )
         val paragraphSpacingPx = with(density) { prefs.paragraphSpacing.dp.toPx().roundToInt() }
+        // M6.4-K 续片重测样式：整块布局里续行无首行缩进，子串带 firstLine 缩进
+        // 单独重测会换行不一致（可能多折一行）→ 超出页预算被裁。
+        val continuationStyle = textStyle.copy(textIndent = TextIndent(firstLine = 0.sp))
         val textWidthPx = widthPx
         val pageHeightPx = heightPx
-        val slices = ArrayList<NovelTextSlice>()
+        val pages = ArrayList<NovelTextPage>()
+        var currentPage = ArrayList<NovelTextSlice>()
+        var currentHeight = 0
+        var currentPageStart = -1
+        var currentPageEnd = -1
 
-        // 只排到目标偏移所在段落的下一段：预打开快照无需整章排版。
-        val targetBlockIndex = if (stopAfterCharOffset >= 0) {
-            blocks.indexOfFirst { stopAfterCharOffset >= it.charStart && stopAfterCharOffset < it.charEnd }
-        } else {
-            -1
+        fun flushPage() {
+            if (currentPage.isEmpty()) return
+            pages += NovelTextPage(
+                slices = currentPage.toList(),
+                charStart = currentPageStart,
+                charEnd = currentPageEnd,
+                contentHeightPx = currentHeight,
+            )
+            currentPage = ArrayList()
+            currentHeight = 0
+            currentPageStart = -1
+            currentPageEnd = -1
         }
-        val blockLimit = if (targetBlockIndex >= 0) targetBlockIndex + 2 else blocks.size
 
+        // M6.4-K 页底裁切修复：渲染侧 Column 的 spacedBy 在「余数垫高 Spacer 与首片」
+        // 之间也会插一个段距（渲染恒比分页预算多一个段距；页尾余数 < 2×段距时底部
+        // 溢出、末行被裁掉一部分）。预算侧同步恒计一个段距（覆盖 Spacer 缺口），
+        // 预算与渲染逐像素对齐。
+        fun appendSlice(slice: NovelTextSlice) {
+            currentHeight += slice.heightPx + paragraphSpacingPx
+            currentPage += slice
+            if (currentPageStart < 0) currentPageStart = slice.charStart
+            currentPageEnd = slice.charEnd
+        }
+
+        /** 本页剩余可装高度（已扣除下一个段距缺口，空页含 Spacer 与首片之间的段距）。 */
+        fun pageRemain(): Int =
+            pageHeightPx - currentHeight - paragraphSpacingPx
+
+        // 目标偏移只用于决定「排到哪一页为止」，且**必须等整页刷出后再停**：
+        // 若在追加第一片后就 break，目标页只剩一行/一段；渲染侧把页内余量平分到上下
+        //（remPx/2），预打开快照与首屏就表现为「屏幕中间只冒出一行字，随后才出现整页正文」。
+        val hasTarget = stopAfterCharOffset >= 0
+        // 早停改由 targetReached + 页刷出触发，不再按块数预截断（否则填不满目标页）。
+        val blockLimit = blocks.size
+
+        var targetReached = false
+        var stopped = false
         blocks.take(blockLimit).forEachIndexed { blockIndex, block ->
-            // M6.2-B：EPUB 图片块 → 单个图片 slice，高度按内容宽等比缩放，最高占满一页。
+            if (stopped) return@forEachIndexed
+            // M6.2-B：EPUB 图片块 → 单个图片 slice，高度按内容宽等比缩放，最高占满一页；图片不跨页。
             if (block.imagePath != null) {
-                slices += imageSlice(block, textWidthPx, pageHeightPx)
+                // M6.4-K：首位段距已恒计预算，图片满页高会溢出一个段距 → 可用高同步收紧。
+                val slice = imageSlice(block, textWidthPx, pageHeightPx - paragraphSpacingPx)
+                if (currentPage.isNotEmpty() && slice.heightPx > pageRemain()) {
+                    flushPage()
+                    if (targetReached) {
+                        stopped = true
+                        return@forEachIndexed
+                    }
+                }
+                appendSlice(slice)
+                if (hasTarget && currentPageEnd > stopAfterCharOffset) targetReached = true
                 return@forEachIndexed
             }
             val layout = textMeasurer.measure(
@@ -96,83 +146,66 @@ object NovelTextPager {
                 constraints = Constraints(maxWidth = textWidthPx),
             )
             val lineCount = layout.lineCount.coerceAtLeast(1)
-            if (layout.size.height <= pageHeightPx) {
-                slices += NovelTextSlice(
-                    text = block.text,
-                    charStart = block.charStart,
-                    charEnd = block.charEnd,
-                    isBlockStart = true,
-                    heightPx = layout.size.height,
-                )
-                return@forEachIndexed
-            }
-
-            // 长段落按行拆页；同一行组仍保持原始换行结果，避免重排错页。
-            val lineHeightPx = (layout.size.height.toFloat() / lineCount).roundToInt().coerceAtLeast(1)
-            val linesPerPage = (pageHeightPx / lineHeightPx).coerceAtLeast(1)
+            // 行高向上取整：行数预算只少不多估 → 片实测高度必不超预算，页尾零头收敛到不足一行。
+            val lineHeightPx = ((layout.size.height + lineCount - 1) / lineCount).coerceAtLeast(1)
             var start = 0
             while (start < lineCount) {
-                val end = (start + linesPerPage).coerceAtMost(lineCount)
+                var fitLines = pageRemain() / lineHeightPx
+                if (currentPage.isEmpty() && fitLines <= 0) fitLines = 1 // 空页保底，防死循环
+                val end = (start + fitLines).coerceAtMost(lineCount)
+                if (end <= start) {
+                    // 非空页连一行也放不下 → 切页重试（空页已被保底覆盖，不会死循环）。
+                    flushPage()
+                    if (targetReached) {
+                        // 目标页已满页刷出、内容完整，可以停
+                        stopped = true
+                        break
+                    }
+                    continue
+                }
                 val sliceStart = layout.getLineStart(start)
                 val sliceEnd = layout.getLineEnd(end - 1)
                 val sliceText = block.text.substring(sliceStart, sliceEnd)
-                val sliceLayout = textMeasurer.measure(
-                    text = sliceText,
-                    style = textStyle,
-                    constraints = Constraints(maxWidth = textWidthPx),
+                // 整块装入直接用整块测量高度；跨页拆片/尾片按子串实测。
+                val sliceHeight = if (start == 0 && end == lineCount) {
+                    layout.size.height
+                } else {
+                    textMeasurer.measure(
+                        text = sliceText,
+                        // M6.4-K：续片（start>0）用无缩进样式重测，与整块布局换行一致。
+                        style = if (start == 0) textStyle else continuationStyle,
+                        constraints = Constraints(maxWidth = textWidthPx),
+                    ).size.height
+                }
+                appendSlice(
+                    NovelTextSlice(
+                        text = sliceText,
+                        charStart = block.charStart + sliceStart,
+                        charEnd = block.charStart + sliceEnd,
+                        isBlockStart = start == 0,
+                        heightPx = sliceHeight,
+                    ),
                 )
-                slices += NovelTextSlice(
-                    text = sliceText,
-                    charStart = block.charStart + sliceStart,
-                    charEnd = block.charStart + sliceEnd,
-                    isBlockStart = start == 0,
-                    heightPx = sliceLayout.size.height,
-                )
+                // 目标偏移已覆盖：只做标记，继续把这一页填满（否则会留下「只有一行」的残页）。
+                if (hasTarget && currentPageEnd > stopAfterCharOffset) targetReached = true
                 start = end
-            }
-            if (blockIndex != blockLimit - 1) {
-                slices.lastOrNull()?.let { slice ->
-                    slices[slices.lastIndex] = slice.copy(heightPx = slice.heightPx + paragraphSpacingPx)
+                if (start < lineCount) {
+                    // 段落跨页（Kindle 同款惯例）：余行进下页，替代旧的「整段推下页」，
+                    // 页尾装填零头从「一段+段距」收敛到不足一行 → 上下留空恒小且页间稳定。
+                    flushPage()
+                    if (targetReached) {
+                        // 目标页已满页刷出、内容完整，可以停
+                        stopped = true
+                        break
+                    }
+                    if (pages.size >= maxPages) {
+                        stopped = true
+                        break
+                    }
                 }
             }
         }
-
-        val pages = ArrayList<NovelTextPage>()
-        var currentPage = ArrayList<NovelTextSlice>()
-        var currentHeight = 0
-        var currentPageStart = -1
-        var currentPageEnd = -1
-
-        for (slice in slices) {
-            val needed = slice.heightPx + if (currentPage.isEmpty()) 0 else paragraphSpacingPx
-            if (currentPage.isNotEmpty() && currentHeight + needed > pageHeightPx) {
-                pages += NovelTextPage(
-                    slices = currentPage.toList(),
-                    charStart = currentPageStart,
-                    charEnd = currentPageEnd,
-                )
-                if (pages.size >= maxPages) break
-                currentPage = ArrayList()
-                currentHeight = 0
-                currentPageStart = -1
-                currentPageEnd = -1
-            }
-
-            val extra = if (currentPage.isEmpty()) 0 else paragraphSpacingPx
-            currentPage += slice
-            currentHeight += slice.heightPx + extra
-            if (currentPageStart < 0) currentPageStart = slice.charStart
-            currentPageEnd = slice.charEnd
-            // 目标偏移所在页已完整生成即可停止。
-            if (stopAfterCharOffset >= 0 && currentPageEnd > stopAfterCharOffset) break
-        }
-        if (pages.size < maxPages && currentPage.isNotEmpty()) {
-            pages += NovelTextPage(
-                slices = currentPage.toList(),
-                charStart = currentPageStart,
-                charEnd = currentPageEnd,
-            )
-        }
+        flushPage()
         return NovelPagination(blocks, pages)
     }
 
@@ -210,11 +243,11 @@ object NovelTextPager {
         return blocks
     }
 
-    /** 图片块切片：宽 = 内容宽，高 = 宽 / 宽高比，clamp 到一页高；解码失败按 4:3 兜底。 */
+    /** 图片块切片：宽 = 内容宽，高 = 宽 / 宽高比，clamp 到单页可装高度（页高 − 首位段距）；解码失败按 4:3 兜底。 */
     private fun imageSlice(
         block: NovelTextBlock,
         contentWidthPx: Int,
-        pageHeightPx: Int,
+        maxSliceHeightPx: Int,
     ): NovelTextSlice {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         runCatching { BitmapFactory.decodeFile(File(block.imagePath!!).absolutePath, bounds) }
@@ -228,7 +261,7 @@ object NovelTextPager {
             charStart = block.charStart,
             charEnd = block.charEnd,
             isBlockStart = true,
-            heightPx = height.coerceIn(1, pageHeightPx.coerceAtLeast(1)),
+            heightPx = height.coerceIn(1, maxSliceHeightPx.coerceAtLeast(1)),
             imagePath = block.imagePath,
         )
     }
