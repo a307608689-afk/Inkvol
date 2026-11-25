@@ -82,6 +82,14 @@ data class BackupPurifyRule(
     val enabled: Boolean = true,
 )
 
+/** P3：漫画章节条目（派生数据，仅备份防重算）。 */
+@Serializable
+data class BackupSection(
+    val idx: Int,
+    val title: String,
+    val pageStart: Int,
+)
+
 @Serializable
 data class BackupBook(
     val id: String,
@@ -98,6 +106,8 @@ data class BackupBook(
     val novelProgress: BackupNovelProgress? = null,
     val novelBookmarks: List<BackupNovelBookmark> = emptyList(),
     val annotations: List<BackupAnnotation> = emptyList(),
+    // P3：漫画章节区间（缺省空 = 旧备份兼容，恢复后由阅读器 write-through 补齐）
+    val sections: List<BackupSection> = emptyList(),
 )
 
 @Serializable

@@ -287,6 +287,10 @@ fun InkvolApp(
         val railFolderSortDescending = prefs?.let {
             settingsRepository.stringOf(it, SettingsKeys.LIBRARY_FOLDER_SORT_DESC, "0")
         } == "1"
+        // 书架展示样式快照（一级菜单切换行渲染用；与书架页同一持久化真源，三视图联动）
+        val railFolderView = prefs?.let {
+            settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SHELF_VIEW, SettingsKeys.SHELF_VIEW_GRID)
+        } ?: SettingsKeys.SHELF_VIEW_GRID
 
         fun runRailPlusAction() {
             when (plusAction) {
@@ -582,21 +586,9 @@ fun InkvolApp(
             }
         }
 
-        // 小说路由：进入后立即隐藏系统栏，并在 300ms 后重申一次（防路由转场恢复）。
-        LaunchedEffect(currentRoute) {
-            if (currentRoute?.startsWith("novel-reader/") == true) {
-                val window = (context as? android.app.Activity)?.window
-                val controller = window?.let {
-                    WindowCompat.getInsetsController(it, it.decorView)
-                }
-                controller?.systemBarsBehavior =
-                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                controller?.hide(WindowInsetsCompat.Type.systemBars())
-                delay(300)
-                // 路由已变时 effect 会被取消，这里的重申不会误伤书架。
-                controller?.hide(WindowInsetsCompat.Type.systemBars())
-            }
-        }
+        // 小说路由的系统栏不再由宿主重申（用户 2026-11-25 拍板）：
+        // 阅读器进场自己 hide 一次，之后状态栏随菜单栏显隐由 NovelReaderScreen 单点接管；
+        // 宿主保留的 300ms 重申会与「首帧即菜单栏可见」抢控制权（菜单栏在、状态栏被压掉）。
 
         // 预加载失败：若还没切路由则直接反向关闭；若已切 Reader 则回书架。
         LaunchedEffect(readerOpen.contentFailed) {
@@ -903,6 +895,21 @@ fun InkvolApp(
                                 }
                                 scrollToTopBus.request()
                             },
+                            // 展示样式切换：写全局键即生效（prefs flow 回流书架页派生值）
+                            viewStyle = railFolderView,
+                            onViewStyleToggle = {
+                                railSortMenuOpen = false
+                                refreshScope.launch {
+                                    settingsRepository.putString(
+                                        SettingsKeys.LIBRARY_SHELF_VIEW,
+                                        if (railFolderView == SettingsKeys.SHELF_VIEW_LIST) {
+                                            SettingsKeys.SHELF_VIEW_GRID
+                                        } else {
+                                            SettingsKeys.SHELF_VIEW_LIST
+                                        },
+                                    )
+                                }
+                            },
                             alignment = Alignment.TopEnd,
                             origin = TransformOrigin(1f, 0f),
                             modifier = Modifier
@@ -940,6 +947,26 @@ fun InkvolApp(
                                     )
                                 }
                                 scrollToTopBus.request()
+                            },
+                            // 展示样式切换：仅一级平铺/系列渲染（二级页打开时 target 非空
+                            // → 不传，样式只作用一级）；与书夹菜单切换行同一全局键。
+                            viewStyle = if (LibraryUiState.target == null) railFolderView else null,
+                            onViewStyleToggle = if (LibraryUiState.target == null) {
+                                {
+                                    railSortMenuOpen = false
+                                    refreshScope.launch {
+                                        settingsRepository.putString(
+                                            SettingsKeys.LIBRARY_SHELF_VIEW,
+                                            if (railFolderView == SettingsKeys.SHELF_VIEW_LIST) {
+                                                SettingsKeys.SHELF_VIEW_GRID
+                                            } else {
+                                                SettingsKeys.SHELF_VIEW_LIST
+                                            },
+                                        )
+                                    }
+                                }
+                            } else {
+                                null
                             },
                             alignment = Alignment.TopEnd,
                             origin = TransformOrigin(1f, 0f),
@@ -1155,13 +1182,13 @@ private fun InkvolNavHost(
                             }
                         }
                     },
-                    onOpenNovelAt = { book, chapterIdx, charPos ->
+                    onOpenNovelAt = { book, chapterIdx, charPos, rect, locateLen ->
                         if (readerOpen.phase == ReaderOpenPhase.Idle) {
                             val cutout = WindowInsetsCompat.toWindowInsetsCompat(view.rootWindowInsets)
                                 .getInsets(WindowInsetsCompat.Type.displayCutout())
                             readerOpenViewModel.startNovelOpen(
                                 book = book,
-                                sourceRect = null,
+                                sourceRect = rect,
                                 rootWidthPx = view.width.coerceAtLeast(1),
                                 rootHeightPx = view.height.coerceAtLeast(1),
                                 repository = libraryRepository,
@@ -1174,6 +1201,7 @@ private fun InkvolNavHost(
                                 cutoutBottomPx = cutout.bottom,
                                 locateChapter = chapterIdx,
                                 locateChar = charPos,
+                                locateLen = locateLen,
                             )
                         }
                     },

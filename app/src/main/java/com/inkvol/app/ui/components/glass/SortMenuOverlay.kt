@@ -7,7 +7,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.MenuBook
+import androidx.compose.material.icons.automirrored.outlined.ViewList
 import androidx.compose.material.icons.outlined.DataUsage
+import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.DragHandle
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.PieChart
@@ -28,11 +30,14 @@ import com.inkvol.app.data.settings.SettingsKeys
 import com.kyant.backdrop.Backdrop
 
 /**
- * 书架排序菜单（6 档 + 升降序切换）。
+ * 书架排序菜单（6 档 + 升降序切换 + 展示样式切换行）。
  *
  * 功能逻辑对齐 SSMH 的书夹排序：逐档点选即生效并收起，末行「改为升序/改为降序」
  * 切换全局方向。视觉与 [PlusMenuOverlay] 完全同语言（GlassOverlay Anchored 动效 +
  * MenuRow 双行 + HorizontalDivider），选中档主色高亮 + 行尾对勾。
+ *
+ * 展示样式切换行（library_shelf_view）：[viewStyle] / [onViewStyleToggle] 非空才渲染
+ * （一级平铺/系列视图时由调用方传入；二级页打开时不传，样式只作用一级页）。
  *
  * 锚点几何由调用方经 [modifier]（padding / widthIn）与 [alignment] / [origin] 给出：
  * - 手机：标题行排序钮左上角（TopEnd + 右上 origin）；
@@ -87,10 +92,15 @@ fun SortMenuOverlay(
     onDismiss: () -> Unit,
     onPick: (String) -> Unit,
     onToggleOrder: () -> Unit,
+    /** 当前书架展示样式（SettingsKeys.SHELF_VIEW_*）；null = 不渲染切换行（二级页）。 */
+    viewStyle: String? = null,
+    /** 切换网格/列表展示；null = 不渲染切换行。 */
+    onViewStyleToggle: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     alignment: Alignment = Alignment.TopEnd,
     origin: TransformOrigin = TransformOrigin(1f, 0f),
 ) {
+    val listStyleActive = viewStyle == SettingsKeys.SHELF_VIEW_LIST
     GlassOverlay(
         visible = visible,
         motion = GlassOverlayMotion.Anchored,
@@ -119,6 +129,23 @@ fun SortMenuOverlay(
                 subtitle = if (descending) "当前降序，点按切换" else "当前升序，点按切换",
                 onClick = onToggleOrder,
             )
+            if (onViewStyleToggle != null && viewStyle != null) {
+                HorizontalDivider()
+                MenuRow(
+                    icon = if (listStyleActive) {
+                        Icons.Outlined.GridView
+                    } else {
+                        Icons.AutoMirrored.Outlined.ViewList
+                    },
+                    title = if (listStyleActive) "切换为网格展示" else "切换为列表展示",
+                    subtitle = if (listStyleActive) {
+                        "当前列表展示，点按切换"
+                    } else {
+                        "当前网格展示，点按切换"
+                    },
+                    onClick = onViewStyleToggle,
+                )
+            }
         }
     }
 }
@@ -148,10 +175,14 @@ private val folderSortOptions = listOf(
 )
 
 /**
- * 书夹视图（一级）的书夹卡排序菜单（3 档 + 升降序行）——与书排序菜单
+ * 书夹视图（一级）的书夹卡排序菜单（3 档 + 升降序行 + 展示样式切换行）——与书排序菜单
  * [SortMenuOverlay] 同语言但独立记忆（library_folder_sort / _desc），
  * 书夹卡片顺序不跟随全局书排序档。方向只作用于名称/数量两档，
  * 自定义（拖拽）档与方向无关。锚点几何同 [SortMenuOverlay] 由调用方给出。
+ *
+ * 展示样式切换行（library_shelf_view，三视图联动）：[viewStyle] / [onViewStyleToggle]
+ * 非空才渲染（调用方按平板/手机各自传回调，写同一持久化键、prefs flow 自动回流两边）。
+ * 列表样式不支持拖拽排序，custom 档副标题随之提示回网格操作。
  */
 @Composable
 fun FolderSortMenuOverlay(
@@ -165,10 +196,15 @@ fun FolderSortMenuOverlay(
     onDismiss: () -> Unit,
     onPick: (String) -> Unit,
     onToggleOrder: () -> Unit,
+    /** 当前书架展示样式（SettingsKeys.SHELF_VIEW_*）；null = 不渲染切换行。 */
+    viewStyle: String? = null,
+    /** 切换网格/列表展示；null = 不渲染切换行。 */
+    onViewStyleToggle: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     alignment: Alignment = Alignment.TopEnd,
     origin: TransformOrigin = TransformOrigin(1f, 0f),
 ) {
+    val listStyleActive = viewStyle == SettingsKeys.SHELF_VIEW_LIST
     GlassOverlay(
         visible = visible,
         motion = GlassOverlayMotion.Anchored,
@@ -185,7 +221,13 @@ fun FolderSortMenuOverlay(
                 MenuRow(
                     icon = option.icon,
                     title = option.label,
-                    subtitle = if (descending) option.descSubtitle else option.ascSubtitle,
+                    subtitle = if (option.value == SettingsKeys.FOLDER_SORT_CUSTOM && listStyleActive) {
+                        "切换到网格视图后长按拖动"
+                    } else if (descending) {
+                        option.descSubtitle
+                    } else {
+                        option.ascSubtitle
+                    },
                     onClick = { onPick(option.value) },
                     selected = mode == option.value,
                 )
@@ -197,6 +239,23 @@ fun FolderSortMenuOverlay(
                 subtitle = if (descending) "当前降序，点按切换" else "当前升序，点按切换",
                 onClick = onToggleOrder,
             )
+            if (onViewStyleToggle != null && viewStyle != null) {
+                HorizontalDivider()
+                MenuRow(
+                    icon = if (listStyleActive) {
+                        Icons.Outlined.GridView
+                    } else {
+                        Icons.AutoMirrored.Outlined.ViewList
+                    },
+                    title = if (listStyleActive) "切换为网格展示" else "切换为列表展示",
+                    subtitle = if (listStyleActive) {
+                        "当前列表展示，点按切换"
+                    } else {
+                        "当前网格展示，点按切换"
+                    },
+                    onClick = onViewStyleToggle,
+                )
+            }
         }
     }
 }

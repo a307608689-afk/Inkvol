@@ -5,6 +5,7 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.inkvol.app.data.model.BookRecord
+import com.inkvol.app.data.model.BookSectionRecord
 import com.inkvol.app.data.model.CategoryRecord
 import com.inkvol.app.data.model.LibraryRecord
 import com.inkvol.app.data.model.NovelChapterRecord
@@ -23,7 +24,7 @@ import com.inkvol.app.data.model.TrashBook
  * - categories / book_categories：全局书夹（多对多）；
  * - progress / page_bookmarks：为 M3 阅读器预留，M2 只读 percent。
  */
-class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", null, 11) {
+class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", null, 14) {
 
     override fun onCreate(db: SQLiteDatabase) {
         createCoreTables(db)
@@ -32,6 +33,8 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
         createM6Tables(db)
         createM63BTables(db)
         createSyncTables(db)
+        createTypeOverrideTable(db)
+        createSectionTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
@@ -68,6 +71,47 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
         if (oldVersion < 11) {
             createSyncTables(db)
         }
+        // v12：系列文件夹层级（book_locations.folder_path）。旧数据为 NULL，
+        // 系列视图先按旧 series 名退化，后台自动重扫一次后生效（无感迁移）。
+        if (oldVersion < 12) {
+            runCatching {
+                db.execSQL("ALTER TABLE book_locations ADD COLUMN folder_path TEXT")
+            }
+        }
+        // v13：用户手动指定的阅读类型（EPUB 小说↔漫画互转后，重扫不再自动判定覆盖）
+        if (oldVersion < 13) {
+            createTypeOverrideTable(db)
+        }
+        // v14：漫画章节区间（book_sections，仅备份用；阅读器始终从内容源现算）
+        if (oldVersion < 14) {
+            createSectionTable(db)
+        }
+    }
+
+    private fun createSectionTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS book_sections(
+                book_id TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                page_start INTEGER NOT NULL,
+                PRIMARY KEY(book_id, idx)
+            )
+            """.trimIndent(),
+        )
+    }
+
+    /** v13：手动类型标记表（不碰 books 表，避免加列迁移）。 */
+    private fun createTypeOverrideTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS book_type_overrides(
+                book_id TEXT PRIMARY KEY,
+                updated_at INTEGER NOT NULL
+            )
+            """.trimIndent(),
+        )
     }
 
     /** M4.5：同步墓碑表（跨设备删除传播；kind+key 唯一）。 */
@@ -143,6 +187,8 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                 display_path TEXT NOT NULL,
                 last_seen_at INTEGER NOT NULL,
                 is_primary INTEGER NOT NULL DEFAULT 1,
+                -- v12：位置相对库根的目录路径（""=库根；NULL=旧数据未回填/单文件导入）
+                folder_path TEXT,
                 PRIMARY KEY(book_id, doc_id)
             )
             """.trimIndent(),
@@ -410,6 +456,7 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                 put("display_path", book.displayPath)
                 put("last_seen_at", System.currentTimeMillis())
                 put("is_primary", 1)
+                put("folder_path", book.folderPath)
             }
             db.insertWithOnConflict("book_locations", null, location, SQLiteDatabase.CONFLICT_REPLACE)
             db.setTransactionSuccessful()
@@ -418,8 +465,74 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
         }
     }
 
+    // ---------------- v13：阅读类型手动指定 / 类型互转 ----------------
+
+    /** 该书是否被用户手动指定过阅读类型（命中则重扫不再自动判定）。 */
+    fun isTypeOverridden(bookId: String): Boolean =
+        readableDatabase.rawQuery(
+            "SELECT 1 FROM book_type_overrides WHERE book_id = ?",
+            arrayOf(bookId),
+        ).use { it.moveToFirst() }
+
+    fun markTypeOverridden(bookId: String) {
+        writableDatabase.insertWithOnConflict(
+            "book_type_overrides",
+            null,
+            ContentValues().apply {
+                put("book_id", bookId)
+                put("updated_at", System.currentTimeMillis())
+            },
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+    }
+
+    fun clearTypeOverride(bookId: String) {
+        writableDatabase.delete("book_type_overrides", "book_id = ?", arrayOf(bookId))
+    }
+
+    /** 小说 / 漫画互转：只改类型相关列，不动 added_at、书夹归属与文件位置。 */
+    fun updateBookKind(
+        bookId: String,
+        type: String,
+        format: String,
+        pageCount: Int,
+        coverPath: String?,
+    ) {
+        val values = ContentValues().apply {
+            put("type", type)
+            put("format", format)
+            put("page_count", pageCount)
+            if (coverPath != null) put("cover_path", coverPath)
+            put("updated_at", System.currentTimeMillis())
+        }
+        writableDatabase.update("books", values, "id = ?", arrayOf(bookId))
+    }
+
+    /** 转漫画：清小说进度与章节（章节残留会污染全站搜索的章节命中）。 */
+    fun deleteNovelProgress(bookId: String) {
+        writableDatabase.delete("novel_progress", "book_id = ?", arrayOf(bookId))
+        writableDatabase.delete("novel_chapters", "book_id = ?", arrayOf(bookId))
+    }
+
+    /** 转小说：清漫画页码进度（页书签 / 分格缓存由调用方清理）。 */
+    fun deleteComicProgress(bookId: String) {
+        writableDatabase.delete("progress", "book_id = ?", arrayOf(bookId))
+        writableDatabase.delete("page_bookmarks", "book_id = ?", arrayOf(bookId))
+    }
+
     fun hasBook(id: String): Boolean =
         readableDatabase.rawQuery("SELECT 1 FROM books WHERE id = ?", arrayOf(id)).use { it.moveToFirst() }
+
+    /**
+     * 仅「书架可见」的书：回收站里的书不算存在。
+     * 单文件重新导入用它判重——否则「移入回收站 → 想重导被拦『已经在书架里了』」成为死路；
+     * 放行后 upsertBook 复用同一指纹行（deleted_at 为空的新行）自然复活。
+     */
+    fun hasActiveBook(id: String): Boolean =
+        readableDatabase.rawQuery(
+            "SELECT 1 FROM books WHERE id = ? AND deleted_at IS NULL",
+            arrayOf(id),
+        ).use { it.moveToFirst() }
 
     /**
      * 扫描「再次见到」已存在的书时刷新可见时间戳。
@@ -434,6 +547,53 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
             arrayOf(bookId, folderId.toString()),
         )
     }
+
+    /**
+     * v12 系列路径回填：已存在的书重扫时走 skip 分支（不进 upsertBook），
+     * 必须在这里同步刷新系列名与目录路径，否则 folder_path 永远为空、
+     * 系列视图的文件夹层级/扁平分组无法生效。
+     */
+    fun updateBookLocationFolder(
+        bookId: String,
+        folderId: Long,
+        series: String?,
+        folderPath: String?,
+    ) {
+        val db = writableDatabase
+        db.update(
+            "books",
+            ContentValues().apply {
+                put("series", series)
+                put("updated_at", System.currentTimeMillis())
+            },
+            "id = ?",
+            arrayOf(bookId),
+        )
+        db.update(
+            "book_locations",
+            ContentValues().apply {
+                put("folder_path", folderPath)
+                put("last_seen_at", System.currentTimeMillis())
+            },
+            "book_id = ? AND folder_id = ?",
+            arrayOf(bookId, folderId.toString()),
+        )
+    }
+
+    /**
+     * v12 无感迁移判定：非单文件导入的位置里还有 folder_path 为空的行。
+     * 单文件导入永远为 NULL（不属于任何文件夹系列），必须排除，否则判定恒真、
+     * 每次冷启动都会白扫一遍。
+     */
+    fun hasMissingFolderPath(): Boolean = readableDatabase.rawQuery(
+        """
+        SELECT 1 FROM book_locations l
+        JOIN folders f ON f.id = l.folder_id
+        WHERE l.folder_path IS NULL AND f.tree_uri != ?
+        LIMIT 1
+        """.trimIndent(),
+        arrayOf(com.inkvol.app.data.import.SingleFileImporter.SINGLE_LIBRARY_URI),
+    ).use { it.moveToFirst() }
 
     fun clearAll() {
         val db = writableDatabase
@@ -566,8 +726,10 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
         db.delete("page_bookmarks", "book_id = ?", arrayOf(bookId))
         db.delete("novel_chapters", "book_id = ?", arrayOf(bookId))
         db.delete("novel_progress", "book_id = ?", arrayOf(bookId))
+        db.delete("book_sections", "book_id = ?", arrayOf(bookId))
         db.delete("annotations", "book_id = ?", arrayOf(bookId))
         db.delete("novel_purify", "book_id = ?", arrayOf(bookId))
+        db.delete("book_type_overrides", "book_id = ?", arrayOf(bookId))
         db.delete("books", "id = ?", arrayOf(bookId))
     }
 
@@ -646,6 +808,58 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
             arrayOf(id.toString()),
         ).use { it.moveToFirst() }
 
+    /** 同步范围候选（M4.5）：单文件导入库之外的各文件夹 + 书数（含可单文件传输数与文件夹漫画数）。 */
+    data class ScopeFolderRow(
+        val id: Long,
+        val name: String,
+        val libraryName: String,
+        val totalBooks: Int,
+        val transferableBooks: Int,
+    )
+
+    fun queryScopeFolders(): List<ScopeFolderRow> {
+        val result = ArrayList<ScopeFolderRow>()
+        readableDatabase.rawQuery(
+            """
+            SELECT f.id, COALESCE(f.display_name, ''), COALESCE(lib.name, ''),
+                   COUNT(DISTINCT b.id) AS total_cnt,
+                   COUNT(DISTINCT CASE WHEN b.format != 'FOLDER' THEN b.id END) AS transferable_cnt
+            FROM folders f
+            LEFT JOIN libraries lib ON lib.id = f.library_id
+            LEFT JOIN book_locations bl ON bl.folder_id = f.id
+            LEFT JOIN books b ON b.id = bl.book_id AND b.deleted_at IS NULL
+            WHERE f.enabled = 1 AND f.tree_uri != ?
+            GROUP BY f.id
+            ORDER BY COALESCE(lib.sort_key, 0), f.id
+            """.trimIndent(),
+            arrayOf(com.inkvol.app.data.import.SingleFileImporter.SINGLE_LIBRARY_URI),
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                result += ScopeFolderRow(
+                    id = cursor.getLong(0),
+                    name = cursor.getString(1) ?: "",
+                    libraryName = cursor.getString(2) ?: "",
+                    totalBooks = cursor.getInt(3),
+                    transferableBooks = cursor.getInt(4),
+                )
+            }
+        }
+        return result
+    }
+
+    /** 单文件导入（散书）库中的可同步书数（排除文件夹形态，理论上不存在）。 */
+    fun countSingleLibraryBooks(): Int =
+        readableDatabase.rawQuery(
+            """
+            SELECT COUNT(DISTINCT b.id)
+            FROM book_locations bl
+            JOIN folders f ON f.id = bl.folder_id
+            JOIN books b ON b.id = bl.book_id AND b.deleted_at IS NULL
+            WHERE f.tree_uri = ? AND b.format != 'FOLDER'
+            """.trimIndent(),
+            arrayOf(com.inkvol.app.data.import.SingleFileImporter.SINGLE_LIBRARY_URI),
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.getInt(0) else 0 }
+
     // ---------------- 书架查询 ----------------
 
     private val bookSelect = """
@@ -656,7 +870,8 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                    p.updated_at,
                    (SELECT MAX(updated_at) FROM novel_progress WHERE book_id = b.id),
                    0
-               )
+               ),
+               l.folder_path
         FROM books b
         LEFT JOIN book_locations l ON l.rowid = (
             SELECT rowid FROM book_locations
@@ -754,6 +969,7 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                     percent = cursor.getDouble(15),
                     lastReadAt = cursor.getLong(17),
                     treeUri = cursor.getString(16),
+                    folderPath = cursor.getString(18),
                 )
             }
         }
@@ -948,6 +1164,34 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
         }
         val args = if (chapterIdx != null) arrayOf(bookId, chapterIdx.toString()) else arrayOf(bookId)
         return readableDatabase.rawQuery(sql, args).use { cursor ->
+            val result = ArrayList<AnnotationRecord>()
+            while (cursor.moveToNext()) {
+                result += AnnotationRecord(
+                    id = cursor.getLong(0),
+                    bookId = cursor.getString(1),
+                    kind = cursor.getString(2),
+                    chapterIdx = cursor.getInt(3),
+                    charStart = cursor.getInt(4),
+                    charEnd = cursor.getInt(5),
+                    snippet = cursor.getString(6) ?: "",
+                    note = if (cursor.isNull(7)) null else cursor.getString(7),
+                    color = cursor.getString(8) ?: "yellow",
+                    style = cursor.getString(9) ?: "bg",
+                    createdAt = cursor.getLong(10),
+                    updatedAt = cursor.getLong(11),
+                )
+            }
+            result
+        }
+    }
+
+    /** 全局搜索：全量标注（笔记/划线/书签同表），最近修改优先。 */
+    fun queryAllAnnotations(): List<AnnotationRecord> {
+        return readableDatabase.rawQuery(
+            "SELECT id, book_id, kind, chapter_idx, char_start, char_end, snippet, note, color, style, created_at, updated_at " +
+                "FROM annotations ORDER BY updated_at DESC",
+            null,
+        ).use { cursor ->
             val result = ArrayList<AnnotationRecord>()
             while (cursor.moveToNext()) {
                 result += AnnotationRecord(
@@ -1165,6 +1409,55 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
             "SELECT COUNT(*) FROM novel_chapters WHERE book_id = ?",
             arrayOf(bookId),
         ).use { if (it.moveToFirst()) it.getInt(0) else 0 }
+    }
+
+    // ---------------- 漫画章节区间（P3，仅备份用） ----------------
+
+    /** 整表替换（幂等）；sections 为空 = 清空。 */
+    fun replaceBookSections(bookId: String, sections: List<BookSectionRecord>) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.delete("book_sections", "book_id = ?", arrayOf(bookId))
+            sections.forEach { section ->
+                db.insertWithOnConflict(
+                    "book_sections",
+                    null,
+                    ContentValues().apply {
+                        put("book_id", bookId)
+                        put("idx", section.idx)
+                        put("title", section.title)
+                        put("page_start", section.pageStart)
+                    },
+                    SQLiteDatabase.CONFLICT_REPLACE,
+                )
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    fun queryBookSections(bookId: String): List<BookSectionRecord> {
+        val result = ArrayList<BookSectionRecord>()
+        readableDatabase.rawQuery(
+            "SELECT idx, title, page_start FROM book_sections WHERE book_id = ? ORDER BY idx",
+            arrayOf(bookId),
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                result += BookSectionRecord(
+                    idx = cursor.getInt(0),
+                    title = cursor.getString(1) ?: "",
+                    pageStart = cursor.getInt(2),
+                )
+            }
+        }
+        return result
+    }
+
+    /** 类型转换（漫画→小说）时清空章节。 */
+    fun clearBookSections(bookId: String) {
+        writableDatabase.delete("book_sections", "book_id = ?", arrayOf(bookId))
     }
 
     /** M6.1-D 设置页：全部未删除小说的书 ID（应用全局排版默认用）。 */
@@ -1497,7 +1790,8 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                    l.doc_id, l.display_path, b.read_status, COALESCE(p.percent, 0), f.tree_uri,
                    COALESCE(SUM(rs.duration_ms), 0),
                    COALESCE(SUM(rs.pages_read), 0),
-                   COALESCE(MAX(COALESCE(rs.ended_at, rs.started_at)), 0)
+                   COALESCE(MAX(COALESCE(rs.ended_at, rs.started_at)), 0),
+                   l.folder_path
             FROM books b
             JOIN reading_sessions rs ON rs.book_id = b.id
             LEFT JOIN book_locations l ON l.rowid = (
@@ -1536,6 +1830,7 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                     readStatus = cursor.getString(14) ?: BookRecord.READ_UNREAD,
                     percent = cursor.getDouble(15),
                     treeUri = cursor.getString(16),
+                    folderPath = cursor.getString(20),
                 )
                 result += ReadingHistoryEntry(
                     book = book,

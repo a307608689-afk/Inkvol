@@ -78,7 +78,11 @@ public fun PageCurl(
                 )
         ) {
             // Wrap in key to synchronize state updates
-            key(updatedCurrent, internalState.forward.value, internalState.backward.value) {
+            // inkvol 改动：key 只保留页号。原实现把 forward/backward 的 Edge 值也放进 key，
+            // 而两者是 Animatable、值每帧变化 → 每帧生成新 key → 整页内容组合件每帧被销毁重建
+            // （图片页的 produceState 解码协程每帧被取消重来，仿真动画全程停在占位「[插图]」）。
+            // drawCurl 的 posA/posB 是参数，重组时会自然更新，内容本身不需要跟着动画帧重建。
+            key(updatedCurrent) {
                 if (updatedCurrent + 1 < state.max) {
                     content(updatedCurrent + 1)
                 }

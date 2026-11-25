@@ -9,10 +9,8 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.inkvol.app.data.source.BookContentSource
 import com.inkvol.app.data.source.PdfSource
-import com.inkvol.app.data.source.RarSource
-import com.inkvol.app.data.source.SevenZSource
 import com.inkvol.app.data.source.SourceRules
-import com.inkvol.app.data.source.ZipSource
+import com.inkvol.app.data.source.openComicSource
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
@@ -28,7 +26,12 @@ class ArchiveProber(private val context: Context) {
         val format: String,
         val coverPath: String?,
         val meta: ComicInfoParser.Meta?,
+        /** 章节区间（嵌套归档/文件夹分组源才有；P3 落库备份用）。 */
+        val sections: List<com.inkvol.app.data.source.BookSection> = emptyList(),
     )
+
+    /** 归档抽取缓存根目录（外层副本与嵌套子包解包目录都在这下面）。 */
+    private val archiveCacheRoot = File(context.cacheDir, "import")
 
     fun probe(file: File, fingerprint: String): Result? {
         val head = ByteArray(8)
@@ -36,14 +39,26 @@ class ArchiveProber(private val context: Context) {
         val kind = SourceRules.detect(head.copyOf(read.coerceAtLeast(0))) ?: return null
         return runCatching {
             when (kind) {
-                "ZIP" -> openSourceProbe(ZipSource(file), "CBZ", fingerprint).copy(
+                "ZIP" -> openSourceProbe(
+                    openComicSource(file, "ZIP", fingerprint, archiveCacheRoot),
+                    "CBZ",
+                    fingerprint,
+                ).copy(
                     meta = runCatching {
                         java.util.zip.ZipFile(file).use { ComicInfoParser.parseZip(it) }
                     }.getOrNull(),
                 )
 
-                "RAR" -> openSourceProbe(RarSource(file), "CBR", fingerprint)
-                "SEVEN_Z" -> openSourceProbe(SevenZSource(file), "CB7", fingerprint)
+                "RAR" -> openSourceProbe(
+                    openComicSource(file, "RAR", fingerprint, archiveCacheRoot),
+                    "CBR",
+                    fingerprint,
+                )
+                "SEVEN_Z" -> openSourceProbe(
+                    openComicSource(file, "SEVEN_Z", fingerprint, archiveCacheRoot),
+                    "CB7",
+                    fingerprint,
+                )
                 "PDF" -> {
                     val pages = PdfSource(file).use { it.pageCount }
                     Result(pages, "PDF", if (pages > 0) savePdfCover(fingerprint, file) else null, null)
@@ -68,6 +83,8 @@ class ArchiveProber(private val context: Context) {
             format = format,
             coverPath = if (count > 0) saveCover(fingerprint) { _ -> it.openPage(0) } else null,
             meta = null,
+            sections = (source as? com.inkvol.app.data.source.SectionedContentSource)
+                ?.listSections().orEmpty(),
         )
     }
 

@@ -5,6 +5,9 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import com.inkvol.app.data.local.InkvolDatabase
 import com.inkvol.app.data.model.BookRecord
+import com.inkvol.app.data.source.BookContentSource
+import com.inkvol.app.data.source.EpubImageSource
+import com.inkvol.app.data.source.MobiImageSource
 import com.inkvol.app.data.source.SourceRules
 import com.inkvol.app.util.Fingerprint
 import kotlinx.coroutines.Dispatchers
@@ -26,6 +29,9 @@ class SingleFileImporter(
     class AlreadyExistsException : Exception("这本书已经在书架里了")
     class UnsupportedException(message: String) : Exception(message)
 
+    private fun comicSourceOf(format: String, local: File): BookContentSource =
+        if (format == "EPUB") EpubImageSource(local) else MobiImageSource(local)
+
     suspend fun import(uri: Uri): BookRecord = withContext(Dispatchers.IO) {
         val resolver = context.contentResolver
         val displayName = queryDisplayName(uri) ?: uri.lastPathSegment ?: "未命名"
@@ -35,7 +41,8 @@ class SingleFileImporter(
         val fingerprint = Fingerprint.ofArchive(size) {
             resolver.openInputStream(uri) ?: throw UnsupportedException("无法打开文件")
         }
-        if (db.hasBook(fingerprint)) throw AlreadyExistsException()
+        // 回收站里的书不算「已存在」：允许重新导入，upsertBook 复用同一指纹行（deleted_at 为空）复活
+        if (db.hasActiveBook(fingerprint)) throw AlreadyExistsException()
 
         val cacheDir = File(context.cacheDir, "import").apply { mkdirs() }
         val ext = displayName.substringAfterLast('.', "bin")
@@ -52,6 +59,68 @@ class SingleFileImporter(
             val ext = SourceRules.extensionOf(displayName)
             val isEpub = ext == "epub"
             val isMobi = ext == "mobi"
+
+            // EPUB/MOBI 漫画：与扫描器同一套探针（手动指定过类型的书不覆盖）
+            if (isEpub || isMobi) {
+                val comicFormat = if (isEpub) "EPUB" else "MOBI"
+                val forced = db.isTypeOverridden(fingerprint)
+                val forcedComic = forced && db.queryBook(fingerprint)?.type == "COMIC"
+                val verdict = if (forced) {
+                    null
+                } else if (isEpub) {
+                    NovelComicProbe.probeEpub(local)
+                } else {
+                    NovelComicProbe.probeMobi(local)
+                }
+                if (forcedComic || (verdict?.isComic == true && verdict.pageCount > 0)) {
+                    val pages = verdict?.pageCount
+                        ?: runCatching {
+                            comicSourceOf(comicFormat, local).use { it.pageCount }
+                        }.getOrDefault(0)
+                    if (pages > 0) {
+                        var sections: List<com.inkvol.app.data.source.BookSection> = emptyList()
+                        val cover = runCatching {
+                            comicSourceOf(comicFormat, local).use { source ->
+                                sections = (source as? com.inkvol.app.data.source.SectionedContentSource)
+                                    ?.listSections().orEmpty()
+                                ArchiveProber(context)
+                                    .saveCover(fingerprint) { index -> source.openPage(index) }
+                            }
+                        }.getOrNull()
+                        val book = BookRecord(
+                            id = fingerprint,
+                            type = "COMIC",
+                            title = title,
+                            series = "单文件导入",
+                            volume = null,
+                            writer = null,
+                            tags = null,
+                            pageCount = pages,
+                            format = comicFormat,
+                            fileSize = size,
+                            coverPath = cover,
+                            addedAt = System.currentTimeMillis(),
+                            docId = uri.toString(),
+                            displayPath = displayName,
+                        )
+                        db.upsertBook(book, folderId)
+                        // P3：章节落库（备份用）
+                        runCatching {
+                            db.replaceBookSections(
+                                fingerprint,
+                                sections.map {
+                                    com.inkvol.app.data.model.BookSectionRecord(
+                                        it.idx, it.title, it.pageStart,
+                                    )
+                                },
+                            )
+                        }
+                        db.deleteNovelProgress(fingerprint)
+                        return@withContext book
+                    }
+                }
+            }
+
             val parsedChapters: List<com.inkvol.app.data.model.NovelChapterRecord>
             val parsedCoverPath: String?
             if (isEpub) {
@@ -117,6 +186,15 @@ class SingleFileImporter(
             displayPath = displayName,
         )
         db.upsertBook(book, folderId)
+        // P3：章节落库（备份用；普通无章节归档 sections 为空 = 整表替换自清）
+        runCatching {
+            db.replaceBookSections(
+                fingerprint,
+                probe.sections.map {
+                    com.inkvol.app.data.model.BookSectionRecord(it.idx, it.title, it.pageStart)
+                },
+            )
+        }
         return@withContext book
     }
 
@@ -128,7 +206,8 @@ class SingleFileImporter(
         val size = file.length()
         if (size <= 0) throw UnsupportedException("文件为空")
         val fingerprint = Fingerprint.ofArchive(size) { file.inputStream() }
-        if (db.hasBook(fingerprint)) throw AlreadyExistsException()
+        // 回收站里的书不算「已存在」：允许重新导入，upsertBook 复用同一指纹行（deleted_at 为空）复活
+        if (db.hasActiveBook(fingerprint)) throw AlreadyExistsException()
 
         val libraryId = db.findOrCreateLibrary(SINGLE_LIBRARY_URI, "单文件导入")
         val folderId = db.findOrCreateFolder(libraryId, SINGLE_LIBRARY_URI, "单文件导入")
@@ -138,6 +217,68 @@ class SingleFileImporter(
             val ext = SourceRules.extensionOf(displayName)
             val isEpub = ext == "epub"
             val isMobi = ext == "mobi"
+
+            // EPUB/MOBI 漫画：与扫描器同一套探针（手动指定过类型的书不覆盖）
+            if (isEpub || isMobi) {
+                val comicFormat = if (isEpub) "EPUB" else "MOBI"
+                val forced = db.isTypeOverridden(fingerprint)
+                val forcedComic = forced && db.queryBook(fingerprint)?.type == "COMIC"
+                val verdict = if (forced) {
+                    null
+                } else if (isEpub) {
+                    NovelComicProbe.probeEpub(file)
+                } else {
+                    NovelComicProbe.probeMobi(file)
+                }
+                if (forcedComic || (verdict?.isComic == true && verdict.pageCount > 0)) {
+                    val pages = verdict?.pageCount
+                        ?: runCatching {
+                            comicSourceOf(comicFormat, file).use { it.pageCount }
+                        }.getOrDefault(0)
+                    if (pages > 0) {
+                        var sections: List<com.inkvol.app.data.source.BookSection> = emptyList()
+                        val cover = runCatching {
+                            comicSourceOf(comicFormat, file).use { source ->
+                                sections = (source as? com.inkvol.app.data.source.SectionedContentSource)
+                                    ?.listSections().orEmpty()
+                                ArchiveProber(context)
+                                    .saveCover(fingerprint) { index -> source.openPage(index) }
+                            }
+                        }.getOrNull()
+                        val book = BookRecord(
+                            id = fingerprint,
+                            type = "COMIC",
+                            title = title,
+                            series = "单文件导入",
+                            volume = null,
+                            writer = null,
+                            tags = null,
+                            pageCount = pages,
+                            format = comicFormat,
+                            fileSize = size,
+                            coverPath = cover,
+                            addedAt = System.currentTimeMillis(),
+                            docId = Uri.fromFile(file).toString(),
+                            displayPath = displayName,
+                        )
+                        db.upsertBook(book, folderId)
+                        // P3：章节落库（备份用）
+                        runCatching {
+                            db.replaceBookSections(
+                                fingerprint,
+                                sections.map {
+                                    com.inkvol.app.data.model.BookSectionRecord(
+                                        it.idx, it.title, it.pageStart,
+                                    )
+                                },
+                            )
+                        }
+                        db.deleteNovelProgress(fingerprint)
+                        return@withContext book
+                    }
+                }
+            }
+
             val parsedChapters: List<com.inkvol.app.data.model.NovelChapterRecord>
             val parsedCoverPath: String?
             if (isEpub) {
@@ -201,6 +342,15 @@ class SingleFileImporter(
             displayPath = displayName,
         )
         db.upsertBook(book, folderId)
+        // P3：章节落库（备份用；普通无章节归档 sections 为空 = 整表替换自清）
+        runCatching {
+            db.replaceBookSections(
+                fingerprint,
+                probe.sections.map {
+                    com.inkvol.app.data.model.BookSectionRecord(it.idx, it.title, it.pageStart)
+                },
+            )
+        }
         return@withContext book
     }
 

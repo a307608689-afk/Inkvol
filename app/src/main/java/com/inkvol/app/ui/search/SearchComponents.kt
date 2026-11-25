@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -41,6 +42,7 @@ import com.inkvol.app.data.model.BookRecord
 import com.inkvol.app.data.model.FullTextBookGroup
 import com.inkvol.app.data.model.FullTextHit
 import com.inkvol.app.data.model.SearchChapterRow
+import com.inkvol.app.data.model.SearchNoteRow
 import com.inkvol.app.data.model.SearchFilter
 import com.inkvol.app.data.model.TriStateSet
 import com.inkvol.app.ui.components.LocalReaderOpenController
@@ -190,10 +192,12 @@ fun SectionHeader(
     modifier: Modifier = Modifier,
     trailing: (@Composable () -> Unit)? = null,
 ) {
+    // 横向 padding 归零：组件在 LazyVerticalGrid 内，网格 contentPadding(16dp)
+    // 已是唯一横向边距，自身再加会双重缩进（书卡 16 vs 标题 32）。
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 8.dp),
+            .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
@@ -215,6 +219,7 @@ fun SearchBookCard(
     book: BookRecord,
     query: String,
     onClick: (ReaderOpenRect?) -> Unit,
+    activeSourceKey: String? = null,
     modifier: Modifier = Modifier,
 ) {
     var coverBounds by remember { mutableStateOf<ReaderOpenRect?>(null) }
@@ -235,7 +240,11 @@ fun SearchBookCard(
                         height = bounds.height,
                     )
                     coverBounds = rect
-                    openController?.updateSourceRect(book.id, rect, true)
+                    // Closing 回报对暗号：本次打开的来源控件才允许更新回程目标，
+                    // 同 bookId 的其它回报点（章节行/正文卡/别的书卡）不抢。
+                    if (activeSourceKey == null || activeSourceKey == "book_${book.id}") {
+                        openController?.updateSourceRect(book.id, rect, true)
+                    }
                 }
                 .background(MaterialTheme.colorScheme.surfaceContainerHigh),
             contentAlignment = Alignment.Center,
@@ -280,19 +289,23 @@ fun SearchBookCard(
     }
 }
 
-/** 章节标题命中行（点击打开阅读器该章）。 */
+/** 章节标题命中行（点击打开阅读器该章；封面矩形回报一镜到底）。 */
 @Composable
 fun ChapterHitRow(
     row: SearchChapterRow,
     query: String,
-    onClick: () -> Unit,
+    onClick: (ReaderOpenRect?) -> Unit,
+    activeSourceKey: String? = null,
     modifier: Modifier = Modifier,
 ) {
+    var coverBounds by remember { mutableStateOf<ReaderOpenRect?>(null) }
+    val openController = LocalReaderOpenController.current
+    val sourceKey = "ch_${row.bookId}_${row.chapterIdx}"
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(horizontal = 20.dp, vertical = 10.dp),
+            .clickable { onClick(coverBounds) }
+            .padding(vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
@@ -300,6 +313,20 @@ fun ChapterHitRow(
                 .width(40.dp)
                 .height(56.dp)
                 .clip(InkvolRadius.cover)
+                .onGloballyPositioned { coords ->
+                    val bounds = coords.boundsInRoot()
+                    val rect = ReaderOpenRect(
+                        left = bounds.left,
+                        top = bounds.top,
+                        width = bounds.width,
+                        height = bounds.height,
+                    )
+                    coverBounds = rect
+                    // 回报对暗号：同书的书卡/其它章节行不抢回程目标。
+                    if (activeSourceKey == null || activeSourceKey == sourceKey) {
+                        openController?.updateSourceRect(row.bookId, rect, true)
+                    }
+                }
                 .background(MaterialTheme.colorScheme.surfaceContainerHigh),
             contentAlignment = Alignment.Center,
         ) {
@@ -320,20 +347,121 @@ fun ChapterHitRow(
             }
         }
         Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = row.bookTitle,
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onBackground,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+        // 文字列与封面同高 + SpaceBetween：首行顶齐封面顶、末行底齐封面底；
+        // 命中的章节名升为主行（大字），书名降为副行（小字）——仅章节行对调。
+        Column(
+            modifier = Modifier.weight(1f).heightIn(min = 56.dp),
+            verticalArrangement = Arrangement.SpaceBetween,
+        ) {
             HighlightText(
                 text = row.chapterTitle,
                 query = query,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onBackground,
+                maxLines = 2,
+            )
+            Text(
+                text = row.bookTitle,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/**
+ * 笔记命中行：标注（批注文字 note / 划线原文 snippet 任一命中）与书签。
+ * 主行 = 命中文本（批注文字优先），副行 = 书名 · 章 · 类型标（笔记/划线/书签）。
+ * 点击打开阅读器定位到标注字符区间（宿主带 locateLen 做 5s 定位高亮）。
+ */
+@Composable
+fun NoteHitRow(
+    row: SearchNoteRow,
+    query: String,
+    onClick: (ReaderOpenRect?) -> Unit,
+    activeSourceKey: String? = null,
+    modifier: Modifier = Modifier,
+) {
+    var coverBounds by remember { mutableStateOf<ReaderOpenRect?>(null) }
+    val openController = LocalReaderOpenController.current
+    val ann = row.annotation
+    val sourceKey = "note_${ann.id}"
+    val qn = query.trim()
+    val primaryText = if (qn.isNotEmpty() && ann.note?.contains(qn, ignoreCase = true) == true) {
+        ann.note
+    } else {
+        ann.snippet
+    }
+    val typeLabel = when {
+        ann.kind == "bookmark" -> "书签"
+        !ann.note.isNullOrBlank() -> "笔记"
+        else -> "划线"
+    }
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable { onClick(coverBounds) }
+            .padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .width(40.dp)
+                .height(56.dp)
+                .clip(InkvolRadius.cover)
+                .onGloballyPositioned { coords ->
+                    val bounds = coords.boundsInRoot()
+                    val rect = ReaderOpenRect(
+                        left = bounds.left,
+                        top = bounds.top,
+                        width = bounds.width,
+                        height = bounds.height,
+                    )
+                    coverBounds = rect
+                    // 回报对暗号：同书的书卡/章节行/正文卡不抢回程目标。
+                    if (activeSourceKey == null || activeSourceKey == sourceKey) {
+                        openController?.updateSourceRect(row.book.id, rect, true)
+                    }
+                }
+                .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+            contentAlignment = Alignment.Center,
+        ) {
+            val cover = row.book.coverPath
+            if (cover != null) {
+                AsyncImage(
+                    model = File(cover),
+                    contentDescription = row.book.title,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else {
+                Text(
+                    text = row.book.title.take(1),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(
+            modifier = Modifier.weight(1f).heightIn(min = 56.dp),
+            verticalArrangement = Arrangement.SpaceBetween,
+        ) {
+            HighlightText(
+                text = primaryText,
+                query = query,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onBackground,
                 maxLines = 2,
+            )
+            Text(
+                text = "${row.book.title} · 第 ${ann.chapterIdx + 1} 章 · $typeLabel",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
@@ -348,18 +476,21 @@ fun BodyGroupRow(
     group: FullTextBookGroup,
     query: String,
     bookLimited: Boolean,
-    onOpenHit: (FullTextHit) -> Unit,
+    onOpenHit: (FullTextHit, ReaderOpenRect?) -> Unit,
+    activeSourceKey: String? = null,
     modifier: Modifier = Modifier,
 ) {
     var expanded by remember(group.book.id) { mutableStateOf(false) }
+    var coverBounds by remember(group.book.id) { mutableStateOf<ReaderOpenRect?>(null) }
+    val openController = LocalReaderOpenController.current
+    val sourceKey = "body_${group.book.id}"
     val scheme = MaterialTheme.colorScheme
+    // 扁平行（无卡片底）：网格 contentPadding(16dp) 是唯一横向边距，
+    // 封面/书名/摘要与章节行、书网格同一条 16dp 线；组间距靠网格 12dp 行距。
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 6.dp)
-            .clip(InkvolRadius.card)
-            .background(scheme.surfaceContainerLow)
-            .padding(12.dp),
+            .padding(vertical = 6.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
@@ -367,6 +498,20 @@ fun BodyGroupRow(
                     .width(34.dp)
                     .height(48.dp)
                     .clip(InkvolRadius.cover)
+                    .onGloballyPositioned { coords ->
+                        val bounds = coords.boundsInRoot()
+                        val rect = ReaderOpenRect(
+                            left = bounds.left,
+                            top = bounds.top,
+                            width = bounds.width,
+                            height = bounds.height,
+                        )
+                        coverBounds = rect
+                        // 回报对暗号：同书的书卡/章节行不抢回程目标。
+                        if (activeSourceKey == null || activeSourceKey == sourceKey) {
+                            openController?.updateSourceRect(group.book.id, rect, true)
+                        }
+                    }
                     .background(scheme.surfaceContainerHigh),
                 contentAlignment = Alignment.Center,
             ) {
@@ -387,7 +532,11 @@ fun BodyGroupRow(
                 }
             }
             Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) {
+            // 文字列与封面（48dp）同高 + SpaceBetween：首行顶齐、末行底齐。
+            Column(
+                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                verticalArrangement = Arrangement.SpaceBetween,
+            ) {
                 HighlightText(
                     text = group.book.title,
                     query = query,
@@ -415,8 +564,8 @@ fun BodyGroupRow(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(12.dp))
-                    .clickable { onOpenHit(hit) }
-                    .padding(horizontal = 4.dp, vertical = 6.dp),
+                    .clickable { onOpenHit(hit, coverBounds) }
+                    .padding(vertical = 6.dp),
             ) {
                 Text(
                     text = "第 ${hit.chapterIdx + 1} 章 ${hit.chapterTitle}",

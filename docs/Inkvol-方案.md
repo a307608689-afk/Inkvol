@@ -4,7 +4,9 @@
 > 包名：`com.inkvol.app`
 > 定位：纯本地、零网络（同步可选）、漫画与小说双引擎的世界级阅读器，Google Play 上架
 > 设计依据：`设计规范.md`（SSMH 液态玻璃体系全文）+ 新增 §13 阅读器专章
-> 状态：决策冻结；M0 已落地可构建骨架，按 §15 里程碑推进
+> 状态（2026-11-24）：**v1.0.0 已发布**。M0~M6 全部落地；M4.5 同步、M6.4 MOBI、
+> 隐私合规（首启同意 / 许可页）、应用锁 / 空间清理 / 崩溃日志导出均已并入 1.0。
+> §15 里程碑表保留为历史规划。
 
 ---
 
@@ -374,10 +376,10 @@ TTS 合规：`foregroundServiceType="mediaPlayback"` + `FOREGROUND_SERVICE_MEDIA
 
 | 项 | 要求 |
 |---|---|
-| 权限 | 零存储权限；SAF 导入；导出走 MediaStore；通知/生物识别按需；WorkManager 声明 dataSync FGS；`INTERNET` 仅同步 |
-| 原生 | targetSdk 37；16KB page（NDK r27+）；arm64 + x86_64 |
-| 许可 | junrar/commons-compress（Apache-2.0）、XZ（Public Domain）、unRAR（附许可）、OpenCC（Apache-2.0）、思源宋体（OFL） |
-| 商店 | Play App Signing、隐私政策、Data Safety 不收集、内容分级、中英双语 |
+| 权限 | 零存储权限；导入与备份导出全部走 SAF；生物识别按需（应用锁，系统校验）；`INTERNET` / `ACCESS_NETWORK_STATE` 仅可选的 WebDAV 同步；WorkManager 声明 `WAKE_LOCK`/`RECEIVE_BOOT_COMPLETED`/`FOREGROUND_SERVICE`（后台扫描调度，不常驻） |
+| 原生 | targetSdk 37；**无任何 `.so`**（RAR 由 junrar 纯 Java 实现）→ 16KB page size 天然满足；无 ABI 限制（早期 unRAR JNI spike 已废弃，代码中不存在） |
+| 许可 | GPL-3.0（含 junrar §7 附加许可）；AndroidX/Compose、Coroutines、Coil、commons-compress、backdrop、shapes、pagecurl 为 Apache-2.0；XZ 为 Public Domain；junrar 为 UnRar License；SLF4J NOP 为 MIT |
+| 商店 | Play App Signing（上传现有密钥）、隐私政策 URL、Data Safety 不收集、内容分级；国内渠道需应用备案与实名；应用内已含首启隐私同意与许可页 |
 | 无障碍 | TalkBack 标签、放大字体、高对比主题、48dp 触控、朗读模式；不做高级档 |
 
 ---

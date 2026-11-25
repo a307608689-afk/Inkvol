@@ -60,6 +60,11 @@ object NovelTextPager {
         textMeasurer: androidx.compose.ui.text.TextMeasurer,
         maxPages: Int = Int.MAX_VALUE,
         stopAfterCharOffset: Int = -1,
+        /**
+         * 插图根目录（通常是 filesDir）：marker 里存的是相对路径，量图片宽高比必须补上根目录，
+         * 否则 decodeFile 找不到文件 → 所有插图按 4:3 兜底（高度全错）。
+         */
+        imageBaseDir: File? = null,
     ): NovelPagination {
         val blocks = parseBlocks(chapterText)
         if (blocks.isEmpty() || widthPx <= 0 || heightPx <= 0) {
@@ -128,7 +133,12 @@ object NovelTextPager {
             // M6.2-B：EPUB 图片块 → 单个图片 slice，高度按内容宽等比缩放，最高占满一页；图片不跨页。
             if (block.imagePath != null) {
                 // M6.4-K：首位段距已恒计预算，图片满页高会溢出一个段距 → 可用高同步收紧。
-                val slice = imageSlice(block, textWidthPx, pageHeightPx - paragraphSpacingPx)
+                val slice = imageSlice(
+                    block,
+                    textWidthPx,
+                    pageHeightPx - paragraphSpacingPx,
+                    imageBaseDir,
+                )
                 if (currentPage.isNotEmpty() && slice.heightPx > pageRemain()) {
                     flushPage()
                     if (targetReached) {
@@ -248,9 +258,14 @@ object NovelTextPager {
         block: NovelTextBlock,
         contentWidthPx: Int,
         maxSliceHeightPx: Int,
+        imageBaseDir: File?,
     ): NovelTextSlice {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        runCatching { BitmapFactory.decodeFile(File(block.imagePath!!).absolutePath, bounds) }
+        // M6.4：marker 是相对路径，必须先挂根目录再 decodeFile（此前直接 File(相对路径)，
+        // cwd 下不存在 → outWidth=0 → 全部插图按 4:3 兜底，长图/竖图比例失真）。
+        val imageFile = imageBaseDir?.let { File(it, block.imagePath!!) }
+            ?: File(block.imagePath!!)
+        runCatching { BitmapFactory.decodeFile(imageFile.absolutePath, bounds) }
         val height = if (bounds.outWidth > 0 && bounds.outHeight > 0) {
             (contentWidthPx.toFloat() * bounds.outHeight / bounds.outWidth).roundToInt()
         } else {

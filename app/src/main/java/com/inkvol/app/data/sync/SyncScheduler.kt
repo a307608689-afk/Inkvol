@@ -56,6 +56,12 @@ class SyncScheduler(
 
     private suspend fun autoEnabled(): Boolean {
         val prefs = settings.snapshotPreferences()
+        // 未同意当前隐私政策前不发起任何联网同步（与首启同意门同源）
+        if (settings.stringOf(prefs, SettingsKeys.PRIVACY_ACCEPTED_VERSION, "") !=
+            SettingsKeys.PRIVACY_POLICY_VERSION
+        ) {
+            return false
+        }
         if (!settings.booleanOf(prefs, SettingsKeys.SYNC_ENABLED, false)) return false
         if (!settings.booleanOf(prefs, SettingsKeys.SYNC_AUTO, true)) return false
         return true
@@ -63,12 +69,20 @@ class SyncScheduler(
 
     private suspend fun runAutoSync() {
         val prefs = settings.snapshotPreferences()
-        // 失败冷却期：静默跳过（dirty 保留，冷却结束后的下一次触发补上）
-        if (System.currentTimeMillis() < settings.longOf(prefs, SettingsKeys.SYNC_COOLDOWN_UNTIL, 0)) return
+        val cooldownUntil = settings.longOf(prefs, SettingsKeys.SYNC_COOLDOWN_UNTIL, 0)
+        // 失败冷却期：静默跳过（dirty 保留，冷却结束后的下一次触发补上）；状态行要能看出来
+        if (System.currentTimeMillis() < cooldownUntil) {
+            sync.noteGated(waitingWifi = false, cooldownUntil = cooldownUntil)
+            return
+        }
         // 请求预算软闸：剩余不足以完成最小同步（PROPFIND×2 + PUT）时跳过
         if (budgetRemaining() < MIN_SYNC_REQUESTS) return
-        // 仅 WiFi 门禁：不满足保留 dirty 等下次
-        if (settings.booleanOf(prefs, SettingsKeys.SYNC_WIFI_ONLY, true) && !isWifi()) return
+        // 仅 WiFi 门禁：不满足保留 dirty 等下次（状态行提示「等待 WiFi」，不静默）
+        if (settings.booleanOf(prefs, SettingsKeys.SYNC_WIFI_ONLY, true) && !isWifi()) {
+            sync.noteGated(waitingWifi = true)
+            return
+        }
+        sync.noteGated(waitingWifi = false)
         val entry = sync.syncNow("自动")
         consumeBudget(entry.requests)
         if (entry.ok) sync.clearDirtyFlag()

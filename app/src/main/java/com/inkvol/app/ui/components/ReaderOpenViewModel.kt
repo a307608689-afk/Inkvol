@@ -219,8 +219,10 @@ class ReaderOpenViewModel : ViewModel() {
                 cutoutSafeDp(32.dp, rawBottomDp)
             }
 
-            // 双页档判定与 NovelReaderScreen 的 useDouble 同一规则（横向翻页 + 始终 or 横屏）。
+            // 双页档判定与 NovelReaderScreen 的 useDouble 同一规则（横向翻页 + 始终 or 横屏）；
+            // M6.5 纵向连续档不双页（同上下翻页）。
             val useDouble = prefs.pagingMode != SettingsKeys.NOVEL_PAGE_VERTICAL &&
+                prefs.pagingMode != SettingsKeys.NOVEL_PAGE_SCROLL &&
                 doublePageMode != SettingsKeys.DOUBLE_PAGE_OFF &&
                 (doublePageMode == SettingsKeys.DOUBLE_PAGE_ALWAYS || landscape)
             val textWidthPx = with(density) {
@@ -252,6 +254,8 @@ class ReaderOpenViewModel : ViewModel() {
                     heightPx = textHeightPx,
                     density = density,
                     textMeasurer = textMeasurer,
+                    // 插图比例：与 Reader 整章分页同参数（相对路径补 filesDir 根）。
+                    imageBaseDir = repository.filesDir,
                     maxPages = pageLimit,
                     stopAfterCharOffset = stopAfter,
                 )

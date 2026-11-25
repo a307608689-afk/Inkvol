@@ -4,12 +4,26 @@ package com.inkvol.app.data.settings
 object SettingsKeys {
     const val APP_THEME = "app_theme"                // system / light / dark
     const val DYNAMIC_COLOR = "dynamic_color"
+    // 自定义主题色（强调色）：值为 ThemeAccent.id，缺省 "vermilion" 与旧版一致。
+    // 只接管 primary 一族，背景/卡片/语义色不受影响；动态取色开启时不生效。
+    const val THEME_ACCENT = "theme_accent"
 
     const val THEME_SYSTEM = "system"
     const val THEME_LIGHT = "light"
     const val THEME_DARK = "dark"
 
     const val LIBRARY_VIEW = "library_view"          // folder / series / flat
+    // 系列视图结构（只作用于「系列」视图，书夹/平铺零影响）：
+    // hierarchy = 层级（一级文件夹→二级→三级，默认）；flat = 扁平（直接含书的目录各成一系列）。
+    // 两种模式共用同一份 folder_path 数据，切换不需要重扫。
+    const val LIBRARY_SERIES_MODE = "library_series_mode"
+    const val SERIES_MODE_HIERARCHY = "hierarchy"
+    const val SERIES_MODE_FLAT = "flat"
+    // 文件夹扫描深度：递归层数（缺省 3 = 最多下钻三级目录，与历史硬编码一致）。
+    const val LIBRARY_SCAN_DEPTH = "library_scan_depth"
+    // 系列路径回填：上次尝试时间（毫秒，字符串存）。失败 24h 后再试，
+    // 防止权限失效时每次冷启动都白扫一遍。
+    const val SERIES_PATH_BACKFILL_AT = "series_path_backfill_at"
     // 书架全局排序档位（一级平铺/系列、二级书夹/系列页共用一份，SSMH 同款语义）。
     // 缺省 recent + 降序 = 旧版 SQL ORDER BY added_at DESC 的原样行为，升级零感知。
     // 旧 per-target 键 library_sort_<target> 已废弃，残留值无人读取。
@@ -24,6 +38,14 @@ object SettingsKeys {
     const val FOLDER_SORT_NAME = "name"      // 卡名 A → Z / Z → A
     const val FOLDER_SORT_COUNT = "count"    // 书数少/多在前（与卡片角标同源）
     const val FOLDER_SORT_CUSTOM = "custom"  // 拖拽序（sort_key），不受方向影响
+
+    // 书架展示样式：grid 网格（缺省，现状卡）/ list 列表（仿历史页行卡）。
+    // 作用于 书夹/系列/平铺 三视图的一级页（三视图联动，全局一份）；
+    // 二级页不受影响。键值沿用历史字符串 "library_folder_view"（初版只作用书夹，
+    // 扩展为全局后键值不变 = 已写过的 grid/list 值零迁移直接兼容）。
+    const val LIBRARY_SHELF_VIEW = "library_folder_view"
+    const val SHELF_VIEW_GRID = "grid"
+    const val SHELF_VIEW_LIST = "list"
     // 排序方向（全局一份，一级与二级页共用）：缺省 "1" 降序（SSMH 同款语义）。
     const val LIBRARY_SORT_DESC = "library_sort_desc"
     const val PLUS_ACTION = "import_plus_action"     // ask / folder / file / rescan
@@ -123,6 +145,9 @@ object SettingsKeys {
     const val NOVEL_THEME_DARK = "dark"
     const val NOVEL_PAGE_HORIZONTAL = "horizontal"
     const val NOVEL_PAGE_VERTICAL = "vertical"
+    // M6.5 纵向连续：单章信息流式连续滚动（LazyColumn）。
+    // 与 horizontal/vertical 同字段第三档值，无新存储结构；旧版本读到未知值回落默认横向。
+    const val NOVEL_PAGE_SCROLL = "scroll"
 
     fun novelBookKey(bookId: String): String = NOVEL_BOOK_PREFIX + bookId
 
@@ -134,6 +159,14 @@ object SettingsKeys {
 
     // M6.1-D 设置页：小说阅读全局默认（per-book 未设置时回退到它）
     const val NOVEL_GLOBAL_PREFS = "novel_global_prefs"
+
+    // 深色跟随：App 处于深色模式时，小说阅读背景自动切到墨黑（双向跟随：读取时派生，
+    // 不写 prefs.theme，回浅色自动恢复手动档）；跟随期间手动选浅色档 = 用户接管，自动关闭。
+    // 缺省开（booleanOf 默认 true）。
+    const val NOVEL_DARK_FOLLOW = "novel_dark_follow"
+
+    // 深色跟随首次提示：进入深色后首次打开小说阅读器弹一次居中卡提示，落盘后不再出现。
+    const val NOVEL_DARK_FOLLOW_HINT = "novel_dark_follow_hint_shown"
 
     // 挖孔避让兜底：设备曾上报过的最大挖孔 inset（dp 字符串）。
     // 部分平板横屏时 displayCutout 全 0（挖孔被并入状态栏语义），用该值对左右补偿。
@@ -154,8 +187,12 @@ object SettingsKeys {
     const val SYNC_WIFI_ONLY = "sync_wifi_only"           // 仅在 WiFi 下同步
     const val SYNC_DEVICE_NAME = "sync_device_name"       // 空串 = 默认（厂商+型号）
     const val SYNC_DEVICE_ID = "sync_device_id"           // 首次启用生成的 UUID
-    const val SYNC_FILES_SINGLE = "sync_files_single"     // 单文件导入书籍文件同步（默认开）
-    const val SYNC_FILES_ALL = "sync_files_all"           // 全部书籍文件同步（默认关）
+    const val SYNC_FILE_SCOPE = "sync_file_scope"         // 文件同步范围 JSON（SyncFileScope）
+    @Deprecated("已被 SYNC_FILE_SCOPE 取代，仅用于旧值迁移")
+    const val SYNC_FILES_SINGLE = "sync_files_single"     // 旧：单文件导入书籍文件同步（默认开）
+    @Deprecated("已被 SYNC_FILE_SCOPE 取代，仅用于旧值迁移")
+    const val SYNC_FILES_ALL = "sync_files_all"           // 旧：全部书籍文件同步（默认关）
+    const val SYNC_ALLOW_INSECURE_TLS = "sync_allow_insecure_tls" // 允许自签证书（默认关）
     const val SYNC_DIRTY = "sync_dirty"                   // 持久脏标记（进程死亡后补同步）
     const val SYNC_UPLOAD_PENDING = "sync_upload_pending" // 待上传 bookId JSON 数组
     const val SYNC_DELETE_PENDING = "sync_delete_pending" // 待删除云端文件 bookId JSON 数组
@@ -170,6 +207,16 @@ object SettingsKeys {
 
     // per-book 阅读偏好变更时间戳（合并 LWW 依据；ReaderScreen 落盘处同步写）
     const val BOOK_PREF_TS_PREFIX = "book_pref_ts_"
+
+    // 应用锁：开关（系统锁屏凭据解锁；未设置锁屏密码时自动不生效）
+    const val APP_LOCK_ENABLED = "app_lock_enabled"
+    // 离开应用多久后重新上锁（毫秒）
+    const val APP_LOCK_GRACE_MS = 30_000L
+
+    // ---- 隐私政策同意 ----
+    // 值为用户已同意的政策版本；与 PRIVACY_POLICY_VERSION 不等时首启会重新征求同意。
+    const val PRIVACY_ACCEPTED_VERSION = "privacy_accepted_version"
+    const val PRIVACY_POLICY_VERSION = "1"
 
     fun bookPrefTsKey(bookId: String): String = BOOK_PREF_TS_PREFIX + bookId
 }

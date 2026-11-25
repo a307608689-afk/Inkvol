@@ -19,6 +19,8 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.unit.IntSize
 import com.inkvol.pagecurl.utils.rotate
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlin.math.PI
 
@@ -42,6 +44,21 @@ internal suspend fun PointerInputScope.detectCurlGestures(
     var config: DragConfig? = null
     var startOffset: Offset = Offset.Zero
 
+    // vendor 修改：拖动目标合并。
+    // onDrag 只把最新手指位置丢进 CONFLATED 通道（旧值被覆盖），由下方单个常驻协程消费并
+    // 瞬时置值——每帧最多一次 snapTo/一次重组。原实现每个 move 起一个协程，慢速拖动时
+    // 几十上百个协程在主线程排队抢 Animatable 锁，输入事件被挤后 → 拖到一半停住即"卡死"。
+    val dragTargets = Channel<Offset>(Channel.CONFLATED)
+
+    coroutineScope {
+    launch {
+        for (pos in dragTargets) {
+            val cfg = config ?: continue
+            if (!cfg.isEnabled()) continue
+            cfg.edge.snapTo(newEdgeCreator.createNew(size, startOffset, pos))
+        }
+    }
+
     detectCustomDragGestures(
         onDragStart = { start, end ->
             startOffset = start
@@ -49,7 +66,14 @@ internal suspend fun PointerInputScope.detectCurlGestures(
             config != null
         },
         onDragEnd = { endOffset, complete ->
-            config?.apply {
+            // vendor 修改：先断开 pump 并清掉残留目标，再做收尾动画，
+            // 避免残留的 snapTo 把页面又拽回旧位置、打断收尾动画
+            val cfg = config
+            config = null
+            while (dragTargets.tryReceive().isSuccess) {
+                // drain
+            }
+            cfg?.apply {
                 val velocity = velocityTracker.calculateVelocity()
                 val decay = splineBasedDecay<Offset>(this@detectCurlGestures)
                 val flingEndOffset = decay.calculateTargetValue(
@@ -91,14 +115,14 @@ internal suspend fun PointerInputScope.detectCurlGestures(
                 scope.launch { cfg.edge.animateTo(cfg.start) }
             } else if (cfg != null) {
                 velocityTracker.addPosition(System.currentTimeMillis(), change.position)
-
-                scope.launch {
-                    val target = newEdgeCreator.createNew(size, startOffset, change.position)
-                    cfg.edge.animateTo(target)
-                }
+                // vendor 修改：只投递最新手指位置（CONFLATED 通道覆盖旧值），由单个协程消费
+                // 并瞬时置值——每帧最多一次 snapTo。原实现每个 move 起一个动画协程，慢速拖动
+                // 时几十上百个协程在主线程排队抢锁，输入事件被挤后 → 拖到一半停住即"卡死"。
+                dragTargets.trySend(change.position)
             }
         }
     )
+    }
 }
 
 internal suspend fun PointerInputScope.detectCustomDragGestures(

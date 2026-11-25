@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#C8462F</color>
+    <!-- 图标底色取自源图（书籍米色），与前景 PNG 边缘一致 -->
+    <color name="ic_launcher_background">#E9D5BD</color>
 </resources>

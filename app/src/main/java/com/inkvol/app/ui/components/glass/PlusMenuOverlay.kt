@@ -20,6 +20,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
@@ -82,12 +83,28 @@ internal fun MenuRow(
      * （图标/标题主色 + 行尾对勾）；false = 未选档（图标降为次要色）。
      */
     selected: Boolean? = null,
+    /** 不可用（如选中物全是文件夹漫画时的导出/分享）：置灰 + 不响应点击。 */
+    enabled: Boolean = true,
+    /** 危险动作（删除）：图标与标题用 error 色。 */
+    danger: Boolean = false,
 ) {
     val scheme = MaterialTheme.colorScheme
+    val titleColor = when {
+        danger -> scheme.error
+        selected == true -> scheme.primary
+        else -> scheme.onSurface
+    }
+    val iconTint = when {
+        danger -> scheme.error
+        selected == true -> scheme.primary
+        selected == false -> scheme.onSurfaceVariant
+        else -> scheme.primary
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
+            .alpha(if (enabled) 1f else 0.45f)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -95,17 +112,13 @@ internal fun MenuRow(
         Icon(
             icon,
             contentDescription = null,
-            tint = when (selected) {
-                true -> scheme.primary
-                false -> scheme.onSurfaceVariant
-                null -> scheme.primary
-            },
+            tint = iconTint,
         )
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 title,
                 style = MaterialTheme.typography.titleSmall,
-                color = if (selected == true) scheme.primary else scheme.onSurface,
+                color = titleColor,
             )
             Text(
                 subtitle,

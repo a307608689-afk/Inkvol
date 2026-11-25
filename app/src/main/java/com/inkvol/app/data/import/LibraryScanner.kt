@@ -14,11 +14,11 @@ import android.util.Log
 import com.inkvol.app.data.local.InkvolDatabase
 import com.inkvol.app.data.model.BookRecord
 import com.inkvol.app.data.source.BookContentSource
+import com.inkvol.app.data.source.EpubImageSource
+import com.inkvol.app.data.source.MobiImageSource
 import com.inkvol.app.data.source.PdfSource
-import com.inkvol.app.data.source.RarSource
-import com.inkvol.app.data.source.SevenZSource
 import com.inkvol.app.data.source.SourceRules
-import com.inkvol.app.data.source.ZipSource
+import com.inkvol.app.data.source.openComicSource
 import com.inkvol.app.util.Fingerprint
 import java.io.File
 import java.io.FileOutputStream
@@ -70,7 +70,7 @@ class LibraryScanner(
         val scanStart = System.currentTimeMillis()
         // 先探活：目录列举失败（权限失效/存储卸载）时跳过对账，避免整库被误清
         val accessible = isFolderAccessible(rootDocId)
-        scanDirectory(rootDocId, rootName, parentSeries = null, depth = 0, depthLimit = depthLimit)
+        scanDirectory(rootDocId, rootName, parentPath = "", depth = 0, depthLimit = depthLimit)
         pruneArchiveCache()
         db.markFolderScanned(folderId)
         // M7：EPUB 元数据幂等回填（writer/tags 双空的 EPUB 重解析 OPF；每次扫描顺带，候选为空零开销）
@@ -95,7 +95,7 @@ class LibraryScanner(
     private fun scanDirectory(
         docId: String,
         displayName: String,
-        parentSeries: String?,
+        parentPath: String,
         depth: Int,
         depthLimit: Int,
     ) {
@@ -105,17 +105,23 @@ class LibraryScanner(
         val novels = children.filter { !it.isDirectory && SourceRules.isNovelName(it.name) }
         val directories = children.filter { it.isDirectory }
 
-        val series = parentSeries ?: displayName
+        // v12：系列归属 = 书本所在目录本身（文件夹为准，ComicInfo 的 Series 不再覆盖）；
+        // folderPath = 该目录相对库根的路径，供系列视图建树（"" = 直接放在库根）。
+        // 旧实现用「父目录名」当系列，导致一级子文件夹的书挤进库根系列、文件夹层级丢失。
+        val series = displayName
+        val folderPath = parentPath
 
         if (images.isNotEmpty()) {
-            importFolderBook(displayName, series, docId, images)
+            importFolderBook(displayName, series, folderPath, docId, images)
         }
-        archives.forEach { archive -> importArchive(archive, series) }
-        novels.forEach { novel -> importNovel(novel, series) }
+        archives.forEach { archive -> importArchive(archive, series, folderPath) }
+        // EPUB 先探针判类型：漫画型走图片页，文本型保持原小说路径（MOBI 下一批）
+        novels.forEach { novel -> importNovelEntry(novel, series, folderPath) }
 
         if (depth < depthLimit) {
             directories.forEach { child ->
-                scanDirectory(child.docId, child.name, displayName, depth + 1, depthLimit)
+                val childPath = if (parentPath.isEmpty()) child.name else "$parentPath/${child.name}"
+                scanDirectory(child.docId, child.name, childPath, depth + 1, depthLimit)
             }
         }
     }
@@ -123,13 +129,15 @@ class LibraryScanner(
     private fun importFolderBook(
         title: String,
         series: String,
+        folderPath: String,
         docId: String,
         images: List<DocEntry>,
     ) {
         try {
             val fingerprint = Fingerprint.ofFolder(images.map { it.name to it.size })
             if (db.hasBook(fingerprint)) {
-                db.touchBookLocation(fingerprint, folderId)
+                // skip 也要刷新系列归属（v12 回填：旧库 folder_path 为 NULL，重扫靠这里补）
+                db.updateBookLocationFolder(fingerprint, folderId, series, folderPath)
                 skipped++
                 return
             }
@@ -152,6 +160,7 @@ class LibraryScanner(
                 addedAt = System.currentTimeMillis(),
                 docId = docId,
                 displayPath = title,
+                folderPath = folderPath,
             )
             db.upsertBook(book, folderId)
             added++
@@ -163,11 +172,11 @@ class LibraryScanner(
         }
     }
 
-    private fun importArchive(entry: DocEntry, series: String) {
+    private fun importArchive(entry: DocEntry, series: String, folderPath: String) {
         try {
             val fingerprint = Fingerprint.ofArchive(entry.size) { openDocument(entry.docId) }
             if (db.hasBook(fingerprint)) {
-                db.touchBookLocation(fingerprint, folderId)
+                db.updateBookLocationFolder(fingerprint, folderId, series, folderPath)
                 skipped++
                 return
             }
@@ -193,7 +202,8 @@ class LibraryScanner(
                 id = fingerprint,
                 type = "COMIC",
                 title = probe.meta?.title ?: title,
-                series = probe.meta?.series ?: series,
+                // 文件夹为准：ComicInfo 的 Series 不再覆盖系列归属（否则文件夹层级失效）
+                series = series,
                 volume = probe.meta?.volume,
                 writer = probe.meta?.writer,
                 tags = probe.meta?.tags,
@@ -204,8 +214,18 @@ class LibraryScanner(
                 addedAt = System.currentTimeMillis(),
                 docId = entry.docId,
                 displayPath = entry.name,
+                folderPath = folderPath,
             )
             db.upsertBook(book, folderId)
+            // P3：章节落库（备份用；阅读器始终现算，DB 不参与阅读路径）
+            runCatching {
+                db.replaceBookSections(
+                    fingerprint,
+                    probe.sections.map {
+                        com.inkvol.app.data.model.BookSectionRecord(it.idx, it.title, it.pageStart)
+                    },
+                )
+            }
             added++
             processed++
             onProgress(processed, title)
@@ -215,9 +235,16 @@ class LibraryScanner(
         }
     }
 
-    private fun importNovel(entry: DocEntry, series: String) {
+    private fun importNovel(
+        entry: DocEntry,
+        series: String,
+        folderPath: String,
+        precomputedId: String? = null,
+        precomputedLocal: File? = null,
+    ) {
         try {
-            val fingerprint = Fingerprint.ofArchive(entry.size) { openDocument(entry.docId) }
+            val fingerprint = precomputedId
+                ?: Fingerprint.ofArchive(entry.size) { openDocument(entry.docId) }
             val title = entry.name.substringBeforeLast('.')
             val ext = SourceRules.extensionOf(entry.name)
             val isEpub = ext == "epub"
@@ -230,8 +257,8 @@ class LibraryScanner(
             val parsedCoverPath: String?
             var parsedEpubMeta: EpubParser.Meta? = null
             if (isEpub) {
-                // EPUB 需要 ZipFile 随机访问，先落一份缓存副本
-                val local = copyToCache(entry, fingerprint)
+                // EPUB 需要 ZipFile 随机访问，先落一份缓存副本（探针阶段已落地则直接复用）
+                val local = precomputedLocal ?: copyToCache(entry, fingerprint)
                 val parsed = EpubParser.parse(context, fingerprint, local, purifyRegexes)
                 parsedChapters = parsed.chapters
                 parsedCoverPath = parsed.coverPath
@@ -274,6 +301,7 @@ class LibraryScanner(
                 addedAt = System.currentTimeMillis(),
                 docId = entry.docId,
                 displayPath = entry.name,
+                folderPath = folderPath,
             )
             db.upsertBook(book, folderId)
             db.replaceNovelChapters(fingerprint, parsedChapters)
@@ -286,6 +314,115 @@ class LibraryScanner(
         } catch (error: Throwable) {
             failed++
             Log.w("InkvolScan", "novel failed: ${entry.name}", error)
+        }
+    }
+
+    /**
+     * EPUB 类型分派：探针判漫画走图片页，其余保持原小说路径。
+     * 用户手动指定过类型的书（book_type_overrides）完全尊重，不再自动判定——
+     * 否则一次重扫就会把「手动转成小说」的图文 EPUB 拉回漫画。
+     */
+    private fun importNovelEntry(entry: DocEntry, series: String, folderPath: String) {
+        val ext = SourceRules.extensionOf(entry.name)
+        if (ext != "epub" && ext != "mobi") {
+            importNovel(entry, series, folderPath)
+            return
+        }
+        val fingerprint = try {
+            Fingerprint.ofArchive(entry.size) { openDocument(entry.docId) }
+        } catch (error: Throwable) {
+            failed++
+            Log.w("InkvolScan", "novel failed: ${entry.name}", error)
+            return
+        }
+        val local = try {
+            copyToCache(entry, fingerprint)
+        } catch (error: Throwable) {
+            failed++
+            Log.w("InkvolScan", "novel cache failed: ${entry.name}", error)
+            return
+        }
+
+        val forced = db.isTypeOverridden(fingerprint)
+        val forcedComic = forced && db.queryBook(fingerprint)?.type == "COMIC"
+        val verdict = if (forced) {
+            null
+        } else if (ext == "epub") {
+            NovelComicProbe.probeEpub(local)
+        } else {
+            NovelComicProbe.probeMobi(local)
+        }
+        val asComic = forcedComic || (verdict?.isComic == true && verdict.pageCount > 0)
+        if (asComic) {
+            val format = if (ext == "epub") "EPUB" else "MOBI"
+            val pages = verdict?.pageCount
+                ?: runCatching { comicSourceOf(format, local).use { it.pageCount } }.getOrDefault(0)
+            if (pages > 0) {
+                importComicEntry(entry, series, folderPath, fingerprint, local, format, pages)
+                return
+            }
+        }
+        importNovel(entry, series, folderPath, fingerprint, local)
+    }
+
+    private fun comicSourceOf(format: String, local: File): BookContentSource =
+        if (format == "EPUB") EpubImageSource(local) else MobiImageSource(local)
+
+    /** 漫画型 EPUB/MOBI 入库：type=COMIC / format 同文件，页数即图片页数，封面取第一页。 */
+    private fun importComicEntry(
+        entry: DocEntry,
+        series: String,
+        folderPath: String,
+        fingerprint: String,
+        local: File,
+        format: String,
+        pageCount: Int,
+    ) {
+        try {
+            val title = entry.name.substringBeforeLast('.')
+            var sections: List<com.inkvol.app.data.source.BookSection> = emptyList()
+            val coverPath = runCatching {
+                comicSourceOf(format, local).use { source ->
+                    sections = (source as? com.inkvol.app.data.source.SectionedContentSource)
+                        ?.listSections().orEmpty()
+                    saveCover(fingerprint) { index -> source.openPage(index) }
+                }
+            }.getOrNull()
+            val book = BookRecord(
+                id = fingerprint,
+                type = "COMIC",
+                title = title,
+                series = series,
+                volume = null,
+                writer = null,
+                tags = null,
+                pageCount = pageCount,
+                format = format,
+                fileSize = entry.size,
+                coverPath = coverPath,
+                addedAt = System.currentTimeMillis(),
+                docId = entry.docId,
+                displayPath = entry.name,
+                folderPath = folderPath,
+            )
+            db.upsertBook(book, folderId)
+            // P3：章节落库（备份用）
+            runCatching {
+                db.replaceBookSections(
+                    fingerprint,
+                    sections.map {
+                        com.inkvol.app.data.model.BookSectionRecord(it.idx, it.title, it.pageStart)
+                    },
+                )
+            }
+            // 可能是从小说判定纠正过来：清旧章节与小说进度，避免搜索 / 继续阅读串味。
+            db.deleteNovelProgress(fingerprint)
+            added++
+            processed++
+            onProgress(processed, title)
+        } catch (error: Throwable) {
+            failed++
+            Log.w("InkvolScan", "${format.lowercase()} comic failed: ${entry.name}", error)
         }
     }
 
@@ -379,17 +516,30 @@ class LibraryScanner(
         val format: String,
         val coverPath: String?,
         val meta: ComicInfoParser.Meta?,
+        val sections: List<com.inkvol.app.data.source.BookSection> = emptyList(),
     )
 
     private fun probeArchive(kind: String, file: File, fingerprint: String): Probe = when (kind) {
-        "ZIP" -> openSourceProbe(ZipSource(file), "CBZ", fingerprint).copy(
+        "ZIP" -> openSourceProbe(
+            openComicSource(file, "ZIP", fingerprint, File(context.cacheDir, "import")),
+            "CBZ",
+            fingerprint,
+        ).copy(
             meta = runCatching {
                 java.util.zip.ZipFile(file).use { ComicInfoParser.parseZip(it) }
             }.getOrNull(),
         )
 
-        "RAR" -> openSourceProbe(RarSource(file), "CBR", fingerprint)
-        "SEVEN_Z" -> openSourceProbe(SevenZSource(file), "CB7", fingerprint)
+        "RAR" -> openSourceProbe(
+            openComicSource(file, "RAR", fingerprint, File(context.cacheDir, "import")),
+            "CBR",
+            fingerprint,
+        )
+        "SEVEN_Z" -> openSourceProbe(
+            openComicSource(file, "SEVEN_Z", fingerprint, File(context.cacheDir, "import")),
+            "CB7",
+            fingerprint,
+        )
         "PDF" -> {
             val pages = runCatching { PdfSource(file).use { it.pageCount } }.getOrDefault(0)
             Probe(
@@ -414,6 +564,8 @@ class LibraryScanner(
             format = format,
             coverPath = if (count > 0) saveCover(fingerprint) { _ -> it.openPage(0) } else null,
             meta = null,
+            sections = (source as? com.inkvol.app.data.source.SectionedContentSource)
+                ?.listSections().orEmpty(),
         )
     }
 
@@ -446,17 +598,20 @@ class LibraryScanner(
         null
     }
 
-    /** 归档抽取缓存封顶 200MB，按最后访问时间淘汰。 */
+    /** 归档抽取缓存封顶 200MB，按最后访问时间淘汰（含嵌套解包目录，递归计体积）。 */
     private fun pruneArchiveCache() {
         val dir = File(context.cacheDir, "import")
-        val files = dir.listFiles()?.filter { it.isFile }?.sortedBy { it.lastModified() } ?: return
-        var total = files.sumOf { it.length() }
-        for (file in files) {
+        val entries = dir.listFiles()?.sortedBy { it.lastModified() } ?: return
+        var total = entries.sumOf { it.recursiveLength() }
+        for (entry in entries) {
             if (total <= MAX_ARCHIVE_CACHE_BYTES) break
-            val length = file.length()
-            if (file.delete()) total -= length
+            val length = entry.recursiveLength()
+            if (entry.deleteRecursively()) total -= length
         }
     }
+
+    private fun File.recursiveLength(): Long =
+        if (isFile) length() else (listFiles() ?: emptyArray()).sumOf { it.recursiveLength() }
 
     /** 抽首图做封面：先量尺寸再按 256px 降采样，避免整页大图进内存。 */
     private fun saveCover(

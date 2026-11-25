@@ -1,0 +1,81 @@
+name: 问题反馈（Bug）
+description: 崩溃、打不开、显示异常、数据丢失等
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。请尽量把信息填全，尤其是**崩溃日志**——没有日志的崩溃问题基本无法定位。
+
+        **导出崩溃日志**：设置 → 关于与诊断 → 崩溃日志 → 对应时间右侧「分享」，发送到微信/邮件/文件应用，再把文件拖进来。
+
+  - type: input
+    id: app_version
+    attributes:
+      label: 应用版本
+      description: 设置 → 关于与诊断 里的「应用版本」与「构建类型」
+      placeholder: "例如：1.0.0 / Release"
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: 设备与系统
+      placeholder: "例如：小米 14 / HyperOS 2.0（Android 15）"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从打开应用到出问题，一步一步写
+      placeholder: |
+        1. 打开应用
+        2. 进入书架，打开 xx 格式的书
+        3. 翻到第 3 页
+        4. 闪退回到书架
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果 / 实际结果
+      placeholder: "期望：正常翻页；实际：直接闪退"
+    validations:
+      required: true
+
+  - type: textarea
+    id: crash_log
+    attributes:
+      label: 崩溃日志（必填）
+      description: 把「设置 → 关于与诊断 → 崩溃日志」导出的 .txt 文件拖到下面；没有崩溃可在同一位置说明「本次无崩溃」
+      placeholder: "把 crash-xxxx.txt 拖到这里，或粘贴日志内容"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: book_format
+    attributes:
+      label: 涉及的书本格式
+      multiple: true
+      options:
+        - 文件夹散页
+        - ZIP / CBZ
+        - 7z / CB7
+        - RAR / CBR
+        - PDF
+        - TXT
+        - EPUB
+        - MOBI
+        - 与格式无关
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息（可选）
+      description: 截图、录屏、是否开启应用锁 / WebDAV 同步 / 深色模式 / 分屏等
+      placeholder: "可选"

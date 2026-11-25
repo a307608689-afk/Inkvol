@@ -3,4 +3,12 @@
     <cache-path
         name="reader_share"
         path="reader_share/" />
+    <!-- 书籍分享：书架多选 → ⋯ → 分享（复制到 cache/share_file 换成友好文件名） -->
+    <cache-path
+        name="share_file"
+        path="share_file/" />
+    <!-- 崩溃日志导出：设置 → 关于与诊断 → 崩溃日志（FileProvider 分享） -->
+    <files-path
+        name="crash"
+        path="crash/" />
 </paths>

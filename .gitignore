@@ -12,6 +12,12 @@ local.properties
 *.aab
 *.hap
 
+# 正式签名材料：严禁入库（丢失即无法升级已发布版本）
+keystore.properties
+/keystore/
+*.jks
+*.keystore
+
 # M0.5 spike：第三方源码与中间产物不入库
 tools/spike/unrar/
 tools/spike/build-arm64/
@@ -50,3 +56,7 @@ docs/handoff*.md
 
 # 临时日志
 build_log.txt
+build_release_log.txt
+
+# 发版归档（APK/AAB/mapping，体积大且含混淆映射）
+/dist/

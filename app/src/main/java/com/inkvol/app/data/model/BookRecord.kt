@@ -25,6 +25,14 @@ data class BookRecord(
     val lastReadAt: Long = 0,
     /** SAF 树 URI；单文件导入为 inkvol://single-file */
     val treeUri: String? = null,
+    /**
+     * 主位置相对书库根的目录路径（v12 起）："" = 直接放在库根，
+     * "海贼王/单行本" = 二级目录；null = 旧数据未回填 / 单文件导入。
+     *
+     * 系列视图（层级 / 扁平）的唯一真源：文件夹为准，ComicInfo 的 Series
+     * 元数据不再覆盖系列归属。
+     */
+    val folderPath: String? = null,
 ) {
     companion object {
         const val READ_UNREAD = "UNREAD"
@@ -137,6 +145,13 @@ data class NovelChapterRecord(
 ) {
     val isWholeBook: Boolean get() = index == 0
 }
+
+/** 漫画章节区间（P3 落库，仅备份用）；pageStart = 该章在扁平页列表中的起始页（0 基）。 */
+data class BookSectionRecord(
+    val idx: Int,
+    val title: String,
+    val pageStart: Int,
+)
 
 /** M6.1-B 小说进度；章节 + 字符偏移锚定，字号/字体变化不漂移。 */
 data class NovelProgressRecord(

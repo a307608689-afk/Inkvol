@@ -39,6 +39,11 @@ data class ChoiceSpec(
     val value: String,
     val options: List<SettingChoice>,
     val enabled: Boolean = true,
+    /**
+     * 主题色色卡模式：选项 value 即 ThemeAccent.id，面板渲染为色卡网格，
+     * 点选立即生效且面板不关闭（便于连续试色），行首显示当前色圆点。
+     */
+    val accentPicker: Boolean = false,
     val onSelect: (String) -> Unit,
 ) : SettingSpec {
     val currentLabel: String

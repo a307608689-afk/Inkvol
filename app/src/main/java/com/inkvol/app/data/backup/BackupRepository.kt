@@ -186,6 +186,21 @@ class BackupRepository(
                         )
                     }
 
+                    // P3：漫画章节区间（先清后插，幂等）
+                    sql.delete("book_sections", "book_id = ?", arrayOf(current.id))
+                    backupBook.sections.forEach { section ->
+                        sql.insert(
+                            "book_sections",
+                            null,
+                            ContentValues().apply {
+                                put("book_id", current.id)
+                                put("idx", section.idx)
+                                put("title", section.title)
+                                put("page_start", section.pageStart)
+                            },
+                        )
+                    }
+
                     // M6.3-D：小说书签（整书替换，章内 char 幂等）
                     sql.delete("bookmarks", "book_id = ?", arrayOf(current.id))
                     backupBook.novelBookmarks.forEach { bookmark ->
@@ -294,6 +309,7 @@ class BackupRepository(
                 novelProgress = queryNovelProgress(row.id),
                 novelBookmarks = queryNovelBookmarks(row.id),
                 annotations = queryAnnotations(row.id),
+                sections = queryBookSections(row.id),
             )
         }
 
@@ -318,6 +334,24 @@ class BackupRepository(
             purifyRules = queryPurifyRules(),
         )
     }
+
+    // ---------------- P3：漫画章节查询 ----------------
+
+    private fun queryBookSections(bookId: String): List<BackupSection> =
+        db.readableDatabase.rawQuery(
+            "SELECT idx, title, page_start FROM book_sections WHERE book_id = ? ORDER BY idx",
+            arrayOf(bookId),
+        ).use { cursor ->
+            val list = ArrayList<BackupSection>()
+            while (cursor.moveToNext()) {
+                list += BackupSection(
+                    idx = cursor.getInt(0),
+                    title = cursor.getString(1) ?: "",
+                    pageStart = cursor.getInt(2),
+                )
+            }
+            list
+        }
 
     // ---------------- M6.3-D：小说数据查询 ----------------
 

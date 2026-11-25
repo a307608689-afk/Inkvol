@@ -242,9 +242,13 @@ fun ReaderScreen(
         }
     }
     DisposableEffect(fallbackSession) {
+        // 必须捕获本 effect 当初持有的 session：onDispose 时读 fallbackSession
+        // 拿到的是"最新值"，会在 session 刚创建时把它自己关掉（loader 随即 closed，
+        // 后续页面全部解码失败，表现为一直转圈；PDF 上最明显）。
+        val ownedSession = fallbackSession
         onDispose {
-            // fallback session 的所有权在当前 ReaderScreen；宿主 session 由状态机关闭。
-            if (session == null) fallbackSession?.close()
+            // 宿主 session 接管或页面离开时，当前 ReaderScreen 持有的 fallback 都该释放。
+            ownedSession?.close()
         }
     }
 
@@ -349,7 +353,27 @@ private fun ReaderContent(
     onBack: () -> Unit,
     onFirstPageReady: () -> Unit,
 ) {
-    val count = loader.source.pageCount.coerceAtLeast(1)
+    val count = loader.pageCount.coerceAtLeast(1)
+    // 章节目录：从内容源现算（纯内存；源在构造期已解析好章节划分）。
+    // 不落库——EPUB spine / MOBI 章节 / 归档顶层文件夹分组都能即时得出，存量书也零迁移生效。
+    val sections = remember(book.id, loader) {
+        runCatching {
+            (loader.source as? com.inkvol.app.data.source.SectionedContentSource)
+                ?.listSections().orEmpty()
+        }.getOrDefault(emptyList())
+            // 第一章的 pageStart 恒为 0，必须保留（此前误写成 1 until count，
+            // 每本书的第一章都被吞掉，两章的书直接不显示目录）
+            .filter { it.pageStart in 0 until count }
+            .distinctBy { it.pageStart }
+            .sortedBy { it.pageStart }
+            .mapIndexed { index, section -> section.copy(idx = index) }
+    }
+    // P3 落库 write-through：库里没记录才写（存量书打开一次补齐；DB 只服务备份）
+    LaunchedEffect(book.id, sections) {
+        if (sections.isNotEmpty()) {
+            repository.saveBookSectionsIfEmpty(book.id, sections)
+        }
+    }
     val prefs by settingsRepository.preferences.collectAsStateWithLifecycle(initialValue = null)
     // 本书快照：仅「单独记忆」开启时读取/写入
     val savedBookPrefsRaw = prefs?.let {
@@ -718,6 +742,10 @@ private fun ReaderContent(
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val widthPx = constraints.maxWidth
         val heightPx = constraints.maxHeight
+        // B：渲染目标跟随实际窗口尺寸（旋转 / 分屏 / 折叠展开后按新尺寸重渲染）。
+        LaunchedEffect(widthPx, heightPx) {
+            loader.updateTargetSize(widthPx, heightPx)
+        }
         val maxPanelHeight = maxHeight * 0.58f
         // handoff 完成后不再唤起 chrome；打开即为干净全屏，单击才显示。
         // loader 由 ReaderOpenSession 提供；生命周期由宿主状态机管理。
@@ -831,7 +859,8 @@ private fun ReaderContent(
             } else {
                 listOf(savingPage, savingPage + 1, savingPage + 2, savingPage - 1, savingPage - 2)
             }
-            loader.prefetch(prefetch, repair)
+            // 预取与可见页用同一套裁边/修复 key，翻过去直接命中；内部有静默门与中止。
+            loader.prefetch(prefetch, repair, trimMargins)
         }
 
         // 面板在场（含退场动画）期间不跑自动隐藏计时，否则底栏刚淡回来又自己藏
@@ -1335,6 +1364,24 @@ private fun ReaderContent(
                 )
             }
 
+            // 统一跳页入口（滑条/缩略图/上一话下一话共用；双页转 spread、分格转帧首）
+            val seekTo: (Int) -> Unit = { target ->
+                scope.launch {
+                    if (vertical) {
+                        listState.scrollToItem(target)
+                    } else {
+                        val targetIndex = if (effectiveDouble) {
+                            spreadIndexFor(target, spreads)
+                        } else if (panelingEnabled) {
+                            frameStartForPage(target)
+                        } else {
+                            target
+                        }
+                        pagerState.scrollToPage(targetIndex.coerceIn(0, pagerCount - 1))
+                    }
+                }
+            }
+
             AnimatedVisibility(
                 visible = chromeVisible && !readerOverlays.present,
                 enter = fadeIn(tween(160)) + slideInVertically(tween(160)) { it / 4 },
@@ -1347,26 +1394,13 @@ private fun ReaderContent(
                     total = count,
                     frameIndex = currentFrameIndex,
                     frameCount = currentFrameCount,
+                    sections = sections,
+                    onJump = seekTo,
                     onThumbnails = {
                         quickPanel = false
                         thumbnailsOpen = true
                     },
-                    onSeek = { target ->
-                        scope.launch {
-                            if (vertical) {
-                                listState.scrollToItem(target)
-                            } else {
-                                val targetIndex = if (effectiveDouble) {
-                                    spreadIndexFor(target, spreads)
-                                } else if (panelingEnabled) {
-                                    frameStartForPage(target)
-                                } else {
-                                    target
-                                }
-                                pagerState.scrollToPage(targetIndex.coerceIn(0, pagerCount - 1))
-                            }
-                        }
-                    },
+                    onSeek = seekTo,
                     backdrop = pageBackdrop,
                 )
             }
@@ -1547,21 +1581,11 @@ private fun ReaderContent(
                 count = count,
                     currentPage = currentPage,
                     loader = loader,
+                    sections = sections,
                     panelHeight = thumbHeight,
                     onPick = { page ->
                         thumbnailsOpen = false
-                        scope.launch {
-                            if (vertical) {
-                                listState.scrollToItem(page)
-                            } else {
-                                val target = when {
-                                    effectiveDouble -> spreadIndexFor(page, spreads)
-                                    panelingEnabled -> frameStartForPage(page)
-                                    else -> page
-                                }
-                                pagerState.scrollToPage(target.coerceIn(0, pagerCount - 1))
-                            }
-                        }
+                        seekTo(page)
                     },
                     onDismiss = { thumbnailsOpen = false },
                     backdrop = pageBackdrop,
@@ -2622,6 +2646,8 @@ private fun ReaderBottomBar(
     total: Int,
     frameIndex: Int,
     frameCount: Int,
+    sections: List<com.inkvol.app.data.source.BookSection>,
+    onJump: (Int) -> Unit,
     onThumbnails: () -> Unit,
     onSeek: (Int) -> Unit,
     backdrop: Backdrop,
@@ -2633,6 +2659,12 @@ private fun ReaderBottomBar(
     }
     val shownPage = if (scrubbing) scrubPage else (page - 1)
     val fraction = ((shownPage + 1).toFloat() / total.coerceAtLeast(1)).coerceIn(0f, 1f)
+    // 按章跳转（仅多章节书显示）：当前章 = 最后一个 pageStart <= 当前页的章
+    val hasSections = sections.size >= 2
+    val currentSection =
+        if (hasSections) sections.indexOfLast { it.pageStart <= shownPage } else -1
+    val prevSection = if (hasSections) sections.getOrNull(currentSection - 1) else null
+    val nextSection = if (hasSections) sections.getOrNull(currentSection + 1) else null
 
     GlassRounded(
         backdrop = backdrop,
@@ -2653,6 +2685,24 @@ private fun ReaderBottomBar(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
+            // 按章跳转：仅多章节书渲染，单话书布局与旧版逐像素一致
+            if (hasSections) {
+                Text(
+                    text = "上一话",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (prevSection != null) {
+                        MaterialTheme.colorScheme.onSurface
+                    } else {
+                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
+                    },
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(enabled = prevSection != null) {
+                            prevSection?.let { onJump(it.pageStart) }
+                        }
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                )
+            }
             Text(
                 text = if (frameCount > 1) {
                     "P${shownPage + 1} · 格 ${frameIndex + 1}/$frameCount"
@@ -2717,6 +2767,23 @@ private fun ReaderBottomBar(
                     tint = MaterialTheme.colorScheme.onSurface,
                 )
             }
+            if (hasSections) {
+                Text(
+                    text = "下一话",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (nextSection != null) {
+                        MaterialTheme.colorScheme.onSurface
+                    } else {
+                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
+                    },
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(enabled = nextSection != null) {
+                            nextSection?.let { onJump(it.pageStart) }
+                        }
+                        .padding(horizontal = 6.dp, vertical = 4.dp),
+                )
+            }
         }
     }
 }
@@ -2728,14 +2795,26 @@ private fun ReaderThumbnailPanel(
     count: Int,
     currentPage: Int,
     loader: PageLoader,
+    sections: List<com.inkvol.app.data.source.BookSection>,
     panelHeight: androidx.compose.ui.unit.Dp,
     onPick: (Int) -> Unit,
     onDismiss: () -> Unit,
     backdrop: Backdrop,
 ) {
+    val hasSections = sections.size >= 2
+    // 面板默认页网格；有章节（≥2）时可切「目录」。模式在面板存续期内保留（重开回到上次模式）。
+    var showSections by remember { mutableStateOf(false) }
     val gridState = rememberLazyGridState()
+    val listState = rememberLazyListState()
+    // 当前章 = 页号所在区间（最后一个 pageStart <= currentPage 的章）
+    val currentSection =
+        if (hasSections) sections.indexOfLast { it.pageStart <= currentPage } else -1
     LaunchedEffect(currentPage) {
         if (currentPage in 0 until count) gridState.scrollToItem(currentPage)
+    }
+    // 打开面板 / 切到目录态时落到当前章
+    LaunchedEffect(visible, showSections, sections) {
+        if (visible && showSections && currentSection >= 0) listState.scrollToItem(currentSection)
     }
 
     GlassOverlay(
@@ -2763,11 +2842,22 @@ private fun ReaderThumbnailPanel(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "缩略图",
+                    text = if (showSections && hasSections) "目录" else "缩略图",
                     style = MaterialTheme.typography.titleSmall,
                     color = MaterialTheme.colorScheme.onSurface,
                     modifier = Modifier.weight(1f),
                 )
+                if (hasSections) {
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color.White.copy(alpha = 0.08f)),
+                    ) {
+                        PanelModeChip("缩略图", !showSections) { showSections = false }
+                        PanelModeChip("目录", showSections) { showSections = true }
+                    }
+                    Spacer(Modifier.width(12.dp))
+                }
                 Text(
                     text = "关闭",
                     style = MaterialTheme.typography.labelMedium,
@@ -2779,25 +2869,113 @@ private fun ReaderThumbnailPanel(
                 )
             }
             Spacer(Modifier.height(10.dp))
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(5),
-                state = gridState,
-                modifier = Modifier.weight(1f),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                contentPadding = PaddingValues(bottom = 4.dp),
-            ) {
-                items(count) { index ->
-                    ThumbCell(
-                        index = index,
-                        selected = index == currentPage,
-                        loader = loader,
-                        onClick = { onPick(index) },
-                    )
+            if (showSections && hasSections) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    contentPadding = PaddingValues(bottom = 4.dp),
+                ) {
+                    items(sections.size) { index ->
+                        val section = sections[index]
+                        // 章末页 = 下一章起始页 − 1（末章到最后一页）
+                        val endPage = (sections.getOrNull(index + 1)?.pageStart ?: count) - 1
+                        val isCurrent = index == currentSection
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (isCurrent) {
+                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+                                    } else {
+                                        Color.Transparent
+                                    },
+                                )
+                                .clickable { onPick(section.pageStart) }
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = "${index + 1}",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (isCurrent) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                                modifier = Modifier.width(28.dp),
+                            )
+                            Text(
+                                text = section.title,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (isCurrent) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                },
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                text = "第 ${section.pageStart + 1}–${endPage + 1} 页",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            } else {
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(5),
+                    state = gridState,
+                    modifier = Modifier.weight(1f),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    contentPadding = PaddingValues(bottom = 4.dp),
+                ) {
+                    items(count) { index ->
+                        ThumbCell(
+                            index = index,
+                            selected = index == currentPage,
+                            loader = loader,
+                            onClick = { onPick(index) },
+                        )
+                    }
                 }
             }
         }
     }
+}
+
+/** 缩略图/目录两段式切换的单一 chip。 */
+@Composable
+private fun PanelModeChip(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelMedium,
+        color = if (selected) {
+            MaterialTheme.colorScheme.onPrimary
+        } else {
+            MaterialTheme.colorScheme.onSurfaceVariant
+        },
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(
+                if (selected) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    Color.Transparent
+                },
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+    )
 }
 
 @Composable

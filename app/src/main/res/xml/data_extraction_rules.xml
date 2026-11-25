@@ -1,9 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
+    <!--
+      云备份：只保留真正需要跨设备延续的数据（数据库 + DataStore 设置）。
+      派生缓存与崩溃日志不参与备份——崩溃日志承诺「仅本机」，派生数据可重建。
+      注意：DataStore 存于 files/datastore/，不在 sharedpref 域。
+    -->
     <cloud-backup>
-        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="crash/" />
+        <exclude domain="file" path="covers/" />
+        <exclude domain="file" path="novel_covers/" />
+        <exclude domain="file" path="epub_images/" />
+        <exclude domain="file" path="novel_text/" />
         <exclude domain="file" path="secure/" />
     </cloud-backup>
+    <!-- 换机直传：保留完整数据（用户主动发起，带崩溃日志也无妨） -->
     <device-transfer>
         <exclude domain="sharedpref" path="." />
         <exclude domain="file" path="secure/" />

@@ -62,6 +62,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -87,6 +88,8 @@ import com.inkvol.app.data.model.SearchFilterTemplate
 import com.inkvol.app.data.model.SearchState
 import com.inkvol.app.data.model.SystemCategory
 import com.inkvol.app.data.repository.LibraryRepository
+import com.inkvol.app.ui.components.LocalReaderOpenController
+import com.inkvol.app.ui.components.ReaderOpenPhase
 import com.inkvol.app.ui.components.ReaderOpenRect
 import com.inkvol.app.ui.components.glass.GlassCapsule
 import com.inkvol.app.ui.components.glass.GlassDimens
@@ -104,6 +107,7 @@ import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 /**
@@ -121,7 +125,7 @@ import kotlin.math.roundToInt
 internal fun SearchScreen(
     repository: LibraryRepository,
     onOpenBook: (BookRecord, ReaderOpenRect?) -> Unit,
-    onOpenNovelAt: (BookRecord, Int, Int) -> Unit,
+    onOpenNovelAt: (BookRecord, Int, Int, ReaderOpenRect?, Int) -> Unit,
     onOpenCategory: (LibraryTarget) -> Unit,
 ) {
     val search by repository.search.collectAsStateWithLifecycle()
@@ -129,6 +133,7 @@ internal fun SearchScreen(
     val context = LocalContext.current
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
+    val scope = rememberCoroutineScope()
 
     var input by rememberSaveable { mutableStateOf(search.query) }
     var showFilter by remember { mutableStateOf(false) }
@@ -138,6 +143,29 @@ internal fun SearchScreen(
     val presence: GlassOverlayPresence = rememberGlassOverlayPresence()
     val gridState = rememberLazyGridState()
     var booksExpanded by rememberSaveable(search.query) { mutableStateOf(false) }
+    // 本次打开阅读器的来源行暗号：Closing 期间只有暗号匹配的控件才允许回报
+    // 回程矩形（同 bookId 的书卡/章节行/正文卡互相不抢，返回飞回点击的那一行）。
+    // 残留无害：下次任何点击都会重设，且只在 Closing 阶段被消费。
+    var openSourceKey by rememberSaveable { mutableStateOf<String?>(null) }
+    val readerOpen = LocalReaderOpenController.current
+    val closing = readerOpen?.phase == ReaderOpenPhase.Closing
+
+    // §9.12 同款状态栏 inset 冻结：返回时 show(systemBars) 的 ~250ms 回归动画让
+    // 实时 inset 先小后大 → 顶部占位/搜索框让位先高再落一个状态栏高度。
+    // 捕获 = Idle 且实时 inset>0（显示态稳定终值；阅读器/滚动隐显的隐藏态不覆盖）；
+    // 消费 = Closing 期间顶部占位与搜索框行改用冻结值，其余场景实时值零变化。
+    var frozenStatusBarTopDp by rememberSaveable { mutableStateOf(Float.NaN) }
+    val liveStatusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val statusBarTop = if (closing && !frozenStatusBarTopDp.isNaN()) {
+        frozenStatusBarTopDp.dp
+    } else {
+        liveStatusBarTop
+    }
+    LaunchedEffect(liveStatusBarTop, readerOpen?.phase) {
+        if (readerOpen?.phase == ReaderOpenPhase.Idle && liveStatusBarTop > 0.dp) {
+            frozenStatusBarTopDp = liveStatusBarTop.value
+        }
+    }
 
     // facets 预载（幂等）
     LaunchedEffect(Unit) { repository.ensureSearchFacets() }
@@ -150,8 +178,12 @@ internal fun SearchScreen(
         repository.runSearch(input)
     }
 
-    // 回顶联动：切筛选/新查询（规范 §8-3）
+    // 回顶联动：切筛选/新查询（规范 §8-3）。
+    // §9.13 同族守卫：从阅读器返回时整页重组、本 effect 重新起跑会把网格强滚回顶
+    // （来源行沉出视口、飞回终点坐标错位到顶部内容）——Closing 期间跳过；
+    // 键（query/filter）返回后不变不会二次重跑，跳过即终态。
     LaunchedEffect(search.query, search.filter) {
+        if (closing) return@LaunchedEffect
         runCatching { gridState.scrollToItem(0) }
     }
 
@@ -218,6 +250,7 @@ internal fun SearchScreen(
 
     // 实体命中派生（书夹名/系列名匹配；系列 chips 带命中书数）
     val q = search.query
+    val filter = search.filter
     val facets = search.facets
     val categoryHits = remember(q, facets) {
         if (q.isEmpty()) {
@@ -258,11 +291,8 @@ internal fun SearchScreen(
             ) {
                 // 顶部占位真实 item（规范 §8-2）：搜索框行 56 + 上下间隙 + 状态栏
                 item(span = { GridItemSpan(maxLineSpan) }) {
-                    Spacer(
-                        Modifier.height(
-                            64.dp + WindowInsets.statusBars.asPaddingValues().calculateTopPadding(),
-                        ),
-                    )
+                    // Closing 用冻结 inset（§9.12），其余实时值
+                    Spacer(Modifier.height(64.dp + statusBarTop))
                 }
 
                 if (!resultMode) {
@@ -302,7 +332,7 @@ internal fun SearchScreen(
                         }
                     }
 
-                    if (search.books.isNotEmpty()) {
+                    if (filter.sectionOn(com.inkvol.app.data.model.SearchFilter.SECTION_BOOK) && search.books.isNotEmpty()) {
                         item(span = { GridItemSpan(maxLineSpan) }) {
                             SectionHeader(
                                 title = "书 · ${search.books.size} 本",
@@ -321,35 +351,83 @@ internal fun SearchScreen(
                             SearchBookCard(
                                 book = book,
                                 query = q,
-                                onClick = { rect -> onOpenBook(book, rect) },
+                                onClick = { rect ->
+                                    openSourceKey = "book_${book.id}"
+                                    onOpenBook(book, rect)
+                                },
+                                activeSourceKey = openSourceKey,
                             )
                         }
                     }
 
-                    if (search.chapterHits.isNotEmpty()) {
+                    // 笔记区：标注（批注文字/划线原文）与书签命中，排在章节区之前
+                    if (filter.sectionOn(com.inkvol.app.data.model.SearchFilter.SECTION_NOTE) && search.notes.isNotEmpty()) {
                         item(span = { GridItemSpan(maxLineSpan) }) {
-                            SectionHeader(title = "章节 · ${search.chapterHits.size}")
+                            SectionHeader(title = "笔记 · ${search.notes.size} 条")
                         }
                         items(
-                            search.chapterHits,
-                            key = { "ch_${it.bookId}_${it.chapterIdx}" },
-                            contentType = { "chapter" },
+                            search.notes,
+                            key = { "note_${it.annotation.id}" },
+                            contentType = { "note" },
+                            span = { GridItemSpan(maxLineSpan) },
                         ) { row ->
-                            ChapterHitRow(
+                            NoteHitRow(
                                 row = row,
                                 query = q,
-                                onClick = {
-                                    val book = search.books.firstOrNull { it.id == row.bookId }
-                                    if (book != null) {
-                                        // 章节命中定位到章首（charPos=0）；正文命中走 charPos=命中偏移
-                                        onOpenNovelAt(book, row.chapterIdx, 0)
-                                    }
+                                activeSourceKey = openSourceKey,
+                                onClick = { rect ->
+                                    openSourceKey = "note_${row.annotation.id}"
+                                    val ann = row.annotation
+                                    // 跳转到标注字符区间；区间长度做 5s 定位高亮
+                                    onOpenNovelAt(
+                                        row.book,
+                                        ann.chapterIdx,
+                                        ann.charStart,
+                                        rect,
+                                        (ann.charEnd - ann.charStart).coerceAtLeast(1),
+                                    )
                                 },
                             )
                         }
                     }
 
-                    if (search.bodyGroups.isNotEmpty() || search.bodyTotal > 0) {
+                    if (filter.sectionOn(com.inkvol.app.data.model.SearchFilter.SECTION_CHAPTER) && search.chapterHits.isNotEmpty()) {
+                        item(span = { GridItemSpan(maxLineSpan) }) {
+                            SectionHeader(title = "章节 · ${search.chapterHits.size}")
+                        }
+                        // span=maxLineSpan：ChapterHitRow 是全宽列表行，不声明 span 会被
+                        // Adaptive(120dp) 网格挤成小格子（封面+文字截断成一团）。
+                        items(
+                            search.chapterHits,
+                            key = { "ch_${it.bookId}_${it.chapterIdx}" },
+                            contentType = { "chapter" },
+                            span = { GridItemSpan(maxLineSpan) },
+                        ) { row ->
+                            ChapterHitRow(
+                                row = row,
+                                query = q,
+                                onClick = { rect ->
+                                    openSourceKey = "ch_${row.bookId}_${row.chapterIdx}"
+                                    // 章节标题命中的书不一定在 search.books（books 只匹配
+                                    // 书名/系列/作者/标签）——查不到时 bookById 兜底，
+                                    // 否则点击静默无效。
+                                    scope.launch {
+                                        val book = search.books.firstOrNull { it.id == row.bookId }
+                                            ?: repository.bookById(row.bookId)
+                                        if (book != null) {
+                                            // 章节命中定位到章首（charPos=0）；正文命中走 charPos=命中偏移
+                                            onOpenNovelAt(book, row.chapterIdx, 0, rect, 0)
+                                        }
+                                    }
+                                },
+                                activeSourceKey = openSourceKey,
+                            )
+                        }
+                    }
+
+                    if (filter.sectionOn(com.inkvol.app.data.model.SearchFilter.SECTION_BODY) &&
+                        (search.bodyGroups.isNotEmpty() || search.bodyTotal > 0)
+                    ) {
                         item(span = { GridItemSpan(maxLineSpan) }) {
                             SectionHeader(
                                 title = "正文 · $totalBodyHits 处",
@@ -370,6 +448,10 @@ internal fun SearchScreen(
                                             text = "已达上限",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            // 与 TextButton 文字右缘对齐（M3 TextButton 自带
+                                            // horizontal 12dp contentPadding，裸 Text 顶到网格
+                                            // 右缘会多伸出 12dp）
+                                            modifier = Modifier.padding(end = 12.dp),
                                         )
                                     }
                                 },
@@ -383,21 +465,32 @@ internal fun SearchScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.padding(horizontal = 20.dp),
+                                    modifier = Modifier.padding(horizontal = 0.dp),
                                 )
                             }
                         }
-                        items(search.bodyGroups, key = { "body_${it.book.id}" }, contentType = { "body" }) { group ->
+                        // span=maxLineSpan：BodyGroupRow 是全宽聚合卡，同章节区。
+                        items(
+                            search.bodyGroups,
+                            key = { "body_${it.book.id}" },
+                            contentType = { "body" },
+                            span = { GridItemSpan(maxLineSpan) },
+                        ) { group ->
                             BodyGroupRow(
                                 group = group,
                                 query = q,
                                 bookLimited = group.book.id in search.bodyBookLimitedIds,
-                                onOpenHit = { hit -> onOpenNovelAt(hit.book, hit.chapterIdx, hit.charPos) },
+                                onOpenHit = { hit, rect ->
+                                    openSourceKey = "body_${hit.book.id}"
+                                    onOpenNovelAt(hit.book, hit.chapterIdx, hit.charPos, rect, 0)
+                                },
+                                activeSourceKey = openSourceKey,
                             )
                         }
                     }
 
                     val nothing = search.books.isEmpty() &&
+                        search.notes.isEmpty() &&
                         search.chapterHits.isEmpty() &&
                         search.bodyGroups.isEmpty() &&
                         !search.loading
@@ -456,9 +549,8 @@ internal fun SearchScreen(
                 edge = GlassEdge.Outline,
                 modifier = Modifier
                     .padding(top = 8.dp, start = 16.dp, end = 16.dp + chrome.railEndInset)
-                    .padding(
-                        top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding(),
-                    ),
+                    // Closing 用冻结 inset（§9.12）
+                    .padding(top = statusBarTop),
             )
         }
 
@@ -549,7 +641,7 @@ private fun androidx.compose.foundation.lazy.grid.LazyGridScope.InitialContent(
         item(span = { GridItemSpan(maxLineSpan) }) {
             Column {
                 Row(
-                    modifier = Modifier.padding(horizontal = 20.dp),
+                    modifier = Modifier.padding(horizontal = 0.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
@@ -561,7 +653,7 @@ private fun androidx.compose.foundation.lazy.grid.LazyGridScope.InitialContent(
                     TextButton(onClick = onClearHistory) { Text("清空") }
                 }
                 FlowRow(
-                    modifier = Modifier.padding(horizontal = 20.dp),
+                    modifier = Modifier.padding(horizontal = 0.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     search.history.forEach { keyword ->
@@ -578,11 +670,11 @@ private fun androidx.compose.foundation.lazy.grid.LazyGridScope.InitialContent(
                     text = "书夹",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 20.dp),
+                    modifier = Modifier.padding(horizontal = 0.dp),
                 )
                 Spacer(Modifier.height(6.dp))
                 FlowRow(
-                    modifier = Modifier.padding(horizontal = 20.dp),
+                    modifier = Modifier.padding(horizontal = 0.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     facets.categories.forEach { category ->
@@ -631,11 +723,11 @@ private fun EntityHitSection(
                 text = "书夹",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 20.dp),
+                modifier = Modifier.padding(horizontal = 0.dp),
             )
             Spacer(Modifier.height(6.dp))
             FlowRow(
-                modifier = Modifier.padding(horizontal = 20.dp),
+                modifier = Modifier.padding(horizontal = 0.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 categoryHits.forEach { category ->
@@ -658,11 +750,11 @@ private fun EntityHitSection(
                 text = "系列",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 20.dp),
+                modifier = Modifier.padding(horizontal = 0.dp),
             )
             Spacer(Modifier.height(6.dp))
             LazyRow(
-                contentPadding = PaddingValues(horizontal = 20.dp),
+                contentPadding = PaddingValues(horizontal = 0.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 items(seriesHits.size, key = { seriesHits[it] }) { index ->
@@ -673,7 +765,8 @@ private fun EntityHitSection(
                         selected = true,
                         onClick = {
                             LibraryUiState.typeFilter = null
-                            onOpenCategory(LibraryTarget.Series(name))
+                            // 搜索结果只带系列名（没有文件夹路径）：走按名匹配兼容入口
+                            onOpenCategory(LibraryTarget.Series.byName(name))
                         },
                     )
                 }

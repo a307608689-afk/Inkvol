@@ -15,8 +15,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 
-private val InkOnPrimary = Color(0xFF0B0B0D)
-private val LightPrimaryContainer = Color(0xFFF2DED9)
+internal val InkOnPrimary = Color(0xFF0B0B0D)
+internal val LightPrimaryContainer = Color(0xFFF2DED9)
 private val LightSurfaceHigh = Color(0xFFE6E1D8)
 private val LightSurfaceHighest = Color(0xFFDED8CE)
 private val LightOutlineVariant = Color(0xFFEDE8E1)
@@ -97,21 +97,29 @@ val LocalFixedFolderColors = staticCompositionLocalOf<FixedFolderColors> {
     error("FixedFolderColors not provided")
 }
 
+/**
+ * 当前生效的自定义主题色。默认值走 CompositionLocal 读取：
+ * 阅读器内部再套一层 InkvolTheme 时会自动继承顶层选择，不会跳回默认朱红。
+ */
+val LocalThemeAccent = staticCompositionLocalOf { ThemeAccent.VERMILION }
+
 @Composable
 fun InkvolTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
     dynamicColor: Boolean = false,
+    accent: ThemeAccent = LocalThemeAccent.current,
     content: @Composable () -> Unit,
 ) {
     val context = LocalContext.current
     val colorScheme = when {
+        // 动态取色优先：只保留壁纸的 primary 一族，层次/描边/语义色全部锁回品牌色。
         dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
             val dynamic = if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
             dynamic.withBrandCanvas(darkTheme)
         }
 
-        darkTheme -> DarkColors
-        else -> LightColors
+        darkTheme -> DarkColors.applyAccent(accent, dark = true)
+        else -> LightColors.applyAccent(accent, dark = false)
     }
 
     // 智能书夹胶囊卡固定色：无论动态取色开关与否，恒取默认色板同名 token 值（仅分深浅）。
@@ -133,7 +141,10 @@ fun InkvolTheme(
         )
     }
 
-    CompositionLocalProvider(LocalFixedFolderColors provides fixedFolder) {
+    CompositionLocalProvider(
+        LocalThemeAccent provides accent,
+        LocalFixedFolderColors provides fixedFolder,
+    ) {
         MaterialTheme(
             colorScheme = colorScheme,
             typography = InkvolTypography,
@@ -149,7 +160,9 @@ object Breakpoints {
 }
 
 /**
- * 动态取色只接管强调色，背景与层次仍保持品牌墨色，避免整屏被壁纸主色冲淡。
+ * 动态取色「只换强调色」：除 primary 一族外，基底、层次、描边、次级填充与
+ * 语义色全部锁回品牌色，避免壁纸主色把整屏（尤其浅色卡片与分隔线）染掉。
+ * 浅色分支此前只锁了 4 个 token，导致卡片底/描边跟着壁纸走；此处分档补齐。
  */
 private fun ColorScheme.withBrandCanvas(dark: Boolean): ColorScheme = if (dark) {
     copy(
@@ -166,6 +179,12 @@ private fun ColorScheme.withBrandCanvas(dark: Boolean): ColorScheme = if (dark) 
         onSurfaceVariant = PaperMuted,
         outline = InkOutline,
         outlineVariant = InkOutlineSoft,
+        secondary = PaperMuted,
+        onSecondary = InkBlack,
+        secondaryContainer = InkSurfaceHigh,
+        onSecondaryContainer = PaperWhite,
+        error = DangerRed,
+        onError = PaperWhite,
     )
 } else {
     copy(
@@ -173,5 +192,20 @@ private fun ColorScheme.withBrandCanvas(dark: Boolean): ColorScheme = if (dark) 
         onBackground = OnLight,
         surface = SurfaceLight,
         onSurface = OnLight,
+        surfaceContainerLowest = SurfaceLight,
+        surfaceContainerLow = CanvasLight,
+        surfaceContainer = SurfaceLightHigh,
+        surfaceContainerHigh = LightSurfaceHigh,
+        surfaceContainerHighest = LightSurfaceHighest,
+        surfaceVariant = SurfaceLightHigh,
+        onSurfaceVariant = PaperDim,
+        outline = OutlineLight,
+        outlineVariant = LightOutlineVariant,
+        secondary = PaperDim,
+        onSecondary = SurfaceLight,
+        secondaryContainer = SurfaceLightHigh,
+        onSecondaryContainer = OnLight,
+        error = DangerRed,
+        onError = SurfaceLight,
     )
 }

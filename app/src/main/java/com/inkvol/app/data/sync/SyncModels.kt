@@ -147,6 +147,24 @@ data class SyncDeviceDoc(
 
 // ---------- 运行时模型（不落盘到云端） ----------
 
+/**
+ * 书籍文件同步范围（本机白名单，不写云端）。
+ * - all：所有可单文件传输的书籍（文件夹型漫画 format=FOLDER 天然不参与）
+ * - single：单文件导入（散书，tree_uri = inkvol://single-file）
+ * - folderIds：各书库文件夹（本机自增 id，跨设备无意义，故仅约束本机上传）
+ *
+ * 进度/标注/书签等元数据始终全量同步，不受此范围影响——它们依附内容指纹，
+ * 按文件夹隔离会让同一本书在两台设备的进度互相看不见。
+ */
+@Serializable
+data class SyncFileScope(
+    val all: Boolean = false,
+    val single: Boolean = true,
+    val folderIds: List<Long> = emptyList(),
+) {
+    val isEmpty: Boolean get() = !all && !single && folderIds.isEmpty()
+}
+
 /** 单条同步记录（最近 20 条持久化于 DataStore）。 */
 @Serializable
 data class SyncLogEntry(

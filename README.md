@@ -6,6 +6,9 @@
 
 Kotlin · Jetpack Compose · Material 3 · 液态玻璃设计体系
 
+中文别名：**页澜**（应用显示名仍为 Inkvol，仅用于搜索与传播）
+
+![Version](https://img.shields.io/badge/Version-1.0.0-orange)
 ![License](https://img.shields.io/badge/License-GPL--3.0-blue)
 ![Platform](https://img.shields.io/badge/Platform-Android%2026%2B-green)
 ![Kotlin](https://img.shields.io/badge/Kotlin-2.3-purple)
@@ -57,6 +60,9 @@ Kotlin · Jetpack Compose · Material 3 · 液态玻璃设计体系
 - 全量 JSON 备份 / 恢复：书、进度、书签、注释、净化规则、偏好
 - 删除进回收站，误删可救
 - 崩溃自动恢复阅读位置
+- 应用锁（可选）：离开 30 秒后需系统锁屏凭据解锁
+- 空间清理：只清可重建缓存与孤儿封面，不碰书籍 / 进度 / 标注
+- 崩溃日志：仅存本机，可在「关于与诊断」中导出分享
 
 ### 数据同步（可选，默认关闭）
 - WebDAV 同步（坚果云 / 自建服务器均可），多设备书库与进度合并
@@ -69,6 +75,23 @@ Kotlin · Jetpack Compose · Material 3 · 液态玻璃设计体系
 - 一镜到底开书动画：书架封面 → 阅读器，旋转 / 历史入口全路径精确
 - 横屏玻璃侧栏（GlassRail）、底部玻璃栏、动态取色（Material You）
 
+## 下载与反馈
+
+- 安装包与更新说明：[GitHub Releases](https://github.com/a307608689-afk/Inkvol/releases)
+- 问题反馈：[Issues](https://github.com/a307608689-afk/Inkvol/issues)。请附上机型、系统版本、复现步骤，以及崩溃日志
+- 从旧测试包升级请先卸载（签名不同，无法覆盖安装）
+
+### 怎么导出崩溃日志（反馈问题时必看）
+
+应用崩溃后不会自动上传任何东西，日志只写在本机。导出步骤：
+
+1. 重新打开 Inkvol
+2. 进入 **设置 → 关于与诊断 → 崩溃日志**
+3. 点对应时间的日志右侧 **分享**，发送到微信 / 邮件 / 任意文件应用
+4. 把文件和「机型、系统版本、复现步骤」一起贴到 Issue
+
+日志内容只有堆栈、版本号与设备信息，不包含书库、阅读内容或账号。
+
 ## 隐私
 
 - **零采集**：无账号体系，无埋点，无广告 SDK，无遥测
@@ -76,15 +99,36 @@ Kotlin · Jetpack Compose · Material 3 · 液态玻璃设计体系
 - **默认零网络**：联网权限仅服务于可选的 WebDAV 同步——不在设置中配置服务器，应用不会发起任何网络请求
 - 应用本体的全部功能（阅读、备份、搜索、统计）完全离线可用
 
+完整政策见 [`docs/privacy.md`](docs/privacy.md)（与应用内「设置 → 关于与诊断 → 隐私政策」同文），首次启动需明确同意。
+
+安装包声明的权限与用途：
+
+| 权限 | 用途 |
+|---|---|
+| `INTERNET`、`ACCESS_NETWORK_STATE` | 仅可选的 WebDAV 同步（默认关闭） |
+| `WAKE_LOCK`、`RECEIVE_BOOT_COMPLETED`、`FOREGROUND_SERVICE` | WorkManager 后台书库扫描调度，不常驻前台服务 |
+
+补充说明：
+
+- 系统云备份（若开启）可能包含书库索引、阅读进度与设置；封面、EPUB 提取图片、TXT 解析缓存与崩溃日志**不参与**云备份
+- 崩溃日志仅写入本机私有目录，最多保留 5 份，需要用户在应用内主动导出
+
 ## 构建
 
 ```
 JDK 17 + Android SDK（compileSdk 37）
 ./gradlew assembleDebug          # Windows: gradlew.bat assembleDebug
+
+# 正式版（APK + AAB，需 keystore.properties 与 keystore/inkvol-release.jks，均不入库）
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 ```
 
-- minSdk 26（Android 8.0）/ targetSdk 37 / 16KB page size / arm64
-- 无需任何 API 密钥或本地配置即可构建
+版本号单一真源在 `gradle.properties`（`INKVOL_VERSION_CODE` / `INKVOL_VERSION_NAME`）。
+正式包必须使用自建密钥签名；缺少 `keystore.properties` 时发布构建会直接失败，避免误产出 debug 签名的包。
+
+- minSdk 26（Android 8.0）/ targetSdk 37
+- 无可执行原生库（RAR 由 junrar 纯 Java 实现），16KB page size 天然满足，无 ABI 限制
+- 无需任何 API 密钥或本地配置即可构建（正式签名除外）
 
 ## 开源许可
 

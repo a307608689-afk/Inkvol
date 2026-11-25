@@ -149,6 +149,36 @@ fun SearchFilterOverlay(
                 }
             }
 
+            // 分区筛选（多选，默认全开）：关掉的分区整个隐藏 + 查询短路（正文关=停扫描）。
+            FilterGroup("分区") {
+                val sectionChips = ArrayList<@Composable () -> Unit>()
+                listOf(
+                    SearchFilter.SECTION_BOOK to "书",
+                    SearchFilter.SECTION_NOTE to "笔记",
+                    SearchFilter.SECTION_CHAPTER to "章节",
+                    SearchFilter.SECTION_BODY to "正文",
+                ).forEach { (id, label) ->
+                    val chip: @Composable () -> Unit = {
+                        GlassPillChip(
+                            label = label,
+                            selected = id in filter.sections,
+                            onClick = {
+                                val next = if (id in filter.sections) {
+                                    filter.sections - id
+                                } else {
+                                    filter.sections + id
+                                }
+                                onDraft(filter.copy(sections = next))
+                            },
+                            backdrop = backdrop,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    sectionChips.add(chip)
+                }
+                ChipGridTwo(sectionChips, panelColumns)
+            }
+
             val facets = state.facets
             if (facets != null) {
                 FilterGroup("类型") {

@@ -77,6 +77,25 @@ object LibraryGridScroll {
 }
 
 /**
+ * 书架「列表样式」一级页（书夹/系列/平铺三视图联动）的滚动位置（进程级单例），
+ * 与 [LibraryGridScroll] 同范式：离开书架（列表样式活跃时）落值，进书架首帧直接
+ * 构造 LazyListState 恢复。与网格状态互不覆盖——网格/列表各自记住自己的位置，
+ * 样式切换原位恢复。
+ * [active] = 离开时列表样式是否活跃；[viewMode]/[typeFilter] = 离开时的视图 × 分类
+ * 组合（列表态 map 的键，9 组合各持一份）。
+ * 列表行定高：跨方向恢复 index 直接有效、offset 归零即可；平铺列表的书行开书，
+ * 跨方向锚点校准由恢复 effect 按 anchorBookId 重算（与网格同思路）。
+ */
+object LibraryShelfListScroll {
+    var active: Boolean = false
+    var viewMode: String? = null
+    var typeFilter: String? = null
+    var index: Int = 0
+    var offset: Int = 0
+    var landscape: Boolean? = null
+}
+
+/**
  * 书架二级页（书夹 / 系列 / 智能书夹）的滚动位置（进程级单例）。
  * 与 LibraryGridScroll 同范式：进阅读器时落值、返回首帧直接构造 LazyGridState 恢复。
  * 同一时刻只会有一个二级页存活，所以单槽位即可；[key] 用于确认「恢复的还是同一个

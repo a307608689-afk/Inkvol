@@ -25,7 +25,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -51,6 +50,7 @@ import com.inkvol.app.data.import.SingleFileImporter
 import com.inkvol.app.data.model.LibraryRecord
 import com.inkvol.app.data.model.TrashBook
 import com.inkvol.app.data.repository.LibraryRepository
+import com.inkvol.app.ui.components.InkvolSwitch
 import com.inkvol.app.ui.components.glass.GlassDimens
 import com.inkvol.app.ui.components.glass.LocalGlassChrome
 import com.inkvol.app.ui.theme.InkvolRadius
@@ -92,6 +92,9 @@ fun LibraryManagerScreen(
     val duplicatePageReports by repository.duplicatePageReports.collectAsStateWithLifecycle()
     var tab by remember { mutableStateOf(initialTabToTab(initialTab)) }
     var removeTarget by remember { mutableStateOf<LibraryRecord?>(null) }
+    // 回收站：单本彻底删除 / 清空（原先只有「恢复」，永久删除只能等 30 天到期自动清）
+    var purgeTarget by remember { mutableStateOf<TrashBook?>(null) }
+    var clearTrashConfirm by remember { mutableStateOf(false) }
     val notice by repository.notice.collectAsStateWithLifecycle()
     LaunchedEffect(notice) {
         if (notice != null) {
@@ -170,9 +173,30 @@ fun LibraryManagerScreen(
                         if (trash.isEmpty()) {
                             item { EmptyCard("回收站是空的", "从书架移除的书会保留 30 天") }
                         } else {
-                            item { EmptyCard("保留期 30 天", "到期后会在启动时自动清空") }
+                            item {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = "保留期 30 天，到期自动清空；彻底删除立即移除记录与源文件。",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    TextButton(onClick = { clearTrashConfirm = true }) {
+                                        Text(
+                                            text = "清空",
+                                            color = MaterialTheme.colorScheme.error,
+                                        )
+                                    }
+                                }
+                            }
                             items(trash, key = { it.book.id }) { entry ->
-                                TrashCard(entry, repository)
+                                TrashCard(
+                                    entry = entry,
+                                    onRestore = {
+                                        repository.restoreBooksFromTrash(listOf(entry.book.id))
+                                    },
+                                    onPurge = { purgeTarget = entry },
+                                )
                             }
                         }
                     }
@@ -241,6 +265,70 @@ fun LibraryManagerScreen(
                 },
             )
         }
+
+        purgeTarget?.let { entry ->
+            AlertDialog(
+                onDismissRequest = { purgeTarget = null },
+                title = { Text("彻底删除「${entry.book.title}」？") },
+                text = {
+                    Text(
+                        text = "将从书架与数据库永久移除，同时删除源文件" +
+                            "（单文件导入会删掉手机里选中的原文件；无写入权限时降级为仅移除记录）。" +
+                            "不可撤销。",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            repository.purgeTrash(listOf(entry.book.id), deleteFiles = true)
+                            purgeTarget = null
+                        },
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) {
+                        Text("彻底删除")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { purgeTarget = null }) {
+                        Text("取消")
+                    }
+                },
+            )
+        }
+
+        if (clearTrashConfirm) {
+            AlertDialog(
+                onDismissRequest = { clearTrashConfirm = false },
+                title = { Text("清空回收站？") },
+                text = {
+                    Text(
+                        text = "永久删除回收站内 ${trash.size} 本书，同时删除它们的源文件。不可撤销。",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            repository.purgeTrash(trash.map { it.book.id }, deleteFiles = true)
+                            clearTrashConfirm = false
+                        },
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) {
+                        Text("清空")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { clearTrashConfirm = false }) {
+                        Text("取消")
+                    }
+                },
+            )
+        }
     }
 }
 
@@ -285,7 +373,7 @@ private fun LibraryCard(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    Switch(
+                    InkvolSwitch(
                         checked = !library.hidden,
                         onCheckedChange = { visible ->
                             repository.setLibraryHidden(library.id, !visible)
@@ -324,7 +412,8 @@ private fun LibraryCard(
 @Composable
 private fun TrashCard(
     entry: TrashBook,
-    repository: LibraryRepository,
+    onRestore: () -> Unit,
+    onPurge: () -> Unit,
 ) {
     Surface(
         shape = InkvolRadius.card,
@@ -370,8 +459,18 @@ private fun TrashCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            Button(onClick = { repository.restoreBooksFromTrash(listOf(entry.book.id)) }) {
-                Text("恢复")
+            Column(horizontalAlignment = Alignment.End) {
+                Button(onClick = onRestore) {
+                    Text("恢复")
+                }
+                TextButton(
+                    onClick = onPurge,
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error,
+                    ),
+                ) {
+                    Text("彻底删除")
+                }
             }
         }
     }

@@ -3,7 +3,9 @@
 package com.inkvol.app.ui.novel
 
 import android.app.Activity
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.LruCache
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -22,15 +24,18 @@ import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -41,6 +46,7 @@ import androidx.compose.foundation.layout.calculateEndPadding
 import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.displayCutout
@@ -53,7 +59,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.statusBarsIgnoringVisibility
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -63,6 +69,7 @@ import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -92,17 +99,16 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -115,11 +121,16 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -164,6 +175,7 @@ import com.inkvol.app.data.model.NovelReadingPrefs
 import com.inkvol.app.data.repository.LibraryRepository
 import com.inkvol.app.data.settings.SettingsKeys
 import com.inkvol.app.data.settings.SettingsRepository
+import com.inkvol.app.ui.components.LibraryStatusBar
 import com.inkvol.app.ui.components.ReaderOpenRect
 import com.inkvol.app.ui.components.ReaderSurfaceAlive
 import com.inkvol.app.ui.theme.InkvolTheme
@@ -199,6 +211,143 @@ private val NOVEL_FLIP_SPEC: AnimationSpec<Float> = tween(160, easing = FastOutS
 /** 覆盖档专用：盖入语义比平移更重，稍长一点才有「纸张盖过来」的分量感。 */
 private val NOVEL_COVER_SPEC: AnimationSpec<Float> = tween(240, easing = FastOutSlowInEasing)
 
+/** 跨章过渡（快照层）：平移/覆盖档 —— 整章内容跨度，比章内一页动画略长。 */
+private val NOVEL_CHAPTER_FLIP_SPEC: AnimationSpec<Float> = tween(320, easing = FastOutSlowInEasing)
+
+/** 跨章过渡（快照层）：仿真档卷曲 —— 与库内 450ms 卷曲观感对齐但略快。 */
+private val NOVEL_CHAPTER_CURL_SPEC: AnimationSpec<Float> = tween(380, easing = FastOutSlowInEasing)
+
+/**
+ * M6-G 跨章过渡（方案 A：快照过渡层）。
+ *
+ * 章末翻页瞬间把当前整屏画到一张位图（View.draw 一次性软快照，平时零开销），
+ * 照旧切章；等新章排版并落位后，用快照按当前动画档退场（平移滑出 / 被覆盖 /
+ * 仿真卷走），新内容在下方实时渲染露出。抓图失败时不启用过渡，退化为瞬时切换。
+ *
+ * 这样跨章动画完全不碰分页/页号/锚定/选区链，失败自动降级。
+ */
+private class NovelChapterFlip(
+    /** true = 去下一章首页（向后翻）；false = 回上一章末页（向前翻回）。 */
+    val forward: Boolean,
+    /** 上下翻页模式：位移用纵向走向，cover/curl 回退为平移。 */
+    val vertical: Boolean,
+    /** 实际播放档位：instant / slide / cover / curl（vertical 时只会是 slide）。 */
+    val mode: String,
+    val snapshot: ImageBitmap,
+) {
+    var started = false
+    val progress = Animatable(0f)
+}
+
+/**
+ * 跨章仿真过渡：旧页快照按「纸张卷起」退场。
+ *
+ * 简化模型（垂直折痕 + 纸背带 + 折痕根部投影），0.38s 一闪而过：
+ * 观感与库内卷曲一致，但不追求条带级弧面细节（跨章只播一次，新内容已在下方实时渲染）。
+ */
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawChapterCurl(
+    snapshot: ImageBitmap,
+    progress: Float,
+    forward: Boolean,
+    paper: Color,
+) {
+    val w = size.width
+    val h = size.height
+    if (w <= 0f || h <= 0f) return
+    val t = progress.coerceIn(0f, 1f)
+    if (t <= 0.001f) {
+        drawImage(snapshot)
+        return
+    }
+    // 折痕位置：forward 从右缘推进到左缘；backward 从左缘推进到右缘。
+    val foldX = if (forward) w * (1f - t) else w * t
+    // 未翻起的静止部分照常显示内容
+    if (forward) {
+        if (foldX > 0f) {
+            clipRect(left = 0f, top = 0f, right = foldX, bottom = h) { drawImage(snapshot) }
+        }
+    } else {
+        if (foldX < w) {
+            clipRect(left = foldX, top = 0f, right = w, bottom = h) { drawImage(snapshot) }
+        }
+    }
+    // 卷起带（纸背）：宽度取翻起区的 72%，从折痕朝外
+    val flipped = if (forward) w - foldX else foldX
+    if (flipped <= 0.5f) return
+    val backW = (flipped * 0.72f).coerceAtMost(w)
+    val backLeft = if (forward) foldX - backW else foldX
+    val backRight = backLeft + backW
+    // 1) 折痕根部投影（落在静止页上）
+    val shadowW = (flipped * 0.22f + 6.dp.toPx()).coerceAtMost(w * 0.5f)
+    drawRect(
+        brush = if (forward) {
+            Brush.horizontalGradient(
+                colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.22f)),
+                startX = foldX - shadowW,
+                endX = foldX,
+            )
+        } else {
+            Brush.horizontalGradient(
+                colors = listOf(Color.Black.copy(alpha = 0.22f), Color.Transparent),
+                startX = foldX,
+                endX = foldX + shadowW,
+            )
+        },
+        topLeft = Offset(if (forward) foldX - shadowW else foldX, 0f),
+        size = Size(shadowW, h),
+    )
+    // 2) 纸背带本体
+    drawRect(
+        color = paper,
+        topLeft = Offset(backLeft, 0f),
+        size = Size(backW, h),
+    )
+    // 3) 弧面明暗：靠折痕亮、外缘暗（纸背不透光）
+    drawRect(
+        brush = if (forward) {
+            Brush.horizontalGradient(
+                colors = listOf(Color.Black.copy(alpha = 0.20f), Color.Transparent),
+                startX = backLeft,
+                endX = backRight,
+            )
+        } else {
+            Brush.horizontalGradient(
+                colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.20f)),
+                startX = backLeft,
+                endX = backRight,
+            )
+        },
+        topLeft = Offset(backLeft, 0f),
+        size = Size(backW, h),
+    )
+    // 4) 卷起带外缘投影（纸张离开静止页的浮起感）
+    val edgeX = if (forward) backLeft else backRight
+    val edgeShadowW = 10.dp.toPx()
+    drawRect(
+        brush = if (forward) {
+            Brush.horizontalGradient(
+                colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.28f)),
+                startX = edgeX - edgeShadowW,
+                endX = edgeX,
+            )
+        } else {
+            Brush.horizontalGradient(
+                colors = listOf(Color.Black.copy(alpha = 0.28f), Color.Transparent),
+                startX = edgeX,
+                endX = edgeX + edgeShadowW,
+            )
+        },
+        topLeft = Offset(if (forward) edgeX - edgeShadowW else edgeX, 0f),
+        size = Size(edgeShadowW, h),
+    )
+    // 5) 折痕高光（纸边受光）
+    drawRect(
+        color = Color.White.copy(alpha = 0.12f),
+        topLeft = Offset(foldX - 1f, 0f),
+        size = Size(2f, h),
+    )
+}
+
 internal fun novelTheme(id: String): NovelTheme = when (id) {
     SettingsKeys.NOVEL_THEME_SEPIA -> NovelTheme(
         background = Color(0xFFF7EFE1),
@@ -232,10 +381,14 @@ private fun chromeColor(theme: NovelTheme): Color =
 private fun panelColor(theme: NovelTheme): Color =
     if (theme.dark) Color(0xFF1E1E1E) else Color(0xFFFFFFFF)
 
-/** M6.3 优化：面板/菜单栏描边色——跟随软件全局主题色（App MaterialTheme 的 primary）。 */
+/**
+ * 面板/菜单栏描边色——跟随软件全局主题色（App MaterialTheme 的 primary）。
+ * alpha 0.45 在纸白/米黄上几乎看不出换色（用户 2026-11-25 反馈「阅读器颜色没跟着改」），
+ * 提到 0.55 让主题色在 1dp 描边上可辨；底色仍保持中性（对比度优先）。
+ */
 @Composable
 private fun novelOutline(theme: NovelTheme): Color =
-    MaterialTheme.colorScheme.primary.copy(alpha = 0.45f)
+    MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
 
 internal fun novelTextStyle(
     prefs: NovelReadingPrefs,
@@ -383,6 +536,20 @@ fun NovelReaderScreen(
     }
     var paginating by remember(bookId) { mutableStateOf(activeSession == null) }
 
+    // M6.4 插图预览：章内插图序列 + 打开位置（charStart 定位——同一张图章内可能被多次
+    // 引用，imagePath 不唯一）。previewCharStart >= 0 即预览层打开。
+    var previewCharStart by remember(bookId) { mutableIntStateOf(-1) }
+    var previewSaving by remember(bookId) { mutableStateOf(false) }
+    var previewSavedCharStart by remember(bookId) { mutableIntStateOf(-1) }
+    val chapterImages = remember(pagination) {
+        pagination.blocks.mapNotNull { block ->
+            block.imagePath?.let { NovelPreviewImage(it, block.charStart) }
+        }
+    }
+    // 手势协程持有首组 lambda：预览开关经 rememberUpdatedState 中转（根 tap/拦截层都在
+    // pointerInput 里，直接读 previewCharStart 会 stale）。
+    val previewOpenRef by rememberUpdatedState(previewCharStart >= 0)
+
     // M6.3-A 标注：当前章标注列表 + 选区 / 气泡 / 笔记面板状态。
     var annotations by remember(bookId) { mutableStateOf<List<AnnotationRecord>>(emptyList()) }
     var selection by remember(bookId) { mutableStateOf<NovelSelection?>(null) }
@@ -456,23 +623,80 @@ fun NovelReaderScreen(
             )
         }
     }
+    // 动态取色（Android 12+，全局档）：开启时透传给内层 InkvolTheme，阅读器强调色
+    // （描边/图标/进度条/选区手柄/命中）跟壁纸 primary，与主界面同源；关闭时回落主题色档。
+    // Android 11- 无动态分支，自动回落强调色（与顶层 InkvolTheme 的 SDK 门槛一致）。
+    var dynamicColorOn by remember { mutableStateOf(false) }
+    LaunchedEffect(bookId) {
+        dynamicColorOn = settingsRepository.booleanOf(
+            settingsRepository.snapshotPreferences(),
+            SettingsKeys.DYNAMIC_COLOR,
+            false,
+        )
+        settingsRepository.preferences.collect { snapshot ->
+            dynamicColorOn = settingsRepository.booleanOf(snapshot, SettingsKeys.DYNAMIC_COLOR, false)
+        }
+    }
     // M6-G 小说翻页动画全局档（独立键，独立于漫画）：无动画/平移/覆盖/仿真。
     // 读取与双页档同款：先快照同步读一次，再 flow 监听即时生效（设置页改动无需重进）。
-    var pageTransitionMode by remember { mutableStateOf(SettingsKeys.PAGE_TRANSITION_CURL) }
+    // 缺省档 = 平移（用户 2026-11-25 定档；已存过档位的老用户不受影响）。
+    var pageTransitionMode by remember { mutableStateOf(SettingsKeys.PAGE_TRANSITION_SLIDE) }
     LaunchedEffect(bookId) {
         pageTransitionMode = settingsRepository.stringOf(
             settingsRepository.snapshotPreferences(),
             SettingsKeys.NOVEL_PAGE_TRANSITION,
-            SettingsKeys.PAGE_TRANSITION_CURL,
+            SettingsKeys.PAGE_TRANSITION_SLIDE,
         )
         settingsRepository.preferences.collect { snapshot ->
             pageTransitionMode = settingsRepository.stringOf(
                 snapshot,
                 SettingsKeys.NOVEL_PAGE_TRANSITION,
-                SettingsKeys.PAGE_TRANSITION_CURL,
+                SettingsKeys.PAGE_TRANSITION_SLIDE,
             )
         }
     }
+    // 深色跟随：App 生效深色态（APP_THEME 档 + 系统夜间模式）与跟随开关（独立全局键，缺省开）。
+    // 读取与双页档同款：先快照同步读一次，再 flow 监听即时生效。
+    val systemDark = isSystemInDarkTheme()
+    var appThemeMode by remember { mutableStateOf("") }
+    LaunchedEffect(bookId) {
+        appThemeMode = settingsRepository.stringOf(
+            settingsRepository.snapshotPreferences(),
+            SettingsKeys.APP_THEME,
+            SettingsKeys.THEME_SYSTEM,
+        )
+        settingsRepository.preferences.collect { snapshot ->
+            appThemeMode = settingsRepository.stringOf(
+                snapshot,
+                SettingsKeys.APP_THEME,
+                SettingsKeys.THEME_SYSTEM,
+            )
+        }
+    }
+    // "" = 快照未加载：首帧不参与跟随（用 prefs.theme 原样渲染，避免错误跟随闪变）。
+    val appDark = when {
+        appThemeMode.isEmpty() -> false
+        appThemeMode == SettingsKeys.THEME_LIGHT -> false
+        appThemeMode == SettingsKeys.THEME_DARK -> true
+        else -> systemDark
+    }
+    var darkFollow by remember { mutableStateOf(true) }
+    LaunchedEffect(bookId) {
+        darkFollow = settingsRepository.booleanOf(
+            settingsRepository.snapshotPreferences(),
+            SettingsKeys.NOVEL_DARK_FOLLOW,
+            true,
+        )
+        settingsRepository.preferences.collect { snapshot ->
+            darkFollow = settingsRepository.booleanOf(snapshot, SettingsKeys.NOVEL_DARK_FOLLOW, true)
+        }
+    }
+    // 派生不落盘：跟随开启且 App 深色 → 背景强制墨黑；prefs.theme（含 per-book 单独记忆）不被污染，
+    // 回浅色自动恢复手动档。面板选浅色档会走 onPickTheme 关闭跟随（用户接管）。
+    val darkFollowActive = darkFollow && appDark
+    val effectiveThemeId = if (darkFollowActive) SettingsKeys.NOVEL_THEME_DARK else prefs.theme
+    val theme = novelTheme(effectiveThemeId)
+    val dark = theme.dark
     // 当前阅读位置锚（字符偏移）：切档/旋转重排后按它重锚，进度保存时同步更新。
     var anchorOffset by remember(bookId) { mutableIntStateOf(-1) }
     var anchoredOnce by remember(bookId) { mutableStateOf(false) }
@@ -480,9 +704,6 @@ fun NovelReaderScreen(
     // 挖孔兜底记忆：设备曾上报过的最大挖孔 inset（dp）。
     // 部分平板横屏 displayCutout 全 0（挖孔被并入状态栏语义），用该值对左右补偿。
     var rememberedCutoutDp by remember { mutableStateOf(0f) }
-
-    val theme = novelTheme(prefs.theme)
-    val dark = theme.dark
     val fontList = listOf(
         "system" to "系统默认",
         "serif" to "衬线",
@@ -518,14 +739,44 @@ fun NovelReaderScreen(
         val controller = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
         controller?.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        // 阅读期间不再 show，避免状态栏随菜单栏闪回。
+        // 进场先整组隐藏；之后状态栏显隐由下方「菜单栏联动」效果单点接管。
         view.post { controller?.hide(WindowInsetsCompat.Type.systemBars()) }
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onDispose {
             ReaderSurfaceAlive.exit()
+            // 插画位图缓存为会话级：离开阅读器即释放（跨书不保留）。
+            NovelImageCache.clear()
             // 系统栏恢复交给宿主 closeReaderOpen 统一处理，避免双重 show 造成跳动。
             controller?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    // 菜单栏 ↔ 状态栏联动（沉浸）：上下菜单栏出现即唤出状态栏（透明底、图标色随 dark），
+    // 菜单栏消失则连同导航栏一起收回，回到全沉浸。
+    // 驱动信号用 chromeVisible（不含面板排除）：打开目录/排版/注释/搜索/书签等底部面板时
+    // 状态栏保持出现，避免从菜单栏进面板时「灭一下再亮回来」。
+    // 只 show 状态栏、不 show 导航栏——导航栏 inset 是底部留白的输入，唤出会触发重新分页。
+    // openActive 并入 key：深链/重建进场时 chromeVisible 初值可能首帧即 true，
+    // 开书动画结束那一刻重申一次当前状态（防转场把状态栏压掉）。
+    LaunchedEffect(chromeVisible, openActive) {
+        val window = (context as? Activity)?.window
+        val controller = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
+            ?: return@LaunchedEffect
+        runCatching {
+            if (chromeVisible) {
+                // 先复位为非瞬态再 show：TRANSIENT 下的 show 会被系统当作临时唤出，
+                // 状态栏几秒后自动缩回（与书架玻璃头同源的坑）。
+                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+                controller.show(WindowInsetsCompat.Type.statusBars())
+                controller.hide(WindowInsetsCompat.Type.navigationBars())
+            } else {
+                controller.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                // 整组隐藏：显示态切到 DEFAULT 后用户划出的导航栏不会自己缩回，
+                // 只藏状态栏会让手势条赖在屏幕上并改掉底部留白。
+                controller.hide(WindowInsetsCompat.Type.systemBars())
+            }
         }
     }
 
@@ -637,7 +888,25 @@ fun NovelReaderScreen(
         }
     }
 
-    InkvolTheme(darkTheme = dark) {
+    // 深色跟随首次提示：进入深色（手动切换或跟随系统均算）且跟随开启时，首次打开阅读器
+    // 弹一次居中卡提示；落盘标记后任何情况下不再出现。快照未加载/跟随未激活不弹。
+    var darkFollowHintOpen by remember(bookId) { mutableStateOf(false) }
+    LaunchedEffect(bookId, prefsLoaded, appThemeMode.isEmpty(), darkFollowActive) {
+        if (!prefsLoaded || appThemeMode.isEmpty() || !darkFollowActive) return@LaunchedEffect
+        val shown = withContext(Dispatchers.IO) {
+            settingsRepository.booleanOf(
+                settingsRepository.snapshotPreferences(),
+                SettingsKeys.NOVEL_DARK_FOLLOW_HINT,
+                false,
+            )
+        }
+        if (!shown) {
+            darkFollowHintOpen = true
+            settingsRepository.putBoolean(SettingsKeys.NOVEL_DARK_FOLLOW_HINT, true)
+        }
+    }
+
+    InkvolTheme(darkTheme = dark, dynamicColor = dynamicColorOn) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize().background(theme.background)) {
             val availableWidth = maxWidth
             val availableHeight = maxHeight
@@ -654,8 +923,9 @@ fun NovelReaderScreen(
                 .coerceAtLeast(navBarsPad.calculateBottomPadding())
             val rawMaxDp = rawStartDp.coerceAtLeast(rawEndDp).coerceAtLeast(rawTopDp).coerceAtLeast(rawBottomDp)
             val isLandscape = maxWidth > maxHeight
-            // 小说双页：横向翻页 + (始终 or 横屏)；上下翻页模式不生效（同漫画条漫不双页）。
+            // 小说双页：横向翻页 + (始终 or 横屏)；上下翻页/纵向连续不生效（同漫画条漫不双页）。
             val useDouble = prefs.pagingMode != SettingsKeys.NOVEL_PAGE_VERTICAL &&
+                prefs.pagingMode != SettingsKeys.NOVEL_PAGE_SCROLL &&
                 doublePageMode != SettingsKeys.DOUBLE_PAGE_OFF &&
                 (doublePageMode == SettingsKeys.DOUBLE_PAGE_ALWAYS || isLandscape)
             SideEffect {
@@ -746,6 +1016,8 @@ fun NovelReaderScreen(
                             heightPx = heightPx,
                             density = density,
                             textMeasurer = textMeasurer,
+                            // 插图比例：marker 是相对路径，量尺寸必须挂 filesDir 根。
+                            imageBaseDir = context.filesDir,
                             // 双页快速路径预排 2 页，保证首个 spread 两半齐整再交接。
                             maxPages = if (useDouble) 2 else 1,
                         )
@@ -765,6 +1037,7 @@ fun NovelReaderScreen(
                         heightPx = heightPx,
                         density = density,
                         textMeasurer = textMeasurer,
+                        imageBaseDir = context.filesDir,
                     )
                 }
                 pagination = full
@@ -804,53 +1077,41 @@ fun NovelReaderScreen(
                 sessionPages++
             }
 
-            // M6.3 优化：滑动跨章——末页继续向左滑（上下翻页为向下滑）触发下一章；
-            // 首页向反方向滑触发上一章（落上一章末页）。阈值 = 屏宽/3 累计 overscroll。
-            var crossChapterAdvance by remember { mutableFloatStateOf(0f) }
-            val crossChapterConnection = remember(pages.size, chapterIndex, chapters.size) {
-                object : androidx.compose.ui.input.nestedscroll.NestedScrollConnection {
-                    override fun onPostScroll(
-                        consumed: Offset,
-                        available: Offset,
-                        source: androidx.compose.ui.input.nestedscroll.NestedScrollSource,
-                    ): Offset {
-                        // 划线 / 气泡 / 面板激活期间不跨章
-                        if (selection != null || bubble != null || quickPanel ||
-                            chapterListOpen || notePanel != null
-                        ) {
-                            crossChapterAdvance = 0f
-                            return Offset.Zero
-                        }
-                        val threshold = with(density) { 240.dp.toPx() }
-                        val atLast = pagerState.currentPage >= pages.lastIndex
-                        val atFirst = pagerState.currentPage <= 0
-                        val vertical = prefs.pagingMode == SettingsKeys.NOVEL_PAGE_VERTICAL
-                        val avail = if (vertical) available.y else available.x
-                        val canNext = chapterIndex < chapters.lastIndex
-                        val canPrev = chapterIndex > 0
-                        if (avail < 0 && atLast && canNext) {
-                            crossChapterAdvance += -avail
-                            if (crossChapterAdvance > threshold) {
-                                crossChapterAdvance = 0f
-                                pendingRestoreOffset = 0
-                                pendingJumpLastPage = false
-                                chapterIndex += 1
-                            }
-                        } else if (avail > 0 && atFirst && canPrev) {
-                            crossChapterAdvance += avail
-                            if (crossChapterAdvance > threshold) {
-                                crossChapterAdvance = 0f
-                                pendingRestoreOffset = Int.MAX_VALUE
-                                pendingJumpLastPage = true
-                                chapterIndex -= 1
-                            }
-                        } else {
-                            crossChapterAdvance = 0f
-                        }
-                        return Offset.Zero
-                    }
-                }
+            // M6-G 跨章过渡（方案 A：快照过渡层）：状态 + 统一入口。
+            // 非空期间旧页快照冻结在屏上、新章内容整体位移（见页面容器的 graphicsLayer），
+            // 新章排版并落位后播放退场动画，结束后清空。声明位置必须在根层滑动手势
+            // 与各跨章调用点之前（同作用域局部变量只能先用后声明）。
+            var chapterFlip by remember(bookId) { mutableStateOf<NovelChapterFlip?>(null) }
+            // 切章前调用：抓图 = 当前整屏一次性软快照（View.draw），抓不到就不加过渡，
+            // 退化为原来的瞬时切换（跳转类：目录/搜索/恢复进度不经过这里）。
+            val beginChapterFlip: (Boolean) -> Unit = label@{ forward ->
+                if (chapterFlip != null) return@label
+                val mode = pageTransitionMode
+                if (mode == SettingsKeys.PAGE_TRANSITION_INSTANT) return@label
+                // M6.5 纵向连续档同上下翻页：跨章过渡走竖向平移（与滚动方向一致）。
+                val vertical = prefs.pagingMode != SettingsKeys.NOVEL_PAGE_HORIZONTAL
+                // 上下翻页没有横向卷曲/盖入语义 → 回退平移（与 flipTo 的档位回退一致）
+                val effective = if (vertical) SettingsKeys.PAGE_TRANSITION_SLIDE else mode
+                val snapshot = runCatching {
+                    val w = view.width
+                    val h = view.height
+                    if (w <= 0 || h <= 0) return@runCatching null
+                    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    view.draw(android.graphics.Canvas(bmp))
+                    bmp.asImageBitmap()
+                }.getOrNull() ?: return@label
+                chapterFlip = NovelChapterFlip(
+                    forward = forward,
+                    vertical = vertical,
+                    mode = effective,
+                    snapshot = snapshot,
+                )
             }
+            // 手势协程持有首组 lambda：经 rememberUpdatedState 中转，切档/换章后仍取最新
+            val currentBeginChapterFlip: (Boolean) -> Unit by rememberUpdatedState(beginChapterFlip)
+            // 跨章滑动改由根层「边界越界滑动」手势统一识别（见下方 pointerInput）：
+            // 旧的 pager overscroll 累计（240dp 阈值、松手不结算）已移除——阈值远大于
+            // 人手一次滑动距离，且末页拖拽 pager 不动无任何反馈，实际手感就是"滑不动"。
 
             // M6.3 跨页续拖：选区为章节绝对 char，翻页/重排不再清空（渲染按交集天然支持跨页）；
             // 仅章 / 排版 / 字体 / 双页切换才清空。dragging/dragSide 供气泡归属与隐藏。
@@ -870,6 +1131,30 @@ fun NovelReaderScreen(
             val pagesRef by rememberUpdatedState(pages)
             val spreadsRef by rememberUpdatedState(spreads)
             val useDoubleRef by rememberUpdatedState(useDouble)
+            // M6.5 纵向连续（scroll 档）：单章信息流式连续滚动容器（LazyColumn）。
+            // scrollListState 为本档页位置真源；跳转类（settlePage）按它落位。
+            // 列表 item 布局 = [顶部哨兵(上一章)?] + 各页 + [底部哨兵(下一章)?]，
+            // 页号 ↔ item 序号换算经顶部哨兵偏移完成。
+            val pagingScroll = prefs.pagingMode == SettingsKeys.NOVEL_PAGE_SCROLL
+            val scrollFocusRequester = remember { FocusRequester() }
+            val scrollListState = rememberLazyListState(
+                initialFirstVisibleItemIndex =
+                    initialPageIndex + if (chapterIndex > 0) 1 else 0,
+            )
+            val pagingScrollRef by rememberUpdatedState(pagingScroll)
+            val scrollTopSentinelRef by rememberUpdatedState(chapterIndex > 0)
+            val scrollListIndexOf: (Int) -> Int = { pageIdx ->
+                pageIdx + if (scrollTopSentinelRef) 1 else 0
+            }
+            // 当前页 = 首可见 item 减顶部哨兵偏移（页粒度，与进度锚定 charStart 同源）。
+            val scrollCurrentPageIndexOf: () -> Int = {
+                (scrollListState.firstVisibleItemIndex - if (scrollTopSentinelRef) 1 else 0)
+                    .coerceIn(0, (pagesRef.size - 1).coerceAtLeast(0))
+            }
+            // M6.5 scroll 档页数计数：pager 静止（currentPage 不变），由滚动页号驱动。
+            LaunchedEffect(scrollListState.firstVisibleItemIndex) {
+                if (pagingScrollRef) sessionPages++
+            }
             // 当前页快照（返回书架缩略图 + 拖拽跟手 front 复用）：翻页后后台重渲染，
             // snapshotChapter/Page 标记快照对应的章/页用于新鲜度校验。
             var currentSnapshot by remember(bookId) { mutableStateOf(activeSession?.firstPageBitmap) }
@@ -881,7 +1166,8 @@ fun NovelReaderScreen(
             val curlState = rememberPageCurlState()
             val curlActiveNow by rememberUpdatedState(
                 pageTransitionMode == SettingsKeys.PAGE_TRANSITION_CURL &&
-                    prefs.pagingMode != SettingsKeys.NOVEL_PAGE_VERTICAL,
+                    prefs.pagingMode != SettingsKeys.NOVEL_PAGE_VERTICAL &&
+                    prefs.pagingMode != SettingsKeys.NOVEL_PAGE_SCROLL,
             )
             // M6-G curl 档镜像：库容器为页位置真源，current 变化（翻页完成/拖拽跨页）时同步
             // 闲置 pagerState → 下游进度保存/页码/锚定/统计消费点继续读 pagerState 零改动。
@@ -893,10 +1179,11 @@ fun NovelReaderScreen(
             // M6-G 跳转类统一落位入口：curl 档写 curlState（镜像 effect 回同步 pagerState），
             // 其它档直接写 pagerState。目录/搜索/恢复进度/重锚/pendingFlip 全部经此。
             val settlePage: suspend (Int) -> Unit = { page ->
-                if (curlActiveNow) {
-                    curlState.snapTo(page)
-                } else {
-                    pagerState.scrollToPage(page)
+                when {
+                    // M6.5 scroll 档：页号 → 列表 item 序号（含顶部哨兵偏移）落位。
+                    pagingScrollRef -> scrollListState.scrollToItem(scrollListIndexOf(page))
+                    curlActiveNow -> curlState.snapTo(page)
+                    else -> pagerState.scrollToPage(page)
                 }
             }
             // M6.3 跨页续选：拦截层（restricted 手势上下文）不能直接调 suspend 的
@@ -930,9 +1217,45 @@ fun NovelReaderScreen(
                     if (interaction is DragInteraction.Start) flipTarget = -1
                 }
             }
-            // 切换翻页动画档丢弃未完成累加
+            // 切换翻页动画档丢弃未完成累加 + 撤掉跨章过渡
             LaunchedEffect(pageTransitionMode) {
                 flipTarget = -1
+                chapterFlip = null
+            }
+            // M6.5 切换方向档（scroll ↔ pager）：两套容器的页号体系互不相通，
+            // 按当前进度锚点重落位（重锚 effect 统一消化 pendingRestoreOffset）。
+            LaunchedEffect(prefs.pagingMode) {
+                if (anchoredOnce && anchorOffset >= 0) {
+                    pendingRestoreOffset = anchorOffset
+                    pendingJumpLastPage = false
+                }
+            }
+            // 就绪等待 + 播放：新章排版完成且已落位（restore / 末页意图被锚定 effect 消费）后
+            // 才开始退场动画；3s 兜底直接撤掉快照，避免加载异常时屏幕被永久冻结。
+            LaunchedEffect(chapterFlip) {
+                val anim = chapterFlip ?: return@LaunchedEffect
+                val ready = withTimeoutOrNull(3000) {
+                    snapshotFlow {
+                        !paginating && pagination.pages.isNotEmpty() &&
+                            pendingRestoreOffset < 0 && !pendingJumpLastPage
+                    }.first { it }
+                }
+                if (ready == null) {
+                    if (chapterFlip === anim) chapterFlip = null
+                    return@LaunchedEffect
+                }
+                anim.started = true
+                // 让新章内容先真实绘制一帧再揭开快照，避免露出空白
+                withFrameNanos { }
+                anim.progress.animateTo(
+                    targetValue = 1f,
+                    animationSpec = if (anim.mode == SettingsKeys.PAGE_TRANSITION_CURL) {
+                        NOVEL_CHAPTER_CURL_SPEC
+                    } else {
+                        NOVEL_CHAPTER_FLIP_SPEC
+                    },
+                )
+                if (chapterFlip === anim) chapterFlip = null
             }
             // M6-G 点击翻页统一入口：按动画档分流。跳转类（jumpTo/恢复进度/目录/搜索/
             // 跨页续选 pendingFlip）与跨章不经过这里，保持瞬时。本 lambda 每次重组重建、
@@ -998,6 +1321,8 @@ fun NovelReaderScreen(
             // saveable 重建，直接捕获组合态会 stale。
             val curlCustomTapImpl by rememberUpdatedState(
                 tap@ { size: IntSize, offset: Offset ->
+                    // 插图预览打开：库 tap 一律消费但不动作（预览层只处理自己的关闭）
+                    if (previewOpenRef) return@tap true
                     // M6-G 长按刚建选区：库 tapGesture 抬手判定点击会走到这里——消费但不收起，
                     // 让长按建立的选区/气泡保留（否则第一分支会立刻收掉 → 长按表象失效）。
                     if (longPressFired) {
@@ -1018,8 +1343,9 @@ fun NovelReaderScreen(
                                 scope.launch {
                                     when {
                                         cur > 0 -> currentFlipTo(false)
-                                        // 首页点上一页 → 上一章末页（跨章，瞬时）
+                                        // 首页点上一页 → 上一章末页（跨章：快照过渡层）
                                         chapterIndex > 0 -> {
+                                            beginChapterFlip(false)
                                             pendingJumpLastPage = true
                                             chapterIndex -= 1
                                         }
@@ -1032,8 +1358,9 @@ fun NovelReaderScreen(
                                     when {
                                         // 章内 → 翻页动画档；双页末页判定用 spreads.lastIndex
                                         cur < lastIdx -> currentFlipTo(true)
-                                        // 末页点下一页 → 下一章首页（跨章，瞬时）
+                                        // 末页点下一页 → 下一章首页（跨章：快照过渡层）
                                         chapterIndex < chapters.lastIndex -> {
+                                            beginChapterFlip(true)
                                             pendingJumpLastPage = false
                                             pendingRestoreOffset = 0
                                             chapterIndex += 1
@@ -1070,10 +1397,10 @@ fun NovelReaderScreen(
             )
             // M6-G 选区/气泡激活时禁用库拖拽（config 字段为可变状态，重组幂等赋值）：
             // 防卷曲手势抢断划词拖动手柄。禁用走 vendor 静默回弹（不取消手势协程）。
-            curlConfig.dragForwardEnabled = curlActiveNow &&
-                selection == null && bubble == null
-            curlConfig.dragBackwardEnabled = curlActiveNow &&
-                selection == null && bubble == null
+            val curlDragEnabled = curlActiveNow &&
+                selection == null && bubble == null && !previewOpenRef
+            curlConfig.dragForwardEnabled = curlDragEnabled
+            curlConfig.dragBackwardEnabled = curlDragEnabled
             // M6.3-E 跨章触发：握把翻页目标超本章时由 flipPage 调用。
             // 首跳冻结起点章段（pin 章），连续跨章追加途经整章段；不反向跨。
             val beginOrExtendCrossDrag: (Boolean) -> Unit = label@{ end ->
@@ -1162,10 +1489,18 @@ fun NovelReaderScreen(
             // pages/spreads/useDouble 会在 remember(bookId) 内 stale（首次组合
             // 时章文本未加载，pages 为空 → keys 永远为空 → 抓取恒失败）。
             val visiblePageKeysFn: () -> List<Int> = {
-                if (useDoubleRef) {
-                    spreadsRef.getOrNull(pagerState.currentPage)?.map { it.charStart }.orEmpty()
-                } else {
-                    listOfNotNull(pagesRef.getOrNull(pagerState.currentPage)?.charStart)
+                when {
+                    // M6.5 scroll 档：按 LazyList 实际可见 item 派生（哨兵行自动 miss）。
+                    // 随滚动实时更新——手柄抓取判定/convertAt 白名单在连续滚动中保持正确。
+                    pagingScrollRef -> scrollListState.layoutInfo.visibleItemsInfo.mapNotNull { info ->
+                        pagesRef.getOrNull(info.index - if (scrollTopSentinelRef) 1 else 0)?.charStart
+                    }
+                    useDoubleRef -> {
+                        spreadsRef.getOrNull(pagerState.currentPage)?.map { it.charStart }.orEmpty()
+                    }
+                    else -> {
+                        listOfNotNull(pagesRef.getOrNull(pagerState.currentPage)?.charStart)
+                    }
                 }
             }
             val pageCallbacks = remember(bookId) {
@@ -1359,7 +1694,9 @@ fun NovelReaderScreen(
                     // M6.3 跨页续拖：convertAt 按目标绝对 char 定位所在页，
                     // 调用该页注册的换算函数，返回拖动点对应的章节内绝对 char。
                     dragging = { dragging },
-                    currentPageIndex = { pagerState.currentPage },
+                    currentPageIndex = {
+                        if (pagingScrollRef) scrollCurrentPageIndexOf() else pagerState.currentPage
+                    },
                     // M6.3 翻页请求走信号：pendingFlip 由 LaunchedEffect 执行 scrollToPage。
                     // M6.3-E 翻页目标超本章 → 跨章延伸（边界检查在 beginOrExtend 内）。
                     flipPage = { target ->
@@ -1427,6 +1764,7 @@ fun NovelReaderScreen(
             LaunchedEffect(
                 pages,
                 pagerState.currentPage,
+                scrollListState.firstVisibleItemIndex,
                 chapterIndex,
                 prefs,
                 fontFamily,
@@ -1438,7 +1776,8 @@ fun NovelReaderScreen(
                 bottomPadDp,
                 useDouble,
             ) {
-                val targetPage = pagerState.currentPage
+                // M6.5 scroll 档页号从 LazyList 派生；pager 档从 pagerState。
+                val targetPage = if (pagingScrollRef) scrollCurrentPageIndexOf() else pagerState.currentPage
                 val bitmap = withContext(Dispatchers.Default) {
                     if (useDouble) {
                         val spread = spreads.getOrNull(targetPage) ?: return@withContext null
@@ -1477,7 +1816,9 @@ fun NovelReaderScreen(
                         )
                     }
                 } ?: return@LaunchedEffect
-                if (pagerState.currentPage == targetPage) {
+                if ((if (pagingScrollRef) scrollCurrentPageIndexOf() else pagerState.currentPage) ==
+                    targetPage
+                ) {
                     currentSnapshot = bitmap
                     snapshotChapter = chapterIndex
                     snapshotPage = targetPage
@@ -1549,11 +1890,35 @@ fun NovelReaderScreen(
             }
 
             LaunchedEffect(pagerState.currentPage, pages, spreads, useDouble, chapterIndex) {
+                // M6.5 scroll 档 pagerState 不动（页号失真），进度由下方滚动 effect 保存。
+                if (pagingScrollRef) return@LaunchedEffect
                 val currentCharStart = if (useDouble) {
                     spreads.getOrNull(pagerState.currentPage)?.firstOrNull()?.charStart
                 } else {
                     pages.getOrNull(pagerState.currentPage)?.charStart
                 } ?: return@LaunchedEffect
+                val chapter = chapters.getOrNull(chapterIndex) ?: return@LaunchedEffect
+                val localRatio = if (chapter.charCount > 0) {
+                    (currentCharStart.toFloat() / chapter.charCount).coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
+                val overall = ((chapterIndex + localRatio) / chapters.size.coerceAtLeast(1))
+                    .coerceIn(0f, 0.999f)
+                    .toDouble()
+                repository.saveNovelProgress(
+                    bookId = bookId,
+                    chapterIndex = chapterIndex,
+                    charOffset = currentCharStart,
+                    overallPercent = overall,
+                )
+                anchorOffset = currentCharStart
+            }
+            // M6.5 scroll 档进度保存：当前页 = 视口首可见页（页粒度，charStart 锚定）。
+            LaunchedEffect(scrollListState.firstVisibleItemIndex, pages, chapterIndex) {
+                if (!pagingScrollRef) return@LaunchedEffect
+                val pageIdx = scrollCurrentPageIndexOf()
+                val currentCharStart = pages.getOrNull(pageIdx)?.charStart ?: return@LaunchedEffect
                 val chapter = chapters.getOrNull(chapterIndex) ?: return@LaunchedEffect
                 val localRatio = if (chapter.charCount > 0) {
                     (currentCharStart.toFloat() / chapter.charCount).coerceIn(0f, 1f)
@@ -1589,7 +1954,8 @@ fun NovelReaderScreen(
 
             val requestBack: () -> Unit = {
                 val snapshot = currentSnapshot
-                if (snapshot != null && snapshotChapter == chapterIndex && snapshotPage == pagerState.currentPage) {
+                val backPage = if (pagingScrollRef) scrollCurrentPageIndexOf() else pagerState.currentPage
+                if (snapshot != null && snapshotChapter == chapterIndex && snapshotPage == backPage) {
                     onContentSnapshot(snapshot)
                 }
                 onBack()
@@ -1630,19 +1996,106 @@ fun NovelReaderScreen(
                 requestBack()
             }
 
+            // M6.4 插图预览：点击正文插图 → 全屏预览（章内左右滑切换）。
+            // 排版中/跨章过渡中不允许打开（此时点击区域与内容不匹配）。
+            val openImagePreview: (String, Int) -> Unit = { _, charStart ->
+                if (!paginating && chapterFlip == null) {
+                    previewCharStart = charStart
+                    previewSavedCharStart = -1
+                    chromeVisible = false
+                    selection = null
+                    bubble = null
+                    crossDrag = null
+                    pendingCrossArrival = false
+                }
+            }
+            val toastShort: (String) -> Unit = { msg ->
+                android.widget.Toast.makeText(
+                    context,
+                    msg,
+                    android.widget.Toast.LENGTH_SHORT,
+                ).show()
+            }
+            // 保存回落通道：API 26–28 与 SVG 走系统文件选择器（零存储权限）。
+            var pendingSafSave by remember { mutableStateOf<Pair<File, String>?>(null) }
+            val safSaveLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.CreateDocument("image/*"),
+            ) { uri ->
+                val task = pendingSafSave
+                pendingSafSave = null
+                if (uri == null || task == null) {
+                    previewSaving = false
+                    return@rememberLauncherForActivityResult
+                }
+                previewSaving = true
+                scope.launch {
+                    val ok = NovelImageSaver.writeToUri(context, task.first, uri)
+                    previewSaving = false
+                    if (ok) {
+                        previewSavedCharStart = previewCharStart
+                        toastShort("已保存")
+                    } else {
+                        toastShort("保存失败")
+                    }
+                }
+            }
+            val savePreviewImage: (NovelPreviewImage) -> Unit = save@{ item ->
+                if (previewSaving) return@save
+                val src = File(context.filesDir, item.relPath)
+                if (!src.exists()) {
+                    toastShort("图片文件不存在")
+                    return@save
+                }
+                val idx = chapterImages
+                    .indexOfFirst { it.charStart == item.charStart }
+                    .coerceAtLeast(0)
+                val name = NovelImageSaver.defaultFileName(
+                    bookTitle = book?.title ?: "插图",
+                    chapterIndex = chapterIndex,
+                    indexInChapter = idx,
+                    relPath = item.relPath,
+                )
+                val mime = NovelImageSaver.mimeOf(item.relPath)
+                previewSaving = true
+                scope.launch {
+                    when (val result = NovelImageSaver.save(context, src, name, mime)) {
+                        is NovelImageSaveResult.Saved -> {
+                            previewSaving = false
+                            previewSavedCharStart = item.charStart
+                            toastShort("已保存到相册（Pictures/Inkvol）")
+                        }
+
+                        is NovelImageSaveResult.NeedSaf -> {
+                            pendingSafSave = src to name
+                            previewSaving = false
+                            runCatching { safSaveLauncher.launch(name) }
+                                .onFailure {
+                                    pendingSafSave = null
+                                    toastShort("保存失败")
+                                }
+                        }
+
+                        NovelImageSaveResult.Failed -> {
+                            previewSaving = false
+                            toastShort("保存失败")
+                        }
+                    }
+                }
+            }
+
             // M6-G 覆盖档滑动翻页开关：滑动只触发翻页动画（与单击同一条 flipTo 路径），
-            // 不做跟手平移（覆盖档 pager 已禁用 userScrollEnabled）。选中/气泡/竖翻不启用。
+            // 不做跟手平移（覆盖档 pager 已禁用 userScrollEnabled）。选中/气泡/竖翻/预览不启用。
             val coverSwipeRef by rememberUpdatedState(
                 pageTransitionMode == SettingsKeys.PAGE_TRANSITION_COVER &&
                     prefs.pagingMode != SettingsKeys.NOVEL_PAGE_VERTICAL &&
-                    selection == null && bubble == null,
+                    prefs.pagingMode != SettingsKeys.NOVEL_PAGE_SCROLL &&
+                    selection == null && bubble == null && previewCharStart < 0,
             )
 
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(theme.background)
-                    .nestedScroll(crossChapterConnection)
                     .pointerInput(
                         pagerState.currentPage,
                         selection,
@@ -1653,6 +2106,8 @@ fun NovelReaderScreen(
                         useDouble,
                     ) {
                         detectTapGestures { offset ->
+                            // 插图预览打开时根层点击全部失效（预览层自己处理关闭）
+                            if (previewOpenRef) return@detectTapGestures
                             // M6-G curl 档：分区点击由 PageCurl 的 onCustomTap 独家处理
                             //（tap 手势已 vendor 去掉 down consume，本层会同时收到点击），
                             // 此处跳过防双触发；选区收起也在 onCustomTap 第一分支处理。
@@ -1667,13 +2122,35 @@ fun NovelReaderScreen(
                                 pendingCrossArrival = false
                                 return@detectTapGestures
                             }
+                            // M6.5 纵向连续：点击分区换纵轴——上/下 1/3 滚一页（页首对齐，
+                            // 与进度锚定同粒度），中间开合 chrome。chrome 打开时上下滚仍生效
+                            // （与 pager 档「chrome 开着也能翻页」同语义）。
+                            if (pagingScrollRef) {
+                                val pageCount = pagesRef.size
+                                val curPage = scrollCurrentPageIndexOf()
+                                when {
+                                    offset.y < size.height * 0.32f -> {
+                                        if (curPage > 0) scope.launch {
+                                            scrollListState.scrollToItem(scrollListIndexOf(curPage - 1))
+                                        }
+                                    }
+                                    offset.y > size.height * 0.68f -> {
+                                        if (curPage < pageCount - 1) scope.launch {
+                                            scrollListState.scrollToItem(scrollListIndexOf(curPage + 1))
+                                        }
+                                    }
+                                    else -> chromeVisible = !chromeVisible
+                                }
+                                return@detectTapGestures
+                            }
                             when {
                                 offset.x < size.width * 0.32f -> scope.launch {
                                     when {
                                         // 章内 → 翻页动画档（flipTo）
                                         pagerState.currentPage > 0 -> currentFlipTo(false)
-                                        // 首页点上一页 → 上一章末页（跨章，瞬时）。
+                                        // 首页点上一页 → 上一章末页（跨章：快照过渡层）。
                                         chapterIndex > 0 -> {
+                                            beginChapterFlip(false)
                                             pendingJumpLastPage = true
                                             chapterIndex -= 1
                                         }
@@ -1686,8 +2163,9 @@ fun NovelReaderScreen(
                                         // 章内 → 翻页动画档（flipTo）
                                         pagerState.currentPage < lastPagerIndex ->
                                             currentFlipTo(true)
-                                        // 末页点下一页 → 下一章首页（跨章，瞬时）。
+                                        // 末页点下一页 → 下一章首页（跨章：快照过渡层）。
                                         chapterIndex < chapters.lastIndex -> {
+                                            beginChapterFlip(true)
                                             pendingJumpLastPage = false
                                             pendingRestoreOffset = 0
                                             chapterIndex += 1
@@ -1727,8 +2205,9 @@ fun NovelReaderScreen(
                                         if (forward) {
                                             when {
                                                 cur < lastIdx -> currentFlipTo(true)
-                                                // 末页左滑 → 下一章首页（与点击同款瞬时跨章）
+                                                // 末页左滑 → 下一章首页（与点击同款：快照过渡层）
                                                 chapterIndex < chapters.lastIndex -> {
+                                                    beginChapterFlip(true)
                                                     pendingJumpLastPage = false
                                                     pendingRestoreOffset = 0
                                                     chapterIndex += 1
@@ -1737,8 +2216,9 @@ fun NovelReaderScreen(
                                         } else {
                                             when {
                                                 cur > 0 -> currentFlipTo(false)
-                                                // 首页右滑 → 上一章末页
+                                                // 首页右滑 → 上一章末页（快照过渡层）
                                                 chapterIndex > 0 -> {
+                                                    beginChapterFlip(false)
                                                     pendingJumpLastPage = true
                                                     chapterIndex -= 1
                                                 }
@@ -1750,12 +2230,79 @@ fun NovelReaderScreen(
                             }
                         }
                     }
+                    // M6-G 边界越界滑动跨章：末页继续向后滑 / 首页继续向前滑 → 切章。
+                    // 与覆盖档的滑动识别互斥（覆盖档 pager 已关原生拖拽，章内翻页与跨章都由
+                    // 上面那段统一处理）；仿真档库手势在边界不启动、不消费事件，本层照常识别。
+                    // 位移达阈值即触发（56dp，与覆盖档 48dp 同量级），不做累计，避免"滑不动"。
+                    .pointerInput(bookId) {
+                        val threshold = with(density) { 56.dp.toPx() }
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            // M6.5 scroll 档禁用：连续滚动没有吸附边界，向下拖 = 正常滚动，
+                            // 跨章由顶部/底部哨兵行承接（见 LazyColumn 容器）。
+                            if (pagingScrollRef) {
+                                return@awaitEachGesture
+                            }
+                            // 覆盖档走自己的识别
+                            if (pageTransitionMode == SettingsKeys.PAGE_TRANSITION_COVER &&
+                                prefs.pagingMode != SettingsKeys.NOVEL_PAGE_VERTICAL
+                            ) {
+                                return@awaitEachGesture
+                            }
+                            // 选区 / 气泡 / 面板 / 过渡中 / 排版中 / 插图预览：不跨章
+                            if (selection != null || bubble != null || quickPanel ||
+                                chapterListOpen || notePanel != null ||
+                                annotationListOpen || bookmarkListOpen || searchPanelOpen ||
+                                chapterFlip != null || paginating || previewOpenRef
+                            ) {
+                                return@awaitEachGesture
+                            }
+                            val vertical = prefs.pagingMode == SettingsKeys.NOVEL_PAGE_VERTICAL
+                            // 当前页真源：仿真档 pagerState 由镜像滞后同步，用库的 current
+                            val cur = if (curlActiveNow) curlState.current else pagerState.currentPage
+                            val lastIdx = if (useDoubleRef) spreadsRef.lastIndex else pagesRef.lastIndex
+                            if (lastIdx < 0) return@awaitEachGesture
+                            val canNext = cur >= lastIdx && chapterIndex < chapters.lastIndex
+                            val canPrev = cur <= 0 && chapterIndex > 0
+                            if (!canNext && !canPrev) return@awaitEachGesture
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                if (event.changes.none { it.pressed }) return@awaitEachGesture
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: continue
+                                val d = if (vertical) {
+                                    change.position.y - down.position.y
+                                } else {
+                                    change.position.x - down.position.x
+                                }
+                                // 左滑/上滑（d<0）= 下一章；右滑/下滑（d>0）= 上一章
+                                val forward = canNext && d <= -threshold
+                                val backward = canPrev && d >= threshold
+                                if (!forward && !backward) continue
+                                change.consume()
+                                scope.launch {
+                                    if (forward) {
+                                        currentBeginChapterFlip(true)
+                                        pendingJumpLastPage = false
+                                        pendingRestoreOffset = 0
+                                        chapterIndex += 1
+                                    } else {
+                                        currentBeginChapterFlip(false)
+                                        pendingJumpLastPage = true
+                                        chapterIndex -= 1
+                                    }
+                                }
+                                return@awaitEachGesture
+                            }
+                        }
+                    }
                     // M6.3-E 全书级手柄拦截层：key 不含章/页/选区——跨章、跨页、选区高频
                     // 更新时手势协程均不重启，一切状态经回调读最新值。手柄抓取判定用
                     // 「可见页」（当前 spread 1~2 页）注册的锚点；新章锚点未就绪时
                     // 全部 null → 判定失败放弃（安全兜底，选区停顿不乱跳）。
                     .pointerInput(bookId, pageCallbacks) {
                         awaitEachGesture {
+                            // 插图预览打开：不建选区、不拖手柄（全屏层之下不应有任何选区行为）
+                            if (previewOpenRef) return@awaitEachGesture
                             val down = awaitFirstDown(requireUnconsumed = false)
                             // 新手势起手：清除上一手势遗留的长按标记（防误消费本次点击）
                             longPressFired = false
@@ -2133,6 +2680,14 @@ fun NovelReaderScreen(
                     }
                     .onGloballyPositioned { screenOrigin = it.positionInRoot() }
             ) {
+                // M6-G 跨章覆盖档：旧页快照垫在最底层（新内容从侧面盖入，必须画在页面之下）。
+                chapterFlip?.let { anim ->
+                    if (anim.mode == SettingsKeys.PAGE_TRANSITION_COVER) {
+                        Canvas(Modifier.fillMaxSize()) {
+                            drawImage(anim.snapshot)
+                        }
+                    }
+                }
                 when {
                     loading -> {
                         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -2148,11 +2703,34 @@ fun NovelReaderScreen(
                         }
                     }
                     else -> {
+                        // M6-G 跨章过渡：页面容器整体位移（仅过渡期间非零）——
+                        // slide/cover 档让新章内容从侧向滑入，curl 档保持不动（由覆盖层卷走旧页）。
+                        // 常驻不透明底：cover 档位移时新内容不能透出下层旧页快照。
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .graphicsLayer {
+                                    val anim = chapterFlip
+                                    if (anim != null &&
+                                        anim.mode != SettingsKeys.PAGE_TRANSITION_CURL
+                                    ) {
+                                        val p = anim.progress.value.coerceIn(0f, 1f)
+                                        val remain = (1f - p) * (if (anim.forward) 1f else -1f)
+                                        if (anim.vertical) {
+                                            translationY = remain * size.height
+                                        } else {
+                                            translationX = remain * size.width
+                                        }
+                                    }
+                                }
+                                .background(theme.background),
+                        ) {
                         // M6-G 覆盖档（横翻生效；上下翻页由 flipTo 回退平移，pager 不套补偿）。
                         // 覆盖档下 pager 关闭拖拽（userScrollEnabled=false）：横向滑动由根层
                         // 识别后直接播与单击一致的覆盖动画，不存在拖拽跟手的补偿抖动。
                         val coverEnabled = pageTransitionMode == SettingsKeys.PAGE_TRANSITION_COVER &&
-                            prefs.pagingMode != SettingsKeys.NOVEL_PAGE_VERTICAL
+                            prefs.pagingMode != SettingsKeys.NOVEL_PAGE_VERTICAL &&
+                            prefs.pagingMode != SettingsKeys.NOVEL_PAGE_SCROLL
                         // 覆盖档共享派生：当前动画的「进入页」索引（静止 = -1）。derivedStateOf 让
                         // 动画帧内只有 currentPage 翻转瞬间才触发 placement 更新，动画期间零重组。
                         val coverEnteringPage by remember {
@@ -2172,13 +2750,127 @@ fun NovelReaderScreen(
                                 }
                             }
                         }
-                        if (prefs.pagingMode == SettingsKeys.NOVEL_PAGE_VERTICAL) {
+                        // M6.5 纵向连续（scroll 档）：LazyColumn 连续滚动容器，单章信息流。
+                        // item 布局 = [顶部哨兵(上一章)] + 各页 + [底部哨兵(下一章)]。
+                        // 页间无缝：页 item 随内容自适应高度（不套视口定高），页排版用
+                        // 零上下边距 + availHeightPx=0（关掉翻页档的余数平分装饰），
+                        // 正文首尾相接成连续文本流；分页结构/进度锚定不动。
+                        // 章首/章末呼吸：列表 contentPadding 上下 16dp（方案 A）。
+                        if (pagingScroll) {
+                            val volumeKeysEnabled = selection == null && bubble == null &&
+                                !quickPanel && !chapterListOpen && notePanel == null &&
+                                !annotationListOpen && !bookmarkListOpen && !searchPanelOpen &&
+                                previewCharStart < 0 && chapterFlip == null
+                            // 页间无缝排版参数：左右边距保留，上下清零。
+                            val scrollPagePadding = PaddingValues(
+                                start = startPadDp,
+                                end = endPadDp,
+                            )
+                            LaunchedEffect(
+                                pagingScroll, quickPanel, chapterListOpen, notePanel,
+                                annotationListOpen, bookmarkListOpen, searchPanelOpen,
+                                selection, bubble, chapterFlip,
+                            ) {
+                                // 面板全关后重新要焦点：音量键依赖本容器持有焦点。
+                                if (pagingScroll && volumeKeysEnabled) {
+                                    runCatching { scrollFocusRequester.requestFocus() }
+                                }
+                            }
+                            LazyColumn(
+                                state = scrollListState,
+                                contentPadding = PaddingValues(top = 16.dp, bottom = 16.dp),
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .focusRequester(scrollFocusRequester)
+                                    .focusable()
+                                    .onPreviewKeyEvent { event ->
+                                        // 音量键 = 上/下滚一页（scroll 档专属；pager 档无此功能）。
+                                        val hit = event.type == KeyEventType.KeyDown &&
+                                            (event.key == Key.VolumeUp || event.key == Key.VolumeDown) &&
+                                            volumeKeysEnabled
+                                        if (!hit) return@onPreviewKeyEvent false
+                                        val curPage = scrollCurrentPageIndexOf()
+                                        val target = (if (event.key == Key.VolumeDown) {
+                                            curPage + 1
+                                        } else {
+                                            curPage - 1
+                                        }).coerceIn(0, pages.size - 1)
+                                        if (target == curPage) return@onPreviewKeyEvent false
+                                        scope.launch {
+                                            scrollListState.scrollToItem(scrollListIndexOf(target))
+                                        }
+                                        true
+                                    },
+                                // 插图预览打开时下层内容不跟随手指滚动（与 pager 档同语义）
+                                userScrollEnabled = previewCharStart < 0,
+                            ) {
+                                if (chapterIndex > 0) {
+                                    item(key = "novel_scroll_sentinel_top") {
+                                        NovelScrollSentinelRow(
+                                            label = "上一章 · " +
+                                                (chapters.getOrNull(chapterIndex - 1)?.title ?: ""),
+                                            enabled = true,
+                                            theme = theme,
+                                            onClick = {
+                                                beginChapterFlip(false)
+                                                pendingJumpLastPage = true
+                                                chapterIndex -= 1
+                                            },
+                                        )
+                                    }
+                                }
+                                items(
+                                    count = pages.size,
+                                    key = { idx -> "novel_scroll_page_${pages[idx].charStart}" },
+                                ) { pageIdx ->
+                                    // 不套定高：Box 随页内容自适应（LazyColumn item 高度无界），
+                                    // 页与页正文首尾相接；页排版上下零边距 + 无余数垫高。
+                                    Box(modifier = Modifier.fillMaxWidth()) {
+                                        NovelPageContent(
+                                            page = pages[pageIdx],
+                                            prefs = prefs,
+                                            theme = theme,
+                                            fontFamily = fontFamily,
+                                            contentPadding = scrollPagePadding,
+                                            availHeightPx = 0,
+                                            annotations = annotations,
+                                            selection = displaySelection,
+                                            bubble = bubble,
+                                            bubbleAnnotation = bubbleAnnotation,
+                                            callbacks = pageCallbacks,
+                                            dragging = dragging,
+                                            dragSide = dragSide,
+                                            locateHighlight = if (locateHighlightChapter == chapterIndex) locateHighlight else null,
+                                            onImageTap = openImagePreview,
+                                        )
+                                    }
+                                }
+                                if (chapterIndex < chapters.lastIndex) {
+                                    item(key = "novel_scroll_sentinel_bottom") {
+                                        NovelScrollSentinelRow(
+                                            label = "下一章 · " +
+                                                (chapters.getOrNull(chapterIndex + 1)?.title ?: ""),
+                                            enabled = true,
+                                            theme = theme,
+                                            onClick = {
+                                                beginChapterFlip(true)
+                                                pendingRestoreOffset = 0
+                                                pendingJumpLastPage = false
+                                                chapterIndex += 1
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                        } else if (prefs.pagingMode == SettingsKeys.NOVEL_PAGE_VERTICAL) {
                             VerticalPager(
                                 state = pagerState,
                                 modifier = Modifier.fillMaxSize(),
                                 // M6.3 跨页续选：翻页后旧页保持组合，拦截层手势协程不被取消
                                 // （默认 0 会在 scrollToPage 时销毁旧页 → 拖动中断）
                                 beyondViewportPageCount = 1,
+                                // 插图预览打开时下层页面不跟随手指滚动
+                                userScrollEnabled = previewCharStart < 0,
                             ) { page ->
                                 NovelPageContent(
                                     page = pages[page],
@@ -2195,6 +2887,7 @@ fun NovelReaderScreen(
                                     dragging = dragging,
                                     dragSide = dragSide,
                                     locateHighlight = if (locateHighlightChapter == chapterIndex) locateHighlight else null,
+                                    onImageTap = openImagePreview,
                                 )
                             }
                         } else if (curlActiveNow) {
@@ -2214,6 +2907,10 @@ fun NovelReaderScreen(
                                     }
                                 },
                             ) { index ->
+                                // 只有当前页层接收正文手势：库静止时 current-1 层压在 current 之上
+                                //（drawNothing 不绘制但仍参与命中测试），否则长按会选中上一页的字符、
+                                // 手柄锚点全部 miss（GANCH miss）→ 表现「长按拖选卡住/拖不动」。
+                                val isCurrentLayer = index == curlState.current
                                 // 库的层叠设计假设每页内容自带不透明背景（静止时 current 页
                                 // 盖住底层 current+1 页）——NovelPageContent/NovelSpreadContent
                                 // 只画文字不画背景，必须在此补不透明底，否则两页文字叠印
@@ -2241,6 +2938,8 @@ fun NovelReaderScreen(
                                             dragging = dragging,
                                             dragSide = dragSide,
                                             locateHighlight = if (locateHighlightChapter == chapterIndex) locateHighlight else null,
+                                            inputEnabled = isCurrentLayer,
+                                            onImageTap = openImagePreview,
                                         )
                                     } else {
                                         NovelPageContent(
@@ -2258,6 +2957,8 @@ fun NovelReaderScreen(
                                             dragging = dragging,
                                             dragSide = dragSide,
                                             locateHighlight = if (locateHighlightChapter == chapterIndex) locateHighlight else null,
+                                            inputEnabled = isCurrentLayer,
+                                            onImageTap = openImagePreview,
                                         )
                                     }
                                 }
@@ -2268,7 +2969,7 @@ fun NovelReaderScreen(
                                 modifier = Modifier.fillMaxSize(),
                                 beyondViewportPageCount = 1,
                                 // 覆盖档：拖拽跟手关闭——横向滑动由根层识别后直接播覆盖动画
-                                userScrollEnabled = !coverEnabled,
+                                userScrollEnabled = !coverEnabled && previewCharStart < 0,
                             ) { index ->
                                 val spreadBody: @Composable () -> Unit = {
                                     val spread = spreads.getOrNull(index)
@@ -2289,6 +2990,7 @@ fun NovelReaderScreen(
                                         dragging = dragging,
                                         dragSide = dragSide,
                                         locateHighlight = if (locateHighlightChapter == chapterIndex) locateHighlight else null,
+                                        onImageTap = openImagePreview,
                                     )
                                 }
                                 if (coverEnabled) {
@@ -2363,7 +3065,7 @@ fun NovelReaderScreen(
                                 modifier = Modifier.fillMaxSize(),
                                 beyondViewportPageCount = 1,
                                 // 覆盖档：拖拽跟手关闭——横向滑动由根层识别后直接播覆盖动画
-                                userScrollEnabled = !coverEnabled,
+                                userScrollEnabled = !coverEnabled && previewCharStart < 0,
                             ) { page ->
                                 val pageBody: @Composable () -> Unit = {
                                     NovelPageContent(
@@ -2380,6 +3082,7 @@ fun NovelReaderScreen(
                                         callbacks = pageCallbacks,
                                         dragging = dragging,
                                         dragSide = dragSide,
+                                        onImageTap = openImagePreview,
                                     )
                                 }
                                 if (coverEnabled) {
@@ -2441,6 +3144,36 @@ fun NovelReaderScreen(
                                 }
                             }
                         }
+                        }
+                    }
+                }
+
+                // M6-G 跨章过渡覆盖层：旧页快照按档位退场（画在页面之上）。
+                // 覆盖档不走这里——旧页由上面的底层 Canvas 垫在新内容之下。
+                chapterFlip?.let { anim ->
+                    if (anim.mode != SettingsKeys.PAGE_TRANSITION_COVER) {
+                        Canvas(Modifier.fillMaxSize()) {
+                            val p = anim.progress.value.coerceIn(0f, 1f)
+                            if (anim.mode == SettingsKeys.PAGE_TRANSITION_CURL) {
+                                drawChapterCurl(
+                                    snapshot = anim.snapshot,
+                                    progress = p,
+                                    forward = anim.forward,
+                                    paper = theme.background,
+                                )
+                            } else {
+                                val d = if (anim.forward) 1f else -1f
+                                if (anim.vertical) {
+                                    translate(top = -d * p * size.height) {
+                                        drawImage(anim.snapshot)
+                                    }
+                                } else {
+                                    translate(left = -d * p * size.width) {
+                                        drawImage(anim.snapshot)
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -2467,10 +3200,6 @@ fun NovelReaderScreen(
                         chapterListOpen = false
                         annotationListOpen = true
                     },
-                    onChapterList = {
-                        quickPanel = false
-                        chapterListOpen = true
-                    },
                     onSettings = {
                         chapterListOpen = false
                         quickPanel = true
@@ -2489,14 +3218,17 @@ fun NovelReaderScreen(
                 NovelBottomBar(
                     chapterIndex = chapterIndex,
                     chapterCount = chapters.size,
-                    pageLabel = if (useDouble) {
+                    pageLabel = if (pagingScroll) {
+                        // M6.5 scroll 档：当前页 = 视口首可见页（读 LazyList 状态，翻页即重组）。
+                        "P${scrollCurrentPageIndexOf() + 1}/${pages.size}"
+                    } else if (useDouble) {
                         val first = pagerState.currentPage * 2 + 1
                         val second = first + 1
                         if (second <= pages.size) "P$first-$second/${pages.size}" else "P$first/${pages.size}"
                     } else {
                         "P${pagerState.currentPage + 1}/${pages.size}"
                     },
-                    fraction = ((pagerState.currentPage + 1).toFloat() /
+                    fraction = ((if (pagingScroll) scrollCurrentPageIndexOf() + 1 else pagerState.currentPage + 1).toFloat() /
                         (if (useDouble) spreads.size else pages.size).coerceAtLeast(1))
                         .coerceIn(0f, 1f),
                     theme = theme,
@@ -2504,9 +3236,9 @@ fun NovelReaderScreen(
                         chapterListOpen = false
                         searchPanelOpen = true
                     },
-                    onSettings = {
-                        chapterListOpen = false
-                        quickPanel = true
+                    onChapterList = {
+                        quickPanel = false
+                        chapterListOpen = true
                     },
                 )
             }
@@ -2558,7 +3290,9 @@ fun NovelReaderScreen(
                 theme = theme,
                 onAdd = {
                     // 添加当前页首位置书签：页首 char + 页首 20 字做摘要，幂等（UNIQUE 约束）
-                    val page = pages.getOrNull(pagerState.currentPage)
+                    val page = pages.getOrNull(
+                        if (pagingScroll) scrollCurrentPageIndexOf() else pagerState.currentPage,
+                    )
                     if (page != null) {
                         scope.launch {
                             repository.addBookmark(
@@ -2632,6 +3366,21 @@ fun NovelReaderScreen(
                     pageTransitionMode = value
                     scope.launch { settingsRepository.putString(SettingsKeys.NOVEL_PAGE_TRANSITION, value) }
                 },
+                darkFollow = darkFollow,
+                onSetDarkFollow = { enable ->
+                    // 立即同步本地状态（面板即时生效），异步持久化；与设置-外观同一键。
+                    darkFollow = enable
+                    scope.launch { settingsRepository.putBoolean(SettingsKeys.NOVEL_DARK_FOLLOW, enable) }
+                },
+                onPickTheme = { value ->
+                    // 跟随生效期间手动选浅色档 = 用户接管：自动关闭跟随（与设置项同步），选中即生效。
+                    if (darkFollowActive && value != SettingsKeys.NOVEL_THEME_DARK) {
+                        darkFollow = false
+                        scope.launch { settingsRepository.putBoolean(SettingsKeys.NOVEL_DARK_FOLLOW, false) }
+                    }
+                    prefs = prefs.copy(theme = value)
+                },
+                effectiveThemeId = effectiveThemeId,
                 fonts = fontList,
                 importedFonts = importedFonts,
                 theme = theme,
@@ -2658,6 +3407,52 @@ fun NovelReaderScreen(
                     chromeVisible = false
                 },
             )
+
+            // 深色跟随首次提示：居中玻璃卡（搜索面板/笔记面板同款结构），点「知道了」关闭；
+            // 标记已在触发 effect 落盘，此后不再出现。
+            if (darkFollowHintOpen) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.45f))
+                        .pointerInput(Unit) {
+                            detectTapGestures { darkFollowHintOpen = false }
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = panelColor(theme),
+                        border = BorderStroke(1.dp, novelOutline(theme)),
+                        modifier = Modifier.padding(16.dp).widthIn(max = 560.dp).fillMaxWidth(),
+                    ) {
+                        Column(modifier = Modifier.padding(20.dp)) {
+                            Text(
+                                "背景已自动切换",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = theme.text,
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                "App 处于深色模式，小说背景已自动切换为墨黑；回到浅色模式时会自动恢复你原来的背景档。不需要自动切换的话，可以到 设置-外观 关闭「深色时小说背景自动切换」，或在阅读器排版面板里直接关闭。",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = theme.secondary,
+                            )
+                            Spacer(Modifier.height(16.dp))
+                            Text(
+                                "知道了",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier
+                                    .align(Alignment.End)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .clickable { darkFollowHintOpen = false }
+                                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                            )
+                        }
+                    }
+                }
+            }
 
             notePanel?.let { state ->
                 NovelNotePanel(
@@ -2710,6 +3505,23 @@ fun NovelReaderScreen(
                     onDismiss = {
                         notePanel = null
                     },
+                )
+            }
+
+            // M6.4 插图全屏预览：挂在根 Box 最上层（chrome/面板之后），内部自带 BackHandler。
+            if (previewCharStart >= 0 && chapterImages.isNotEmpty()) {
+                NovelImagePreviewOverlay(
+                    images = chapterImages,
+                    initialCharStart = previewCharStart,
+                    bookTitle = book?.title ?: "插图",
+                    chapterIndex = chapterIndex,
+                    saving = previewSaving,
+                    savedCharStart = previewSavedCharStart,
+                    onClose = {
+                        previewCharStart = -1
+                        previewSavedCharStart = -1
+                    },
+                    onSave = { item, _ -> savePreviewImage(item) },
                 )
             }
         }
@@ -2794,8 +3606,17 @@ private fun NovelPageContent(
     dragSide: String = "",
     /** M7 搜索定位一次性高亮（章内绝对区间；本页章节命中才传）。 */
     locateHighlight: IntRange? = null,
+    /**
+     * 是否接收正文手势。仿真档的 pagecurl 容器会同时叠 3 层内容（current+1 / current /
+     * current-1），静止时 current-1 层在最上——它虽然 drawNothing 不绘制，但仍参与命中测试，
+     * 会抢走长按/拖动（表现为长按选中的是上一页的字符、手柄锚点 miss、拖不动）。
+     * 因此只有 index == 当前页的那一层挂手势，其余层只绘制不接收输入。
+     */
+    inputEnabled: Boolean = true,
+    /** 插图点击（relPath, 章内 charStart）：非空时图片区接收点击并打开预览。 */
+    onImageTap: ((String, Int) -> Unit)? = null,
 ) {
-    val gesturesOn = callbacks != null && callbacks.annotationsEnabled()
+    val gesturesOn = inputEnabled && callbacks != null && callbacks.annotationsEnabled()
     val layouts = remember(page) { arrayOfNulls<TextLayoutResult>(page.slices.size) }
     // slicePos = Text 相对 content root Box 内容区的坐标（手柄/气泡 offset 与其同坐标系，
     // 禁止混用 positionInRoot 窗口坐标，否则 padding 双计导致手柄整体漂移）。
@@ -2803,6 +3624,8 @@ private fun NovelPageContent(
     val clipboard = LocalClipboardManager.current
     val density = LocalDensity.current
     val rootPos = remember { mutableStateOf(Offset.Zero) } // 本页相对窗口（convert 屏幕换算用）
+    // 主题色（强调色）：选区带/搜索命中底色跟主题色走（原写死浅蓝/橙）。
+    val accent = MaterialTheme.colorScheme.primary
 
     // M6.3 选区为章节绝对 char：渲染按本页 slice 交集天然支持跨页；
     // 圆点按端点归属页各自渲染（startAbs / endAbs-1 落在本页才画）。
@@ -2852,7 +3675,8 @@ private fun NovelPageContent(
             val e = min(range.last + 1, ce)
             if (e > s) {
                 addStyleSafe(
-                    SpanStyle(background = Color(0x6681D5FF)),
+                    // 选区带跟主题色（原写死浅蓝）
+                    SpanStyle(background = accent.copy(alpha = 0.20f)),
                     s - cs,
                     e - cs,
                 )
@@ -2864,7 +3688,8 @@ private fun NovelPageContent(
             val e = min(range.last + 1, ce)
             if (e > s) {
                 addStyleSafe(
-                    SpanStyle(background = Color(0x66F0A24B)),
+                    // 搜索命中一次性高亮跟主题色（原写死橙）
+                    SpanStyle(background = accent.copy(alpha = 0.28f)),
                     s - cs,
                     e - cs,
                 )
@@ -3134,7 +3959,15 @@ private fun NovelPageContent(
             page.slices.forEachIndexed { i, slice ->
                 val imagePath = slice.imagePath
                 if (imagePath != null) {
-                    NovelPageImage(path = imagePath, heightPx = slice.heightPx, theme = theme)
+                    NovelPageImage(
+                        path = imagePath,
+                        heightPx = slice.heightPx,
+                        theme = theme,
+                        inputEnabled = inputEnabled,
+                        onTap = onImageTap?.let { tap ->
+                            { tap(imagePath, slice.charStart) }
+                        },
+                    )
                 } else {
                     val badge = annotations.firstOrNull {
                         it.note != null && it.charEnd > slice.charStart && it.charEnd <= slice.charEnd
@@ -3167,6 +4000,7 @@ private fun NovelPageContent(
                                             val upOrTimeout = withTimeoutOrNull(
                                                 viewConfiguration.longPressTimeoutMillis.toLong(),
                                             ) {
+                                                val longPressSlop = viewConfiguration.touchSlop
                                                 while (true) {
                                                     val event = awaitPointerEvent()
                                                     val change = event.changes.firstOrNull { it.id == down.id }
@@ -3178,6 +4012,16 @@ private fun NovelPageContent(
                                                     }
                                                     if (!change.pressed) {
                                                         tap = change
+                                                        break
+                                                    }
+                                                    // 关键修复：位移超过 touch slop 就是拖动（翻页/卷曲），
+                                                    // 放弃长按。否则慢速拖过 longPressTimeout 会被误判成长按
+                                                    // → 建选区 + 后续 move 被长按循环 consume → 库拖拽被判取消
+                                                    // （complete=false 回弹）+ 选区激活禁用拖拽 = 「拖不动/卡住」。
+                                                    if ((change.position - down.position).getDistance() >
+                                                        longPressSlop
+                                                    ) {
+                                                        stolen = true
                                                         break
                                                     }
                                                 }
@@ -3405,7 +4249,8 @@ private fun NovelPageContent(
 /** M6.3-A 选区手柄：竖线 + 圆点，拖动更新选区端点。 */
 @Composable
 private fun SelectionHandle(anchor: Offset) {
-    val tint = Color(0xFF2196F3)
+    // 主题色（强调色）：原写死 #2196F3 蓝，改为跟随软件主题色。
+    val tint = MaterialTheme.colorScheme.primary
     // 微信读书样式：无竖线的圆点，圆心即 anchor（所在行行底下方，两圆点同线）。
     // 纯视觉组件：拖动手势由页面 root 的拦截层统一接管。
     Box(
@@ -3621,20 +4466,48 @@ private fun NovelNotePanel(
     }
 }
 
-/** M6.2-B：EPUB 图片切片渲染；解码失败显示占位。 */
+/**
+ * 插画位图会话级缓存（键 = 绝对路径，容量按字节封顶 32MB）。
+ * 翻页 / 仿真卷曲动画期间页面组合件会重建，命中缓存即零延迟上屏；
+ * 否则每次重建都会重启解码（10~50ms），图片页会闪出「[插图]」占位。
+ * 离开阅读器时清空（见 NovelReaderScreen 的 DisposableEffect）。
+ */
+internal object NovelImageCache {
+    private val cache = object : LruCache<String, ImageBitmap>(32 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: ImageBitmap): Int =
+            value.asAndroidBitmap().allocationByteCount
+    }
+
+    fun get(path: String): ImageBitmap? = cache.get(path)
+
+    fun put(path: String, bitmap: ImageBitmap) {
+        cache.put(path, bitmap)
+    }
+
+    fun clear() = cache.evictAll()
+}
+
+/** M6.2-B：EPUB 图片切片渲染；解码失败显示占位。M6.4：点击打开全屏预览。 */
 @Composable
 private fun NovelPageImage(
     path: String,
     heightPx: Int,
     theme: NovelTheme,
+    inputEnabled: Boolean = true,
+    onTap: (() -> Unit)? = null,
 ) {
+    // pointerInput 协程不随重组重启，点击回调用 rememberUpdatedState 取最新值。
+    val currentOnTap by rememberUpdatedState(onTap)
     val density = LocalDensity.current
     val heightDp = with(density) { heightPx.coerceAtLeast(1).toDp() }
     // marker 存的是 filesDir 相对路径（epub_images/{bookId}/xxx），渲染时解析为绝对路径。
     val context = LocalContext.current
     val absolutePath = remember(path) { File(context.filesDir, path).absolutePath }
-    val bitmap by produceState<ImageBitmap?>(initialValue = null, key1 = absolutePath) {
-        value = withContext(Dispatchers.IO) {
+    // 缓存优先：含首次组合即命中（翻回看过的图 / 从邻页槽升为当前页）。
+    var bitmap by remember(absolutePath) { mutableStateOf(NovelImageCache.get(absolutePath)) }
+    LaunchedEffect(absolutePath) {
+        if (bitmap != null) return@LaunchedEffect
+        val decoded = withContext(Dispatchers.IO) {
             runCatching {
                 val file = File(absolutePath)
                 if (!file.exists()) return@runCatching null
@@ -3646,11 +4519,32 @@ private fun NovelPageImage(
                 BitmapFactory.decodeFile(absolutePath, options)?.asImageBitmap()
             }.getOrNull()
         }
+        if (decoded != null) NovelImageCache.put(absolutePath, decoded)
+        bitmap = decoded
     }
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(heightDp),
+            .height(heightDp)
+            .then(
+                if (inputEnabled && onTap != null) {
+                    Modifier.pointerInput(path) {
+                        awaitEachGesture {
+                            // 插图点击：down 阶段消费即阻断父级 detectTapGestures
+                            // （根层分区翻页/呼 chrome 的 awaitFirstDown 要求未被消费）；
+                            // Pager 与 pagecurl 的拖拽均为 requireUnconsumed=false，
+                            // 从图片区起手滑动仍能正常翻页/卷曲。
+                            val down = awaitFirstDown(requireUnconsumed = true)
+                            down.consume()
+                            // 拖动/滑动过程中事件被消费 → 返回 null，不当作点击。
+                            waitForUpOrCancellation() ?: return@awaitEachGesture
+                            currentOnTap?.invoke()
+                        }
+                    }
+                } else {
+                    Modifier
+                },
+            ),
         contentAlignment = Alignment.Center,
     ) {
         val loaded = bitmap
@@ -3691,6 +4585,10 @@ private fun NovelSpreadContent(
     dragging: Boolean = false,
     dragSide: String = "",
     locateHighlight: IntRange? = null,
+    /** 同 NovelPageContent：仿真档非当前 spread 层只绘制、不接收正文手势。 */
+    inputEnabled: Boolean = true,
+    /** 插图点击（两半页各自上报自己的 charStart）。 */
+    onImageTap: ((String, Int) -> Unit)? = null,
 ) {
     Row(
         modifier = Modifier
@@ -3715,6 +4613,8 @@ private fun NovelSpreadContent(
                 dragging = dragging,
                 dragSide = dragSide,
                 locateHighlight = locateHighlight,
+                inputEnabled = inputEnabled,
+                onImageTap = onImageTap,
             )
         } else {
             Spacer(Modifier.weight(1f))
@@ -3736,6 +4636,8 @@ private fun NovelSpreadContent(
                 dragging = dragging,
                 dragSide = dragSide,
                 locateHighlight = locateHighlight,
+                inputEnabled = inputEnabled,
+                onImageTap = onImageTap,
             )
         } else {
             Spacer(Modifier.weight(1f))
@@ -3743,6 +4645,7 @@ private fun NovelSpreadContent(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun NovelTopBar(
     title: String,
@@ -3751,12 +4654,24 @@ private fun NovelTopBar(
     onBack: () -> Unit,
     onBookmarks: () -> Unit,
     onAnnotations: () -> Unit,
-    onChapterList: () -> Unit,
     onSettings: () -> Unit,
 ) {
+    // 菜单栏在场时状态栏也被唤出（沉浸），顶栏必须避让它。
+    // 取「忽略可见性」的高度：状态栏显/隐切换的过渡帧里偏移恒定，不会先贴顶再下移；
+    // 首帧 insets 尚未派发时会报 0，回落书架玻璃头持续写入的进程级记忆值。
+    val liveStatusBarTop = WindowInsets.statusBarsIgnoringVisibility
+        .asPaddingValues()
+        .calculateTopPadding()
+    val statusBarTop = if (liveStatusBarTop > 0.dp) {
+        liveStatusBarTop
+    } else {
+        LibraryStatusBar.statusBarTopPx.dp
+    }
+    // 主题色（强调色）：图标跟主题色走，标题/章节名保持中性保证可读性。
+    val accent = MaterialTheme.colorScheme.primary
     Box(
         modifier = Modifier
-            .padding(top = 12.dp, start = 12.dp, end = 12.dp)
+            .padding(top = statusBarTop + 12.dp, start = 12.dp, end = 12.dp)
             .fillMaxWidth()
             .height(56.dp)
             .clip(RoundedCornerShape(28.dp))
@@ -3768,7 +4683,7 @@ private fun NovelTopBar(
             verticalAlignment = Alignment.CenterVertically,
             ) {
             IconButton(onClick = onBack) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回", tint = theme.text)
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回", tint = accent)
             }
             Column(modifier = Modifier.weight(1f)) {
                 Text(
@@ -3787,16 +4702,13 @@ private fun NovelTopBar(
                 )
             }
             IconButton(onClick = onBookmarks) {
-                Icon(Icons.Filled.BookmarkBorder, contentDescription = "书签", tint = theme.text)
+                Icon(Icons.Filled.BookmarkBorder, contentDescription = "书签", tint = accent)
             }
             IconButton(onClick = onAnnotations) {
-                Icon(Icons.AutoMirrored.Filled.Notes, contentDescription = "注释", tint = theme.text)
-            }
-            IconButton(onClick = onChapterList) {
-                Icon(Icons.AutoMirrored.Filled.List, contentDescription = "目录", tint = theme.text)
+                Icon(Icons.AutoMirrored.Filled.Notes, contentDescription = "注释", tint = accent)
             }
             IconButton(onClick = onSettings) {
-                Icon(Icons.Filled.Settings, contentDescription = "排版", tint = theme.text)
+                Icon(Icons.Filled.Settings, contentDescription = "排版", tint = accent)
             }
         }
     }
@@ -3810,8 +4722,11 @@ private fun NovelBottomBar(
     fraction: Float,
     theme: NovelTheme,
     onSearch: () -> Unit,
-    onSettings: () -> Unit,
+    /** 目录入口挪到底栏（顶栏只保留排版设置，用户 2026-11-25 定）。 */
+    onChapterList: () -> Unit,
 ) {
+    // 主题色（强调色）：进度条与图标跟主题色走，章节/页码文本保持中性。
+    val accent = MaterialTheme.colorScheme.primary
     Box(
         modifier = Modifier
             .padding(start = 12.dp, end = 12.dp, bottom = 12.dp)
@@ -3822,9 +4737,12 @@ private fun NovelBottomBar(
             .border(1.dp, novelOutline(theme), RoundedCornerShape(28.dp)),
             ) {
             Row(
-            modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
+            // 间距再平衡（方案一）：左起点 12dp 给文字呼吸感；统一 12dp 间隔；
+            // 两个图标收进零间距组（48dp 槽自带 12dp 内边距，字形间距 24dp 为标准节奏，
+            // 原 spacedBy 8 时是 32dp）；行尾 6dp + 槽内边距 = 字形距右缘 18dp，与左端接近对称。
+            modifier = Modifier.fillMaxSize().padding(start = 12.dp, end = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text(
                 text = "第 ${chapterIndex + 1}/$chapterCount 章",
@@ -3832,7 +4750,7 @@ private fun NovelBottomBar(
                 color = theme.text,
             )
             BoxWithConstraints(
-                modifier = Modifier.weight(1f).height(28.dp).padding(horizontal = 8.dp),
+                modifier = Modifier.weight(1f).height(28.dp),
             ) {
                 Box(
                     modifier = Modifier
@@ -3840,7 +4758,7 @@ private fun NovelBottomBar(
                         .fillMaxWidth()
                         .height(4.dp)
                         .clip(CircleShape)
-                        .background(theme.text.copy(alpha = 0.15f)),
+                        .background(accent.copy(alpha = 0.16f)),
                 )
                 Box(
                     modifier = Modifier
@@ -3848,7 +4766,7 @@ private fun NovelBottomBar(
                         .fillMaxWidth(fraction)
                         .height(4.dp)
                         .clip(CircleShape)
-                        .background(theme.text.copy(alpha = 0.6f)),
+                        .background(accent),
                 )
             }
             Text(
@@ -3856,11 +4774,13 @@ private fun NovelBottomBar(
                 style = MaterialTheme.typography.labelMedium,
                 color = theme.text,
             )
-            IconButton(onClick = onSearch) {
-                Icon(Icons.Filled.Search, contentDescription = "搜索", tint = theme.text)
-            }
-            IconButton(onClick = onSettings) {
-                Icon(Icons.Filled.Settings, contentDescription = "排版", tint = theme.text)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onSearch) {
+                    Icon(Icons.Filled.Search, contentDescription = "搜索", tint = accent)
+                }
+                IconButton(onClick = onChapterList) {
+                    Icon(Icons.AutoMirrored.Filled.List, contentDescription = "目录", tint = accent)
+                }
             }
         }
     }
@@ -4626,6 +5546,39 @@ private fun NovelSettingRow(
     }
 }
 
+/**
+ * M6.5 纵向连续档的跨章哨兵行：列表顶部「上一章」/底部「下一章」的矮条入口。
+ * 点击即跨章（复用 beginChapterFlip 快照过渡 + pendingJumpLastPage/pendingRestoreOffset
+ * 落位链），enabled=false（首章/末章）时不渲染点击态。
+ */
+@Composable
+private fun NovelScrollSentinelRow(
+    label: String,
+    enabled: Boolean,
+    theme: NovelTheme,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp)
+            .then(
+                if (enabled) {
+                    Modifier.clickable(onClick = onClick)
+                } else {
+                    Modifier
+                },
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            color = if (enabled) MaterialTheme.colorScheme.primary else theme.secondary,
+        )
+    }
+}
+
 @Composable
 private fun NovelQuickPanel(
     visible: Boolean,
@@ -4636,6 +5589,10 @@ private fun NovelQuickPanel(
     onSetDoublePageMode: (String) -> Unit,
     pageTransitionMode: String,
     onSetPageTransition: (String) -> Unit,
+    darkFollow: Boolean,
+    onSetDarkFollow: (Boolean) -> Unit,
+    onPickTheme: (String) -> Unit,
+    effectiveThemeId: String,
     fonts: List<Pair<String, String>>,
     importedFonts: List<com.inkvol.app.data.model.NovelFontRecord>,
     theme: NovelTheme,
@@ -4661,6 +5618,7 @@ private fun NovelQuickPanel(
     val pagingOptions = listOf(
         NovelSettingOption(SettingsKeys.NOVEL_PAGE_HORIZONTAL, "左右翻页"),
         NovelSettingOption(SettingsKeys.NOVEL_PAGE_VERTICAL, "上下翻页"),
+        NovelSettingOption(SettingsKeys.NOVEL_PAGE_SCROLL, "纵向连续"),
     )
     val doublePageOptions = listOf(
         NovelSettingOption(SettingsKeys.DOUBLE_PAGE_AUTO, "宽屏自动"),
@@ -4803,24 +5761,50 @@ private fun NovelQuickPanel(
                     Spacer(Modifier.height(8.dp))
                     NovelSettingRow(
                         title = "背景",
-                        selectedId = prefs.theme,
+                        selectedId = effectiveThemeId,
                         options = themeOptions,
                         expandedKey = expandedKey,
                         key = "theme",
                         onToggleExpand = { expandedKey = it },
-                        onPick = { onPrefsChange(prefs.copy(theme = it)) },
+                        onPick = onPickTheme,
                     )
                     Spacer(Modifier.height(8.dp))
+                    // 深色跟随开关（与设置-外观同一全局键）：App 深色时背景自动切墨黑，
+                    // 回浅色恢复手动档；整行单击切换。
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable { onSetDarkFollow(!darkFollow) }
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f))
+                            .padding(horizontal = 12.dp, vertical = 12.dp),
+                    ) {
+                        Text(
+                            "深色自动切换",
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            text = if (darkFollow) "开启" else "关闭",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
                     // 翻页动画为全局档（独立键）：仅点击翻页生效，拖拽与跳页保持瞬时。
-                    NovelSettingRow(
-                        title = "动画",
-                        selectedId = pageTransitionMode,
-                        options = pageTransitionOptions,
-                        expandedKey = expandedKey,
-                        key = "pageTransition",
-                        onToggleExpand = { expandedKey = it },
-                        onPick = onSetPageTransition,
-                    )
+                    // M6.5 纵向连续档没有翻页语义，隐藏本行（档位保留，切回翻页档恢复）。
+                    if (prefs.pagingMode != SettingsKeys.NOVEL_PAGE_SCROLL) {
+                        NovelSettingRow(
+                            title = "动画",
+                            selectedId = pageTransitionMode,
+                            options = pageTransitionOptions,
+                            expandedKey = expandedKey,
+                            key = "pageTransition",
+                            onToggleExpand = { expandedKey = it },
+                            onPick = onSetPageTransition,
+                        )
+                    }
                     Spacer(Modifier.height(8.dp))
                     NovelSettingRow(
                         title = "方向",

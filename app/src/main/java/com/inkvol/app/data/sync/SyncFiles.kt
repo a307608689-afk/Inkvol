@@ -44,14 +44,19 @@ class SyncFiles(
         val existsLocally: Boolean,
     )
 
-    /** 上传资格：非文件夹漫画即单文件形态；scope=all 放开全部，否则仅单文件导入库。 */
-    fun eligibleBooks(scopeAll: Boolean): List<EligibleFile> {
+    /**
+     * 上传资格：非文件夹漫画（format != FOLDER）才可单文件传输；
+     * 位置命中范围（全部 / 单文件导入库 / 勾选的文件夹）即可。
+     */
+    fun eligibleBooks(scope: SyncFileScope): List<EligibleFile> {
         val result = ArrayList<EligibleFile>()
         db.querySyncBookRows().forEach { row ->
             if (row.format == "FOLDER") return@forEach
-            val location = db.queryBookLocations(row.id).firstOrNull() ?: return@forEach
-            val singleLibrary = location.treeUri == SingleFileImporter.SINGLE_LIBRARY_URI
-            if (!scopeAll && !singleLibrary) return@forEach
+            val location = db.queryBookLocations(row.id).firstOrNull { loc ->
+                scope.all ||
+                    (loc.treeUri == SingleFileImporter.SINGLE_LIBRARY_URI && scope.single) ||
+                    loc.folderId in scope.folderIds
+            } ?: return@forEach
             // docId 末段通常是文件名（SAF document id 或完整 URI），取其扩展名
             val ext = location.docId
                 .substringAfterLast('/')
@@ -82,7 +87,7 @@ class SyncFiles(
         config: SyncRepository.SyncConfig,
         remoteTitles: Map<String, String>,
         tombstonedBookIds: Set<String>,
-        scopeAll: Boolean,
+        scope: SyncFileScope,
         onRequest: () -> Unit,
         onProgress: (String) -> Unit,
     ): Outcome = withContext(Dispatchers.IO) {
@@ -124,7 +129,7 @@ class SyncFiles(
         val localBookIds = db.querySyncBookRows().map { it.id }.toSet()
 
         // 3) 上传：本地有、云端无（fingerprint 命名 + 对账天然去重）
-        val eligible = eligibleBooks(scopeAll)
+        val eligible = eligibleBooks(scope)
         eligible.forEach { file ->
             if (uploaded >= UPLOAD_CAP_PER_RUN || failed >= FAIL_ABORT) return@forEach
             if (cloudByName.containsKey(file.bookId)) return@forEach

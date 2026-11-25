@@ -3,8 +3,10 @@ package com.inkvol.app.ui.settings
 import android.content.Context
 import android.net.Uri
 import android.os.Build
+import com.inkvol.app.data.local.InkvolDatabase
 import com.inkvol.app.data.sync.CryptoBox
 import com.inkvol.app.data.sync.DavException
+import com.inkvol.app.data.sync.SyncFileScope
 import com.inkvol.app.data.sync.SyncFiles
 import com.inkvol.app.data.sync.SyncRepository
 import com.inkvol.app.data.sync.WebDavClient
@@ -47,6 +49,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -54,13 +61,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -77,22 +86,33 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.datastore.preferences.core.Preferences
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.inkvol.app.data.backup.BackupPreview
 import com.inkvol.app.data.backup.BackupRepository
+import com.inkvol.app.data.cleanup.CacheCleaner
+import com.inkvol.app.data.cleanup.CleanupItem
+import com.inkvol.app.data.diagnostics.CrashLogFile
+import com.inkvol.app.data.diagnostics.CrashLogStore
 import com.inkvol.app.data.backup.BackupRestoreSheet
 import com.inkvol.app.data.model.PurifyRuleRecord
 import com.inkvol.app.data.repository.LibraryRepository
 import com.inkvol.app.data.settings.SettingsKeys
 import com.inkvol.app.data.settings.SettingsRepository
+import com.inkvol.app.ui.components.InkvolSwitch
 import com.inkvol.app.ui.components.LocalGlassNotice
 import com.inkvol.app.ui.components.LocalPageOverlayController
+import com.inkvol.app.ui.legal.LegalDoc
+import com.inkvol.app.ui.legal.LegalDocOverlay
+import com.inkvol.app.ui.legal.LegalDocs
 import com.inkvol.app.ui.components.TabPage
 import com.inkvol.app.ui.components.glass.GlassDimens
 import com.inkvol.app.ui.components.glass.GlassEdge
@@ -104,6 +124,10 @@ import com.inkvol.app.ui.components.glass.GlassTier
 import com.inkvol.app.ui.components.glass.LocalGlassChrome
 import com.inkvol.app.ui.components.glass.rememberGlassOverlayPresence
 import com.inkvol.app.ui.theme.InkvolRadius
+import com.inkvol.app.ui.theme.ThemeAccent
+import com.inkvol.app.ui.theme.onColorFor
+import com.inkvol.app.ui.theme.themeAccentOf
+import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import kotlinx.coroutines.launch
@@ -140,6 +164,19 @@ fun SettingsScreen(
     var syncDeviceNameOpen by remember { mutableStateOf(false) }
     var syncClearConfirmOpen by remember { mutableStateOf(false) }
     var syncCloudBooksOpen by remember { mutableStateOf(false) }
+    var syncScopeOpen by remember { mutableStateOf(false) }
+    // 配置保存后自动弹范围面板：等配置面板退场动画结束再开，避免两个玻璃层重叠
+    var pendingScopeAfterConfig by remember { mutableStateOf(false) }
+    LaunchedEffect(pendingScopeAfterConfig) {
+        if (pendingScopeAfterConfig) {
+            kotlinx.coroutines.delay(260)
+            syncScopeOpen = true
+            pendingScopeAfterConfig = false
+        }
+    }
+    // 任一同步面板打开时，返回键归面板（先关面板，不关分组/不退设置页）
+    val syncOverlayOpen = syncConfigOpen || syncScopeOpen || syncLogOpen ||
+        syncDeviceNameOpen || syncCloudBooksOpen || syncClearConfirmOpen
     val backupRepository = remember(libraryRepository, settingsRepository) {
         BackupRepository(context, libraryRepository, settingsRepository)
     }
@@ -196,10 +233,25 @@ fun SettingsScreen(
     var openChoice by remember { mutableStateOf<ChoiceSpec?>(null) }
     // M6.3-C：净化规则面板
     var purifyPanelOpen by remember { mutableStateOf(false) }
+    // 批次 2：隐私政策 / 开源许可 / GPL 全文阅读层（null = 关闭）
+    var legalDocOpen by remember { mutableStateOf<LegalDoc?>(null) }
+    // 退场动画期间保留最后一帧文档（§5 数据型面板约定）
+    var legalDocHeld by remember { mutableStateOf<LegalDoc?>(null) }
+    // 崩溃日志面板（只读本机 filesDir/crash，分享走 FileProvider）
+    var crashPanelOpen by remember { mutableStateOf(false) }
+    var crashLogs by remember { mutableStateOf<List<CrashLogFile>>(emptyList()) }
+    var crashRefresh by remember { mutableStateOf(0) }
+    // 空间清理面板
+    var cleanupPanelOpen by remember { mutableStateOf(false) }
+    var cleanupItems by remember { mutableStateOf<List<CleanupItem>>(emptyList()) }
+    var cleanupRefresh by remember { mutableStateOf(0) }
     // M6.3-D 收口：back 链——分组详情 → 设置首页 → 书架 tab。
     // 互斥 enabled 避免与 overlay 层（净化/备份）的 BackHandler 抢优先级。
-    BackHandler(enabled = selectedGroupId != null) { selectedGroupId = null }
-    BackHandler(enabled = selectedGroupId == null && !purifyPanelOpen) {
+    BackHandler(enabled = selectedGroupId != null && !syncOverlayOpen) { selectedGroupId = null }
+    BackHandler(
+        enabled = selectedGroupId == null && !purifyPanelOpen && !syncOverlayOpen &&
+            legalDocOpen == null && !crashPanelOpen && !cleanupPanelOpen,
+    ) {
         onBackToLibrary()
     }
 
@@ -209,6 +261,17 @@ fun SettingsScreen(
     LaunchedEffect(panelCacheRefresh) {
         panelCacheCount = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             com.inkvol.app.ui.reader.panel.PanelLayoutCache.count(context)
+        }
+    }
+    LaunchedEffect(crashRefresh) {
+        crashLogs = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            CrashLogStore.list(context)
+        }
+    }
+    LaunchedEffect(cleanupRefresh) {
+        val ids = libraryRepository.books.value.map { it.id }.toSet()
+        cleanupItems = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            CacheCleaner.scan(context, ids)
         }
     }
     val fontImporter = rememberLauncherForActivityResult(
@@ -233,6 +296,7 @@ fun SettingsScreen(
         panelCacheCount = panelCacheCount,
         syncUi = syncUi,
         onOpenSyncConfig = { syncConfigOpen = true },
+        onOpenSyncScope = { syncScopeOpen = true },
         onOpenSyncLog = { syncLogOpen = true },
         onOpenSyncDeviceName = { syncDeviceNameOpen = true },
         onClearSyncConfig = { syncClearConfirmOpen = true },
@@ -269,6 +333,22 @@ fun SettingsScreen(
             }
         },
         onNotice = { glassNotice.show(it) },
+        onOpenLegalDoc = { legalDocOpen = it },
+        onOpenSource = {
+            if (!LegalDocs.openUrl(context, LegalDocs.SOURCE_URL)) {
+                glassNotice.show("没有可用的浏览器")
+            }
+        },
+        crashLogCount = crashLogs.size,
+        onOpenCrashLogs = {
+            crashRefresh++
+            crashPanelOpen = true
+        },
+        cleanupSummary = CacheCleaner.formatSize(cleanupItems.sumOf { it.bytes }),
+        onOpenCleanup = {
+            cleanupRefresh++
+            cleanupPanelOpen = true
+        },
     )
     val overlayController = LocalPageOverlayController.current
     val showBackupSheet = restorePreview != null && pendingRestoreUri != null
@@ -281,6 +361,7 @@ fun SettingsScreen(
     LaunchedEffect(openChoice) { openChoice?.let { choiceHeld = it } }
     LaunchedEffect(restorePreview) { restorePreview?.let { previewHeld = it } }
     LaunchedEffect(pendingRestoreUri) { pendingRestoreUri?.let { restoreUriHeld = it } }
+    LaunchedEffect(legalDocOpen) { legalDocOpen?.let { legalDocHeld = it } }
 
     val overlayShowing = openChoice != null || showBackupSheet || overlayPresence.present
     LaunchedEffect(overlayShowing) {
@@ -295,7 +376,7 @@ fun SettingsScreen(
         ) {
             // 二级导航方向滑动：进二级从右滑入，返回从左滑入，
             // 参数与顶层 Tab 切换转场一致（280ms FastOutSlowIn）。
-            BackHandler(enabled = selectedGroupId != null) {
+            BackHandler(enabled = selectedGroupId != null && !syncOverlayOpen) {
                 selectedGroupId = null
             }
             AnimatedContent(
@@ -349,7 +430,9 @@ fun SettingsScreen(
                 onDismiss = { openChoice = null },
                 onSelect = { next ->
                     spec.onSelect(next)
-                    openChoice = null
+                    // 色卡面板：点选后保持展开并刷新选中态（便于连续试色），
+                    // 其余选择面板仍是「点选即关」。
+                    openChoice = if (spec.accentPicker) spec.copy(value = next) else null
                 },
             )
         }
@@ -399,52 +482,69 @@ fun SettingsScreen(
                 repository = settingsRepository,
                 syncRepository = syncRepository,
                 onDismiss = { syncConfigOpen = false },
+                onSaved = {
+                    syncConfigOpen = false
+                    pendingScopeAfterConfig = true
+                },
                 onNotice = { glassNotice.show(it) },
+                presence = overlayPresence,
+                backdrop = pageBackdrop,
+            )
+            SyncScopeDialog(
+                visible = syncScopeOpen,
+                syncRepository = syncRepository,
+                onDismiss = { syncScopeOpen = false },
+                presence = overlayPresence,
+                backdrop = pageBackdrop,
             )
             SyncLogDialog(
                 visible = syncLogOpen,
                 syncRepository = syncRepository,
                 onDismiss = { syncLogOpen = false },
+                presence = overlayPresence,
+                backdrop = pageBackdrop,
             )
             SyncDeviceNameDialog(
                 visible = syncDeviceNameOpen,
                 repository = settingsRepository,
                 syncRepository = syncRepository,
                 onDismiss = { syncDeviceNameOpen = false },
+                presence = overlayPresence,
+                backdrop = pageBackdrop,
             )
             SyncCloudBooksDialog(
                 visible = syncCloudBooksOpen,
                 syncRepository = syncRepository,
                 onDismiss = { syncCloudBooksOpen = false },
                 onNotice = { glassNotice.show(it) },
+                presence = overlayPresence,
+                backdrop = pageBackdrop,
             )
-            if (syncClearConfirmOpen) {
-                androidx.compose.material3.AlertDialog(
-                    onDismissRequest = { syncClearConfirmOpen = false },
-                    title = { Text("清除同步配置？") },
-                    text = {
-                        Text("将删除本机的服务器、账号与应用密码配置并停用同步。云端数据与其它设备不受影响；重新配置后可重新配对。")
-                    },
-                    confirmButton = {
-                        TextButton(onClick = {
-                            syncClearConfirmOpen = false
-                            scope.launch {
-                                settingsRepository.putString(SettingsKeys.SYNC_SERVER, "")
-                                settingsRepository.putString(SettingsKeys.SYNC_ACCOUNT, "")
-                                settingsRepository.putString(SettingsKeys.SYNC_PASSWORD_ENC, "")
-                                settingsRepository.putString(SettingsKeys.SYNC_DEVICE_NAME, "")
-                                settingsRepository.putBoolean(SettingsKeys.SYNC_ENABLED, false)
-                                settingsRepository.putString(SettingsKeys.SYNC_LAST_MODIFIED, "")
-                                syncRepository.refreshState()
-                                glassNotice.show("已清除同步配置")
-                            }
-                        }) { Text("清除", color = MaterialTheme.colorScheme.error) }
-                    },
-                    dismissButton = {
-                        TextButton(onClick = { syncClearConfirmOpen = false }) { Text("取消") }
-                    },
-                )
-            }
+            // §5 模式 B 居中卡：同步配置清除确认（原 AlertDialog 违反 §2.4-1）
+            SyncClearConfirmOverlay(
+                visible = syncClearConfirmOpen,
+                presence = overlayPresence,
+                backdrop = pageBackdrop,
+                onDismiss = { syncClearConfirmOpen = false },
+                onConfirm = {
+                    syncClearConfirmOpen = false
+                    scope.launch {
+                        settingsRepository.putString(SettingsKeys.SYNC_SERVER, "")
+                        settingsRepository.putString(SettingsKeys.SYNC_ACCOUNT, "")
+                        settingsRepository.putString(SettingsKeys.SYNC_PASSWORD_ENC, "")
+                        settingsRepository.putString(SettingsKeys.SYNC_DEVICE_NAME, "")
+                        settingsRepository.putBoolean(SettingsKeys.SYNC_ENABLED, false)
+                        settingsRepository.putString(SettingsKeys.SYNC_LAST_MODIFIED, "")
+                        settingsRepository.putString(SettingsKeys.SYNC_FILE_SCOPE, "")
+                        settingsRepository.putString(SettingsKeys.SYNC_LAST_RESULT, "")
+                        settingsRepository.putLong(SettingsKeys.SYNC_LAST_OK_AT, 0)
+                        settingsRepository.putInt(SettingsKeys.SYNC_FAILURES, 0)
+                        settingsRepository.putLong(SettingsKeys.SYNC_COOLDOWN_UNTIL, 0)
+                        syncRepository.refreshState()
+                        glassNotice.show("已清除同步配置")
+                    }
+                },
+            )
         }
 
         // M6.3-C：净化规则管理面板（遮罩点击关闭，无涟漪）
@@ -458,6 +558,40 @@ fun SettingsScreen(
             onDelete = { libraryRepository.deletePurifyRule(it) },
             onToggle = { id, enabled -> libraryRepository.setPurifyRuleEnabled(id, enabled) },
             onDismiss = { purifyPanelOpen = false },
+        )
+
+        legalDocHeld?.let { doc ->
+            BackHandler(enabled = legalDocOpen != null) { legalDocOpen = null }
+            LegalDocOverlay(
+                visible = legalDocOpen != null,
+                doc = doc,
+                backdrop = pageBackdrop,
+                onDismiss = { legalDocOpen = null },
+                presence = overlayPresence,
+            )
+        }
+
+        BackHandler(enabled = crashPanelOpen) { crashPanelOpen = false }
+        CrashLogPanel(
+            visible = crashPanelOpen,
+            logs = crashLogs,
+            presence = overlayPresence,
+            backdrop = pageBackdrop,
+            onDismiss = { crashPanelOpen = false },
+            onRefresh = { crashRefresh++ },
+            onNotice = { glassNotice.show(it) },
+        )
+
+        BackHandler(enabled = cleanupPanelOpen) { cleanupPanelOpen = false }
+        StorageCleanupPanel(
+            visible = cleanupPanelOpen,
+            items = cleanupItems,
+            validBookIds = libraryRepository.books.value.map { it.id }.toSet(),
+            presence = overlayPresence,
+            backdrop = pageBackdrop,
+            onDismiss = { cleanupPanelOpen = false },
+            onRefresh = { cleanupRefresh++ },
+            onNotice = { glassNotice.show(it) },
         )
     }
 }
@@ -557,7 +691,7 @@ private fun PurifyRulesPanel(
                                             overflow = TextOverflow.Ellipsis,
                                         )
                                     }
-                                    Switch(
+                                    InkvolSwitch(
                                         checked = rule.enabled,
                                         onCheckedChange = { onToggle(rule.id, it) },
                                     )
@@ -780,20 +914,29 @@ private fun SettingSpecRow(
             onClick = { spec.onToggle(!spec.value) },
         )
 
-        is ChoiceSpec -> SettingRow(
-            title = spec.title,
-            subtitle = spec.subtitle,
-            value = spec.currentLabel,
-            enabled = spec.enabled,
-            onClick = {
-                if (!spec.enabled) return@SettingRow
-                if (spec.usesSheet) {
-                    onOpenChoice(spec)
+        is ChoiceSpec -> {
+            // 当前深浅档：主题色行要在值区画出「该档」的实际颜色（深色档是独立亮版）。
+            val darkScheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
+            SettingRow(
+                title = spec.title,
+                subtitle = spec.subtitle,
+                value = spec.currentLabel,
+                enabled = spec.enabled,
+                valueSwatch = if (spec.accentPicker) {
+                    themeAccentOf(spec.value).swatchFor(darkScheme)
                 } else {
-                    spec.onSelect(spec.nextValue())
-                }
-            },
-        )
+                    null
+                },
+                onClick = {
+                    if (!spec.enabled) return@SettingRow
+                    if (spec.usesSheet) {
+                        onOpenChoice(spec)
+                    } else {
+                        spec.onSelect(spec.nextValue())
+                    }
+                },
+            )
+        }
 
         is InfoSpec -> SettingRow(
             title = spec.title,
@@ -875,55 +1018,153 @@ private fun SettingChoiceSheet(
             .heightIn(max = 460.dp),
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = spec.title,
-                style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-            spec.subtitle?.let {
-                Spacer(Modifier.height(3.dp))
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = spec.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    spec.subtitle?.let {
+                        Spacer(Modifier.height(3.dp))
+                        Text(
+                            text = it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                // 色卡面板点选后不关闭（便于连续试色），因此另给显式出口；
+                // 其它选择面板保持「点选即关」的原有语义。
+                if (spec.accentPicker) {
+                    TextButton(onClick = onDismiss) {
+                        Text("完成")
+                    }
+                }
             }
             Spacer(Modifier.height(10.dp))
-            LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
-                items(spec.options, key = { it.value }) { option ->
-                    val selected = option.value == spec.value
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable { onSelect(option.value) }
-                            .padding(vertical = 10.dp, horizontal = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = option.label,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = if (selected) {
-                                    MaterialTheme.colorScheme.primary
-                                } else {
-                                    MaterialTheme.colorScheme.onSurface
-                                },
-                            )
-                        }
-                        if (selected) {
-                            Icon(
-                                imageVector = Icons.Filled.Check,
-                                contentDescription = "当前选择",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(18.dp),
-                            )
+            if (spec.accentPicker) {
+                // 网格列数自适应：手机可用宽 ~296dp → 3 列（12 色 3×4）；
+                // 平板面板 560dp 宽 → 6 列（12 色 6×2），两种形态都刚好排满。
+                val darkScheme = MaterialTheme.colorScheme.background.luminance() < 0.5f
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(minSize = 80.dp),
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    gridItems(spec.options, key = { it.value }) { option ->
+                        AccentSwatchCell(
+                            label = option.label,
+                            color = themeAccentOf(option.value).swatchFor(darkScheme),
+                            selected = option.value == spec.value,
+                            onClick = { onSelect(option.value) },
+                        )
+                    }
+                }
+            } else {
+                LazyColumn(modifier = Modifier.heightIn(max = 320.dp)) {
+                    items(spec.options, key = { it.value }) { option ->
+                        val selected = option.value == spec.value
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { onSelect(option.value) }
+                                .padding(vertical = 10.dp, horizontal = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = option.label,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = if (selected) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurface
+                                    },
+                                )
+                            }
+                            if (selected) {
+                                Icon(
+                                    imageVector = Icons.Filled.Check,
+                                    contentDescription = "当前选择",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/**
+ * 主题色色卡：外圈选中环 + 实心圆 + 名称。
+ * 圆点统一带 1dp 中性描边——深色档在墨底、浅色档在白底，边缘都不会糊掉。
+ * 选中对勾用该色自己的 onPrimary（自动挑白/墨），浅中性色上也看得见。
+ */
+@Composable
+private fun AccentSwatchCell(
+    label: String,
+    color: Color,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 2.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Box(
+            modifier = Modifier.size(44.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (selected) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .border(2.dp, MaterialTheme.colorScheme.onSurface, CircleShape),
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .size(if (selected) 30.dp else 32.dp)
+                    .clip(CircleShape)
+                    .background(color)
+                    .border(
+                        width = 1.dp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f),
+                        shape = CircleShape,
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (selected) {
+                    Icon(
+                        imageVector = Icons.Filled.Check,
+                        contentDescription = null,
+                        tint = onColorFor(color),
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(5.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (selected) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
     }
 }
 
@@ -934,6 +1175,8 @@ private fun SettingRow(
     value: String,
     enabled: Boolean,
     dimmed: Boolean = !enabled,
+    /** 值区前置色点：仅主题色行使用，其它行传 null 保持原样。 */
+    valueSwatch: Color? = null,
     onClick: () -> Unit,
 ) {
     Surface(
@@ -967,11 +1210,29 @@ private fun SettingRow(
                     )
                 }
             }
-            Text(
-                text = value,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary,
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                if (valueSwatch != null) {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(valueSwatch)
+                            .border(
+                                width = 1.dp,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f),
+                                shape = CircleShape,
+                            ),
+                    )
+                }
+                Text(
+                    text = value,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
         }
     }
 }
@@ -986,6 +1247,7 @@ private fun buildSettingsGroups(
     panelCacheCount: Int,
     syncUi: SyncRepository.SyncUiState,
     onOpenSyncConfig: () -> Unit,
+    onOpenSyncScope: () -> Unit,
     onOpenSyncLog: () -> Unit,
     onOpenSyncDeviceName: () -> Unit,
     onClearSyncConfig: () -> Unit,
@@ -1000,6 +1262,12 @@ private fun buildSettingsGroups(
     onOpenPurifyRules: () -> Unit,
     onClearPanelCache: () -> Unit,
     onNotice: (String) -> Unit,
+    onOpenLegalDoc: (LegalDoc) -> Unit,
+    onOpenSource: () -> Unit,
+    crashLogCount: Int,
+    onOpenCrashLogs: () -> Unit,
+    cleanupSummary: String,
+    onOpenCleanup: () -> Unit,
 ): List<SettingsGroupSpec> {
     fun stringOf(key: String, default: String): String =
         prefs?.let { repository.stringOf(it, key, default) } ?: default
@@ -1099,11 +1367,14 @@ private fun buildSettingsGroups(
         context.packageManager.getPackageInfo(context.packageName, 0).versionName
     }.getOrNull() ?: "unknown"
 
+    // 动态取色与主题色互斥：动态优先（壁纸主色），主题色行灰化并说明原因。
+    val dynamicColorOn = booleanOf(SettingsKeys.DYNAMIC_COLOR, false)
+
     return listOf(
         SettingsGroupSpec(
             id = "appearance",
             title = "外观",
-            subtitle = "主题、动态取色",
+            subtitle = "主题、主题色、动态取色",
             specs = listOf(
                 choice(
                     id = "theme_mode",
@@ -1117,13 +1388,35 @@ private fun buildSettingsGroups(
                         SettingChoice(SettingsKeys.THEME_DARK, "深色"),
                     ),
                 ),
+                // 自定义主题色：只接管强调色（primary 一族），背景/卡片/语义色不动。
+                ChoiceSpec(
+                    id = "theme_accent",
+                    title = "主题色",
+                    subtitle = if (dynamicColorOn) {
+                        "动态取色开启时不生效"
+                    } else {
+                        "只改强调色，背景保持墨黑纸白"
+                    },
+                    value = stringOf(SettingsKeys.THEME_ACCENT, ThemeAccent.VERMILION.id),
+                    options = ThemeAccent.entries.map { SettingChoice(it.id, it.label) },
+                    enabled = !dynamicColorOn,
+                    accentPicker = true,
+                ) { next -> putString(SettingsKeys.THEME_ACCENT, next) },
                 toggle(
                     id = "dynamic_color",
                     title = "动态取色",
-                    subtitle = "使用 Material You 壁纸配色（Android 12+）",
+                    subtitle = "用壁纸主色做强调色（Android 12+）",
                     key = SettingsKeys.DYNAMIC_COLOR,
                     default = false,
                     enabled = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S,
+                ),
+                // 深色跟随：与小说阅读快捷面板「深色自动切换」行同键同步。
+                toggle(
+                    id = "novel_dark_follow",
+                    title = "深色时小说背景自动切换",
+                    subtitle = "App 进入深色时小说阅读背景自动切到墨黑，回浅色恢复原档",
+                    key = SettingsKeys.NOVEL_DARK_FOLLOW,
+                    default = true,
                 ),
             ),
         ),
@@ -1142,6 +1435,42 @@ private fun buildSettingsGroups(
                         SettingChoice(SettingsKeys.VIEW_FOLDER, "书夹"),
                         SettingChoice(SettingsKeys.VIEW_SERIES, "系列"),
                         SettingChoice(SettingsKeys.VIEW_FLAT, "平铺"),
+                    ),
+                ),
+                choice(
+                    id = "library_shelf_view",
+                    title = "书架展示",
+                    subtitle = "作用于书夹、系列、平铺的一级页",
+                    key = SettingsKeys.LIBRARY_SHELF_VIEW,
+                    default = SettingsKeys.SHELF_VIEW_GRID,
+                    options = listOf(
+                        SettingChoice(SettingsKeys.SHELF_VIEW_GRID, "网格"),
+                        SettingChoice(SettingsKeys.SHELF_VIEW_LIST, "列表"),
+                    ),
+                ),
+                choice(
+                    id = "library_series_mode",
+                    title = "系列结构",
+                    subtitle = "只影响「系列」视图，切换不需要重扫",
+                    key = SettingsKeys.LIBRARY_SERIES_MODE,
+                    default = SettingsKeys.SERIES_MODE_HIERARCHY,
+                    options = listOf(
+                        SettingChoice(SettingsKeys.SERIES_MODE_HIERARCHY, "层级系列"),
+                        SettingChoice(SettingsKeys.SERIES_MODE_FLAT, "扁平系列"),
+                    ),
+                ),
+                choice(
+                    id = "library_scan_depth",
+                    title = "扫描深度",
+                    subtitle = "嵌套文件夹最多下钻几层（默认 3 层）",
+                    key = SettingsKeys.LIBRARY_SCAN_DEPTH,
+                    default = "3",
+                    options = listOf(
+                        SettingChoice("1", "1 层"),
+                        SettingChoice("2", "2 层"),
+                        SettingChoice("3", "3 层"),
+                        SettingChoice("4", "4 层"),
+                        SettingChoice("5", "5 层"),
                     ),
                 ),
             ),
@@ -1447,7 +1776,7 @@ private fun buildSettingsGroups(
                         id = "novel_page_transition",
                         title = "动画",
                         subtitle = "点击翻页的过渡效果，独立于漫画；拖拽与跳页不受影响",
-                        value = stringOf(SettingsKeys.NOVEL_PAGE_TRANSITION, SettingsKeys.PAGE_TRANSITION_CURL),
+                        value = stringOf(SettingsKeys.NOVEL_PAGE_TRANSITION, SettingsKeys.PAGE_TRANSITION_SLIDE),
                         options = listOf(
                             SettingChoice(SettingsKeys.PAGE_TRANSITION_INSTANT, "无动画"),
                             SettingChoice(SettingsKeys.PAGE_TRANSITION_SLIDE, "平移"),
@@ -1458,11 +1787,12 @@ private fun buildSettingsGroups(
                     ChoiceSpec(
                         id = "novel_global_paging",
                         title = "默认方向",
-                        subtitle = "左右翻页或上下翻页",
+                        subtitle = "翻页方向或纵向连续滚动",
                         value = defaults.pagingMode,
                         options = listOf(
                             SettingChoice(SettingsKeys.NOVEL_PAGE_HORIZONTAL, "左右翻页"),
                             SettingChoice(SettingsKeys.NOVEL_PAGE_VERTICAL, "上下翻页"),
+                            SettingChoice(SettingsKeys.NOVEL_PAGE_SCROLL, "纵向连续"),
                         ),
                     ) { next -> putGlobal(defaults.copy(pagingMode = next)) },
                     ChoiceSpec(
@@ -1549,6 +1879,11 @@ private fun buildSettingsGroups(
                     !syncUi.configured -> "未配置"
                     !syncUi.enabled -> "已停用"
                     syncUi.syncing -> "同步中…"
+                    syncUi.waitingWifi -> "等待 WiFi"
+                    syncUi.cooldownUntil > System.currentTimeMillis() -> "冷却至 " + java.text.SimpleDateFormat(
+                        "HH:mm",
+                        java.util.Locale.getDefault(),
+                    ).format(java.util.Date(syncUi.cooldownUntil))
                     syncUi.lastOkAt > 0L -> "上次 " + java.text.SimpleDateFormat(
                         "MM-dd HH:mm",
                         java.util.Locale.getDefault(),
@@ -1595,21 +1930,12 @@ private fun buildSettingsGroups(
                             ),
                         )
                         add(
-                            toggle(
-                                id = "sync_files_single",
-                                title = "同步单文件导入书籍",
-                                subtitle = "书籍文件保存到云端，其它设备自动下载导入",
-                                key = SettingsKeys.SYNC_FILES_SINGLE,
-                                default = true,
-                            ),
-                        )
-                        add(
-                            toggle(
-                                id = "sync_files_all",
-                                title = "全部同步",
-                                subtitle = "扩展到所有单文件书籍（ZIP/EPUB 等）；文件夹漫画不参与",
-                                key = SettingsKeys.SYNC_FILES_ALL,
-                                default = false,
+                            ActionSpec(
+                                id = "sync_scope",
+                                title = "同步范围",
+                                subtitle = "选择哪些书籍文件上传到云端；进度与标注始终同步",
+                                value = syncUi.fileScopeSummary.ifBlank { "未选择" },
+                                onAction = onOpenSyncScope,
                             ),
                         )
                         add(
@@ -1703,24 +2029,32 @@ private fun buildSettingsGroups(
                     value = "管理",
                     onAction = onOpenPurifyRules,
                 ),
-                NoteSpec(
+                ActionSpec(
                     id = "storage_cleanup",
                     title = "空间清理",
-                    subtitle = "导入缓存随系统与扫描自动收敛",
-                    message = "手动清理策略随 M4-E 接入",
+                    subtitle = "导入缓存 / 分享图 / 分格缓存 / 孤儿封面",
+                    value = cleanupSummary,
+                    onAction = onOpenCleanup,
                 ),
             ),
         ),
         SettingsGroupSpec(
             id = "privacy",
             title = "隐私与安全",
-            subtitle = "应用锁、无痕阅读、崩溃日志",
+            subtitle = "应用锁与崩溃日志",
             specs = listOf(
+                toggle(
+                    id = "app_lock",
+                    title = "应用锁",
+                    subtitle = "离开 30 秒后需验证系统锁屏凭据；未设置锁屏密码时不生效",
+                    key = SettingsKeys.APP_LOCK_ENABLED,
+                    default = false,
+                ),
                 NoteSpec(
-                    id = "privacy_placeholder",
-                    title = "隐私与安全",
-                    subtitle = "当前为纯本地阅读，不采集数据",
-                    message = "应用锁与诊断策略后续接入",
+                    id = "app_lock_hint",
+                    title = "验证方式",
+                    subtitle = "使用系统锁屏密码 / 图案 / 指纹，应用无法读取这些信息",
+                    message = "崩溃日志已移至「关于与诊断」",
                 ),
             ),
         ),
@@ -1745,10 +2079,50 @@ private fun buildSettingsGroups(
                     subtitle = "DataStore 当前键值数量",
                     value = "$savedCount 项",
                 ),
+                ActionSpec(
+                    id = "about_crash_logs",
+                    title = "崩溃日志",
+                    subtitle = "闪退记录仅存本机，可导出后反馈",
+                    value = "$crashLogCount 条",
+                    onAction = onOpenCrashLogs,
+                ),
+                ActionSpec(
+                    id = "about_privacy",
+                    title = "隐私政策",
+                    subtitle = "数据仅保存在本机；同步为可选项",
+                    value = "查看",
+                    onAction = { onOpenLegalDoc(LegalDoc.PRIVACY) },
+                ),
+                ActionSpec(
+                    id = "about_licenses",
+                    title = "开源许可",
+                    subtitle = "GPL-3.0 与第三方依赖说明",
+                    value = "查看",
+                    onAction = { onOpenLegalDoc(LegalDoc.LICENSES) },
+                ),
+                ActionSpec(
+                    id = "about_gpl",
+                    title = "GPL-3.0 全文",
+                    subtitle = "许可证完整文本（分发合规）",
+                    value = "查看",
+                    onAction = { onOpenLegalDoc(LegalDoc.GPL) },
+                ),
+                ActionSpec(
+                    id = "about_source",
+                    title = "源码与反馈",
+                    subtitle = "GitHub 仓库，问题可在此提交",
+                    value = "打开",
+                    onAction = onOpenSource,
+                ),
             ),
         ),
     )
 }
+
+/** 《设计规范》§5 C-2：底部面板高度上限 = 60% 屏高。 */
+@Composable
+private fun panelMaxHeight(): Dp =
+    (LocalConfiguration.current.screenHeightDp * 0.6f).dp
 
 // ---- M4.5 同步弹层 ----
 
@@ -1758,13 +2132,19 @@ private fun SyncConfigDialog(
     repository: SettingsRepository,
     syncRepository: SyncRepository,
     onDismiss: () -> Unit,
+    onSaved: () -> Unit,
     onNotice: (String) -> Unit,
+    presence: GlassOverlayPresence,
+    backdrop: Backdrop,
 ) {
+    // 系统返回 / 侧滑返回：关面板，不退出设置页（GlassOverlay 只处理遮罩点击）
+    BackHandler(enabled = visible) { onDismiss() }
     val scope = rememberCoroutineScope()
     var server by remember { mutableStateOf("") }
     var account by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var basePath by remember { mutableStateOf("/Inkvol/") }
+    var allowInsecure by remember { mutableStateOf(false) }
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf("") }
     var loaded by remember { mutableStateOf(false) }
@@ -1776,11 +2156,10 @@ private fun SyncConfigDialog(
                 .ifBlank { "https://dav.jianguoyun.com/dav/" }
             account = repository.stringOf(prefs, SettingsKeys.SYNC_ACCOUNT, "")
             basePath = repository.stringOf(prefs, SettingsKeys.SYNC_BASE_PATH, "/Inkvol/")
+            allowInsecure = repository.booleanOf(prefs, SettingsKeys.SYNC_ALLOW_INSECURE_TLS, false)
             loaded = true
         }
     }
-
-    if (!visible) return
 
     fun normalizeBasePath(raw: String): String = raw.trim().let {
         (if (it.startsWith("/")) it else "/$it").let { p -> if (p.endsWith("/")) p else "$p/" }
@@ -1794,24 +2173,40 @@ private fun SyncConfigDialog(
             testResult = "请先填写服务器与账号"
             return
         }
+        if (!srv.startsWith("http://") && !srv.startsWith("https://")) {
+            testResult = "服务器地址需以 http:// 或 https:// 开头"
+            return
+        }
         testing = true
         testResult = ""
+        val insecure = allowInsecure
+        val base = normalizeBasePath(basePath)
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
             val outcome = runCatching {
-                val client = WebDavClient(srv, normalizeBasePath(basePath), acct, pwd)
+                val client = WebDavClient(srv, base, acct, pwd, allowInsecureTls = insecure)
+                // 第 1 步：读目录（404 / 空目录都算通过——首次启用还没建）
                 client.list("")
-                client.makeCollection("")
-                client.makeCollection(SyncRepository.DEVICE_DIR)
-                client.makeCollection(SyncRepository.BOOK_DIR)
+                // 第 2 步：逐级建目录（幂等；父级缺失也能建）
+                client.ensureCollections(SyncRepository.DEVICE_DIR, SyncRepository.BOOK_DIR)
+                // 第 3 步：复核目录是否真的生效
+                val names = client.list("").map { it.name }.toSet()
+                if ("devices" !in names || "books" !in names) {
+                    throw DavException("目录创建后未出现在列表中（服务器可能只读）", 0)
+                }
+                "连接成功 · 路径 $base · 可写"
             }
             kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
                 testing = false
                 testResult = outcome.fold(
-                    onSuccess = { "连接成功，目录已就绪" },
-                    onFailure = {
-                        when (val e = it as? DavException) {
-                            null -> "网络错误：${it.message ?: "未知"}"
-                            else -> if (e.statusCode == 401) "账号或应用密码错误（401）" else "失败（HTTP ${e.statusCode}）：${e.message ?: ""}"
+                    onSuccess = { it },
+                    onFailure = { e ->
+                        when {
+                            e is DavException && e.statusCode == 401 -> "账号或应用密码错误（401）"
+                            e is DavException && e.statusCode == 403 ->
+                                "权限不足（403）：请确认应用密码有读写权限"
+                            e is DavException && e.statusCode == 0 -> "连接失败：${e.message ?: ""}"
+                            e is DavException -> "失败（HTTP ${e.statusCode}）：${e.message ?: ""}"
+                            else -> "失败：${e.message ?: e.javaClass.simpleName}"
                         }
                     },
                 )
@@ -1819,18 +2214,64 @@ private fun SyncConfigDialog(
         }
     }
 
-    androidx.compose.material3.AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("同步服务配置") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    val chrome = LocalGlassChrome.current
+    GlassOverlay(
+        visible = visible,
+        motion = GlassOverlayMotion.BottomPanel,
+        onDismiss = onDismiss,
+        backdrop = backdrop,
+        presence = presence,
+        alignment = Alignment.BottomCenter,
+        modifier = Modifier
+            .imePadding()
+            .navigationBarsPadding()
+            .padding(
+                start = 16.dp,
+                end = 16.dp + chrome.railEndInset,
+                bottom = 16.dp,
+            )
+            .widthIn(max = 560.dp)
+            .fillMaxWidth()
+            .heightIn(max = panelMaxHeight()),
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
+                Text(
+                    "同步服务配置",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text("关闭") }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 OutlinedTextField(
                     value = server,
                     onValueChange = { server = it },
-                    label = { Text("服务器 URL（https）") },
+                    label = { Text("服务器 URL（http/https）") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                if (server.trim().startsWith("http://")) {
+                    Text(
+                        "明文 http 连接，仅建议在局域网内使用",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
                 OutlinedTextField(
                     value = account,
                     onValueChange = { account = it },
@@ -1858,8 +2299,23 @@ private fun SyncConfigDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                TextButton(onClick = { runTest() }, enabled = !testing) {
-                    Text(if (testing) "测试中…" else "测试连接")
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "允许自签证书",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                        Text(
+                            "仅对自建 NAS 的 HTTPS 自签证书有效，安全性降低",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    InkvolSwitch(checked = allowInsecure, onCheckedChange = { allowInsecure = it })
                 }
                 if (testResult.isNotBlank()) {
                     Text(
@@ -1873,30 +2329,288 @@ private fun SyncConfigDialog(
                     )
                 }
             }
-        },
-        confirmButton = {
-            TextButton(
-                enabled = !testing && server.startsWith("https://") &&
-                    account.isNotBlank() && password.isNotBlank(),
-                onClick = {
-                    scope.launch {
-                        repository.putString(SettingsKeys.SYNC_SERVER, server.trim())
-                        repository.putString(SettingsKeys.SYNC_ACCOUNT, account.trim())
-                        repository.putString(SettingsKeys.SYNC_BASE_PATH, normalizeBasePath(basePath))
-                        if (password.isNotBlank()) {
-                            repository.putString(SettingsKeys.SYNC_PASSWORD_ENC, CryptoBox.encrypt(password))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            ) {
+                TextButton(onClick = { runTest() }, enabled = !testing) {
+                    Text(if (testing) "测试中…" else "测试连接")
+                }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text("取消") }
+                Button(
+                    enabled = !testing &&
+                        (server.trim().startsWith("https://") || server.trim().startsWith("http://")) &&
+                        account.isNotBlank() && password.isNotBlank(),
+                    onClick = {
+                        scope.launch {
+                            repository.putString(SettingsKeys.SYNC_SERVER, server.trim())
+                            repository.putString(SettingsKeys.SYNC_ACCOUNT, account.trim())
+                            repository.putString(
+                                SettingsKeys.SYNC_BASE_PATH,
+                                normalizeBasePath(basePath),
+                            )
+                            repository.putBoolean(SettingsKeys.SYNC_ALLOW_INSECURE_TLS, allowInsecure)
+                            if (password.isNotBlank()) {
+                                repository.putString(
+                                    SettingsKeys.SYNC_PASSWORD_ENC,
+                                    CryptoBox.encrypt(password),
+                                )
+                            }
+                            repository.putBoolean(SettingsKeys.SYNC_ENABLED, true)
+                            syncRepository.refreshState()
+                            onNotice("已保存，请选择同步范围")
+                            onSaved()
                         }
-                        repository.putBoolean(SettingsKeys.SYNC_ENABLED, true)
-                        syncRepository.refreshState()
-                        onNotice("已保存，开始首次同步…")
-                        syncRepository.syncNowAsync("首次同步")
-                        onDismiss()
+                    },
+                ) { Text("保存并选择范围") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SyncScopeDialog(
+    visible: Boolean,
+    syncRepository: SyncRepository,
+    onDismiss: () -> Unit,
+    presence: GlassOverlayPresence,
+    backdrop: Backdrop,
+) {
+    BackHandler(enabled = visible) { onDismiss() }
+    val scope = rememberCoroutineScope()
+    var loading by remember { mutableStateOf(true) }
+    var folders by remember { mutableStateOf<List<InkvolDatabase.ScopeFolderRow>>(emptyList()) }
+    var singleBooks by remember { mutableStateOf(0) }
+    var all by remember { mutableStateOf(false) }
+    var single by remember { mutableStateOf(true) }
+    var selected by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    var saving by remember { mutableStateOf(false) }
+
+    LaunchedEffect(visible) {
+        if (!visible) return@LaunchedEffect
+        loading = true
+        runCatching { syncRepository.loadScopeEditor() }.onSuccess { data ->
+            all = data.scope.all
+            single = data.scope.single
+            selected = data.scope.folderIds.toSet()
+            folders = data.folders
+            singleBooks = data.singleLibraryBooks
+        }
+        loading = false
+    }
+
+    fun confirm() {
+        if (saving) return
+        saving = true
+        scope.launch {
+            syncRepository.saveFileScope(
+                SyncFileScope(
+                    all = all,
+                    single = single,
+                    folderIds = selected.toList(),
+                ),
+            )
+            syncRepository.syncNowAsync("首次同步")
+            saving = false
+            onDismiss()
+        }
+    }
+
+    val chrome = LocalGlassChrome.current
+    GlassOverlay(
+        visible = visible,
+        motion = GlassOverlayMotion.BottomPanel,
+        onDismiss = onDismiss,
+        backdrop = backdrop,
+        presence = presence,
+        alignment = Alignment.BottomCenter,
+        modifier = Modifier
+            .navigationBarsPadding()
+            .padding(
+                start = 16.dp,
+                end = 16.dp + chrome.railEndInset,
+                bottom = 16.dp,
+            )
+            .widthIn(max = 560.dp)
+            .fillMaxWidth()
+            .heightIn(max = panelMaxHeight()),
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
+                Text(
+                    "同步范围",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text("关闭") }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "全部同步",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Text(
+                        "所有可单文件传输的书籍都上传；文件夹漫画不参与",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                InkvolSwitch(
+                    checked = all,
+                    onCheckedChange = { checked ->
+                        all = checked
+                        if (checked) {
+                            single = true
+                            selected = folders.map { it.id }.toSet()
+                        }
+                    },
+                )
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            if (loading) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                ) {
+                    Text(
+                        "读取文件夹…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    item(key = "single") {
+                        ScopeRow(
+                            title = "单文件导入（散书）",
+                            subtitle = "$singleBooks 本",
+                            checked = all || single,
+                            enabled = !all,
+                        ) { single = !single }
                     }
-                },
-            ) { Text("保存并启用") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
-    )
+                    items(folders, key = { it.id }) { folder ->
+                        val folderOnly = (folder.totalBooks - folder.transferableBooks).coerceAtLeast(0)
+                        ScopeRow(
+                            title = folder.name.ifBlank { "文件夹 ${folder.id}" },
+                            subtitle = buildString {
+                                append("${folder.transferableBooks} 本可同步")
+                                if (folderOnly > 0) append(" · 其中 $folderOnly 本文件夹漫画不参与")
+                                if (folder.libraryName.isNotBlank() && folder.libraryName != folder.name) {
+                                    append(" · ${folder.libraryName}")
+                                }
+                            },
+                            checked = all || folder.id in selected,
+                            enabled = !all,
+                        ) {
+                            selected = if (folder.id in selected) {
+                                selected - folder.id
+                            } else {
+                                selected + folder.id
+                            }
+                        }
+                    }
+                    if (folders.isEmpty()) {
+                        item(key = "empty") {
+                            Text(
+                                "还没有导入任何文件夹",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 10.dp),
+                            )
+                        }
+                    }
+                }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            ) {
+                TextButton(
+                    enabled = !all,
+                    onClick = {
+                        single = false
+                        selected = emptySet()
+                    },
+                ) { Text("全不选") }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text("稍后") }
+                Button(onClick = { confirm() }, enabled = !saving) {
+                    Text(if (saving) "保存中…" else "保存并同步")
+                }
+            }
+        }
+    }
+}
+
+/** 同步范围单行：复选框 + 标题 + 副标题（书数/文件夹漫画提示）。 */
+@Composable
+private fun ScopeRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    enabled: Boolean,
+    onToggle: () -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(enabled = enabled, onClick = onToggle)
+            .padding(horizontal = 4.dp, vertical = 4.dp)
+            .alpha(if (enabled) 1f else 0.55f),
+    ) {
+        Checkbox(
+            checked = checked,
+            onCheckedChange = { if (enabled) onToggle() },
+            enabled = enabled,
+        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
 }
 
 @Composable
@@ -1904,47 +2618,99 @@ private fun SyncLogDialog(
     visible: Boolean,
     syncRepository: SyncRepository,
     onDismiss: () -> Unit,
+    presence: GlassOverlayPresence,
+    backdrop: Backdrop,
 ) {
-    if (!visible) return
-    val entries = remember { syncRepository.syncLog() }
-    androidx.compose.material3.AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("同步记录") },
-        text = {
+    BackHandler(enabled = visible) { onDismiss() }
+    var entries by remember { mutableStateOf(syncRepository.syncLog()) }
+    LaunchedEffect(visible) {
+        if (visible) entries = syncRepository.syncLog()
+    }
+    val chrome = LocalGlassChrome.current
+    GlassOverlay(
+        visible = visible,
+        motion = GlassOverlayMotion.BottomPanel,
+        onDismiss = onDismiss,
+        backdrop = backdrop,
+        presence = presence,
+        alignment = Alignment.BottomCenter,
+        modifier = Modifier
+            .navigationBarsPadding()
+            .padding(
+                start = 16.dp,
+                end = 16.dp + chrome.railEndInset,
+                bottom = 16.dp,
+            )
+            .widthIn(max = 560.dp)
+            .fillMaxWidth()
+            .heightIn(max = panelMaxHeight()),
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
+                Text(
+                    "同步记录",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text("关闭") }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             if (entries.isEmpty()) {
-                Text("暂无同步记录")
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                ) {
+                    Text(
+                        "暂无同步记录",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             } else {
                 LazyColumn(
-                    modifier = Modifier.heightIn(max = 360.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     items(entries) { entry ->
-                        Column {
-                            Text(
-                                text = buildString {
-                                    append(java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(entry.at)))
-                                    append(if (entry.ok) "  成功" else "  失败")
-                                    if (entry.ok) {
-                                        append(" · 拉取 ${entry.pulled} · 推送 ${entry.pushed}")
-                                        if (entry.conflicts > 0) append(" · 冲突 ${entry.conflicts}")
-                                    } else {
-                                        append(" · ").append(entry.message ?: entry.errorKind ?: "")
-                                    }
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (entry.ok) {
-                                    MaterialTheme.colorScheme.onSurface
+                        Text(
+                            text = buildString {
+                                append(
+                                    java.text.SimpleDateFormat(
+                                        "MM-dd HH:mm",
+                                        java.util.Locale.getDefault(),
+                                    ).format(java.util.Date(entry.at)),
+                                )
+                                append(if (entry.ok) "  成功" else "  失败")
+                                if (entry.ok) {
+                                    append(" · 拉取 ${entry.pulled} · 推送 ${entry.pushed}")
+                                    if (entry.conflicts > 0) append(" · 冲突 ${entry.conflicts}")
                                 } else {
-                                    MaterialTheme.colorScheme.error
-                                },
-                            )
-                        }
+                                    append(" · ").append(entry.message ?: entry.errorKind ?: "")
+                                }
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (entry.ok) {
+                                MaterialTheme.colorScheme.onSurface
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            },
+                        )
                     }
                 }
             }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
-    )
+        }
+    }
 }
 
 @Composable
@@ -1953,7 +2719,10 @@ private fun SyncDeviceNameDialog(
     repository: SettingsRepository,
     syncRepository: SyncRepository,
     onDismiss: () -> Unit,
+    presence: GlassOverlayPresence,
+    backdrop: Backdrop,
 ) {
+    BackHandler(enabled = visible) { onDismiss() }
     val scope = rememberCoroutineScope()
     var name by remember { mutableStateOf("") }
     LaunchedEffect(visible) {
@@ -1961,30 +2730,78 @@ private fun SyncDeviceNameDialog(
             name = syncRepository.state.value.deviceName
         }
     }
-    if (!visible) return
-    androidx.compose.material3.AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("设备名") },
-        text = {
-            OutlinedTextField(
-                value = name,
-                onValueChange = { name = it },
-                label = { Text("留空使用默认（厂商+型号）") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
+    val chrome = LocalGlassChrome.current
+    GlassOverlay(
+        visible = visible,
+        motion = GlassOverlayMotion.BottomPanel,
+        onDismiss = onDismiss,
+        backdrop = backdrop,
+        presence = presence,
+        alignment = Alignment.BottomCenter,
+        modifier = Modifier
+            .imePadding()
+            .navigationBarsPadding()
+            .padding(
+                start = 16.dp,
+                end = 16.dp + chrome.railEndInset,
+                bottom = 16.dp,
             )
-        },
-        confirmButton = {
-            TextButton(onClick = {
-                scope.launch {
-                    repository.putString(SettingsKeys.SYNC_DEVICE_NAME, name.trim())
-                    syncRepository.refreshState()
-                    onDismiss()
-                }
-            }) { Text("保存") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
-    )
+            .widthIn(max = 560.dp)
+            .fillMaxWidth()
+            .heightIn(max = panelMaxHeight()),
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
+                Text(
+                    "设备名",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text("关闭") }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("留空使用默认（厂商+型号）") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            ) {
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text("取消") }
+                Button(
+                    onClick = {
+                        scope.launch {
+                            repository.putString(SettingsKeys.SYNC_DEVICE_NAME, name.trim())
+                            syncRepository.refreshState()
+                            onDismiss()
+                        }
+                    },
+                ) { Text("保存") }
+            }
+        }
+    }
 }
 
 @Composable
@@ -1993,7 +2810,10 @@ private fun SyncCloudBooksDialog(
     syncRepository: SyncRepository,
     onDismiss: () -> Unit,
     onNotice: (String) -> Unit,
+    presence: GlassOverlayPresence,
+    backdrop: Backdrop,
 ) {
+    BackHandler(enabled = visible) { onDismiss() }
     val scope = rememberCoroutineScope()
     var loading by remember { mutableStateOf(false) }
     var books by remember { mutableStateOf<List<SyncFiles.CloudBookInfo>>(emptyList()) }
@@ -2014,8 +2834,6 @@ private fun SyncCloudBooksDialog(
         if (visible) refresh()
     }
 
-    if (!visible) return
-
     fun downloadMissing() {
         if (downloading) return
         downloading = true
@@ -2034,11 +2852,47 @@ private fun SyncCloudBooksDialog(
         }
     }
 
-    androidx.compose.material3.AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("云端书籍") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    val chrome = LocalGlassChrome.current
+    GlassOverlay(
+        visible = visible,
+        motion = GlassOverlayMotion.BottomPanel,
+        onDismiss = onDismiss,
+        backdrop = backdrop,
+        presence = presence,
+        alignment = Alignment.BottomCenter,
+        modifier = Modifier
+            .navigationBarsPadding()
+            .padding(
+                start = 16.dp,
+                end = 16.dp + chrome.railEndInset,
+                bottom = 16.dp,
+            )
+            .widthIn(max = 560.dp)
+            .fillMaxWidth()
+            .heightIn(max = panelMaxHeight()),
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
+                Text(
+                    "云端书籍",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onDismiss) { Text("关闭") }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+            ) {
                 val missing = books.count { !it.existsLocally }
                 Text(
                     if (loading) "读取中…" else "云端 ${books.size} 本 · 本地缺失 $missing 本",
@@ -2046,11 +2900,18 @@ private fun SyncCloudBooksDialog(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 if (error.isNotBlank()) {
-                    Text(error, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    Text(
+                        error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
                 }
+                Spacer(Modifier.height(8.dp))
                 LazyColumn(
-                    modifier = Modifier.heightIn(max = 300.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     items(books) { info ->
                         Row(modifier = Modifier.fillMaxWidth()) {
@@ -2074,13 +2935,76 @@ private fun SyncCloudBooksDialog(
                     }
                 }
             }
-        },
-        confirmButton = {
-            TextButton(
-                enabled = books.any { !it.existsLocally } && !downloading && error.isBlank(),
-                onClick = { downloadMissing() },
-            ) { Text(if (downloading) "下载中…" else "下载缺失") }
-        },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("关闭") } },
-    )
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            ) {
+                Spacer(Modifier.weight(1f))
+                Button(
+                    enabled = books.any { !it.existsLocally } && !downloading && error.isBlank(),
+                    onClick = { downloadMissing() },
+                ) { Text(if (downloading) "下载中…" else "下载缺失") }
+            }
+        }
+    }
+}
+
+/** §5 模式 B：清除同步配置确认（居中玻璃卡，宽 340，避让侧栏）。 */
+@Composable
+private fun SyncClearConfirmOverlay(
+    visible: Boolean,
+    presence: GlassOverlayPresence,
+    backdrop: Backdrop,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val chrome = LocalGlassChrome.current
+    BackHandler(enabled = visible) { onDismiss() }
+    GlassOverlay(
+        visible = visible,
+        motion = GlassOverlayMotion.Card,
+        onDismiss = onDismiss,
+        backdrop = backdrop,
+        presence = presence,
+        alignment = Alignment.Center,
+        modifier = Modifier
+            .padding(end = chrome.railEndInset)
+            .widthIn(max = 340.dp)
+            .fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(20.dp)) {
+            Text(
+                text = "清除同步配置？",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "将删除本机的服务器、账号与应用密码配置并停用同步。" +
+                    "云端数据与其它设备不受影响；重新配置后可重新配对。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(16.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                TextButton(onClick = onDismiss) { Text("取消") }
+                Spacer(Modifier.width(8.dp))
+                Button(
+                    onClick = onConfirm,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError,
+                    ),
+                ) {
+                    Text("清除")
+                }
+            }
+        }
+    }
 }

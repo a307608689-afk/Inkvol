@@ -49,14 +49,20 @@ data class SearchFilter(
     val writers: TriStateSet = TriStateSet(), // 作者名精确值
     val readStatus: String? = null, // null / UNREAD / READING / FINISHED（单选）
     val formats: Set<String> = emptySet(), // FOLDER/CBZ/CBR/CB7/PDF/TXT/EPUB/MOBI
+    /** 分区筛选（多选）：参与结果页的模块。缺省=全开（旧筛选/模板反序列化走默认值）。 */
+    val sections: Set<String> = ALL_SECTIONS,
 ) {
-    /** 角标口径：类型≠空 + 状态≠空 + 格式非空 + 各三态 include+exclude 计数。 */
+    /** 分区开关（结果页按此隐藏对应模块；查询层同步短路）。 */
+    fun sectionOn(id: String): Boolean = id in sections
+
+    /** 角标口径：类型≠空 + 状态≠空 + 格式非空 + 分区非全开 + 各三态 include+exclude 计数。 */
     fun activeCount(): Int =
         (if (type != null) 1 else 0) +
             categories.count + folders.count + series.count + tags.count +
             writers.count +
             (if (readStatus != null) 1 else 0) +
-            formats.size
+            formats.size +
+            (if (sections != ALL_SECTIONS) 1 else 0)
 
     fun isEmpty(): Boolean = activeCount() == 0
 
@@ -75,6 +81,13 @@ data class SearchFilter(
 
         /** 与 LibraryScanner 入库字面量对齐（detect 的 ZIP/RAR/SEVEN_Z 只是中间值，不入库）。 */
         val FORMAT_OPTIONS = listOf("FOLDER", "CBZ", "CBR", "CB7", "PDF", "TXT", "EPUB", "MOBI")
+
+        /** 分区 id：书 / 笔记（批注+划线+书签）/ 章节标题 / 正文。 */
+        const val SECTION_BOOK = "book"
+        const val SECTION_NOTE = "note"
+        const val SECTION_CHAPTER = "chapter"
+        const val SECTION_BODY = "body"
+        val ALL_SECTIONS = setOf(SECTION_BOOK, SECTION_NOTE, SECTION_CHAPTER, SECTION_BODY)
     }
 }
 
@@ -187,12 +200,19 @@ data class FullTextBookGroup(
     val hits: List<FullTextHit>,
 )
 
+/** 笔记命中：标注（划线/批注/书签同存 annotations 表）+ 其所在书。 */
+data class SearchNoteRow(
+    val book: BookRecord,
+    val annotation: com.inkvol.app.data.model.AnnotationRecord,
+)
+
 /** 搜索页会话状态（repository 持有，跨 Tab/进阅读器存活；Screen 渲染）。 */
 data class SearchState(
     val query: String = "",
     val searched: Boolean = false,
     val loading: Boolean = false,
     val books: List<BookRecord> = emptyList(),
+    val notes: List<SearchNoteRow> = emptyList(),
     val chapterHits: List<SearchChapterRow> = emptyList(),
     val bodyGroups: List<FullTextBookGroup> = emptyList(),
     /** 正文扫描进度（scanned to total）；null=未在扫。 */

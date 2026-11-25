@@ -1,5 +1,7 @@
 package com.inkvol.app.ui.library
 
+import android.content.Intent
+import android.provider.DocumentsContract
 import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -55,6 +57,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -73,7 +76,9 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -142,6 +147,7 @@ import com.inkvol.app.data.settings.SettingsRepository
 import com.inkvol.app.ui.components.LocalGlassNotice
 import com.inkvol.app.ui.components.LocalPageOverlayController
 import com.inkvol.app.ui.components.LocalReaderOpenController
+import com.inkvol.app.ui.components.LibraryShelfListScroll
 import com.inkvol.app.ui.components.LibraryDetailScroll
 import com.inkvol.app.ui.components.LibraryGridScroll
 import com.inkvol.app.ui.components.LibraryPullRefresh
@@ -158,6 +164,7 @@ import com.inkvol.app.ui.components.glass.GlassOverlay
 import com.inkvol.app.ui.components.glass.GlassOverlayMotion
 import com.inkvol.app.ui.components.glass.GlassOverlayPresence
 import com.inkvol.app.ui.components.glass.PlusMenuOverlay
+import com.inkvol.app.ui.components.glass.SelectionMenuOverlay
 import com.inkvol.app.ui.components.glass.FolderSortMenuOverlay
 import com.inkvol.app.ui.components.glass.SortMenuOverlay
 import com.inkvol.app.ui.components.glass.GlassRounded
@@ -187,7 +194,140 @@ private val CATEGORY_COLORS = listOf(
 internal sealed interface LibraryTarget {
     data class User(val id: Long, val name: String, val color: String) : LibraryTarget
     data class System(val kind: SystemCategory) : LibraryTarget
-    data class Series(val name: String) : LibraryTarget
+
+    /**
+     * 系列（文件夹）。
+     * - [path] = 相对书库根的目录路径（"" = 库根伪系列「未归档」，
+     *   "海贼王/单行本" = 二级目录）；
+     * - [path] 以 "@name:" 开头 = 搜索页按系列名进入（没有路径，按名字匹配）。
+     */
+    data class Series(val path: String, val name: String) : LibraryTarget {
+        companion object {
+            const val NAME_PREFIX = "@name:"
+            fun byName(name: String) = Series(NAME_PREFIX + name, name)
+        }
+    }
+}
+
+/** 库根直接存放的书在系列视图里的伪系列名（与「未分类」书夹区分）。 */
+private const val ROOT_SERIES_LABEL = "未归档"
+
+/** 旧数据（v12 前 / 单文件导入）没有 folderPath，按旧 series 名退化。 */
+private const val LEGACY_SERIES_PREFIX = "@legacy:"
+
+/**
+ * 书所属的叶子系列（直接父目录）——系列视图的唯一归属真源。
+ * - folderPath 非空（含 ""）→ 目录自身（文件夹为准，ComicInfo 元数据不参与）
+ * - null → 旧数据 / 单文件导入：按旧 series 名（缺省书名）退化，视觉与改前一致
+ */
+private fun leafSeriesOf(book: BookRecord): Pair<String, String> {
+    val path = book.folderPath
+    if (path != null) {
+        val name = if (path.isEmpty()) ROOT_SERIES_LABEL else path.substringAfterLast('/')
+        return path to name
+    }
+    val legacy = book.series?.takeIf { it.isNotBlank() } ?: book.title
+    return LEGACY_SERIES_PREFIX + legacy to legacy
+}
+
+/** 系列路径的显示名（末段；根 / 旧数据 / 按名入口特殊处理）。 */
+private fun seriesNameOf(path: String): String = when {
+    path.isEmpty() -> ROOT_SERIES_LABEL
+    path.startsWith(LEGACY_SERIES_PREFIX) -> path.removePrefix(LEGACY_SERIES_PREFIX)
+    path.startsWith(LibraryTarget.Series.NAME_PREFIX) ->
+        path.removePrefix(LibraryTarget.Series.NAME_PREFIX)
+
+    else -> path.substringAfterLast('/')
+}
+
+/** 系列卡节点：path 唯一；books = 该节点子树内的全部书（拼贴/计数/排序同源）。 */
+private data class SeriesNode(
+    val path: String,
+    val name: String,
+    val books: List<BookRecord>,
+)
+
+/** 层级模式一级卡：库根下的第一层文件夹（根层直接书归「未归档」）。 */
+private fun topSeriesNodes(books: List<BookRecord>): List<SeriesNode> {
+    val groups = LinkedHashMap<String, MutableList<BookRecord>>()
+    books.forEach { book ->
+        val leafPath = leafSeriesOf(book).first
+        val topPath = when {
+            leafPath.isEmpty() || leafPath.startsWith("@") -> leafPath
+            else -> leafPath.substringBefore('/')
+        }
+        groups.getOrPut(topPath) { mutableListOf() } += book
+    }
+    return groups.map { (path, list) -> SeriesNode(path, seriesNameOf(path), list) }
+}
+
+/** 层级模式二级及以下：某节点下的子系列（子节点聚合其子树全部书）。 */
+private fun childSeriesNodes(books: List<BookRecord>, path: String): List<SeriesNode> {
+    // 根伪系列「未归档」只代表直接放在库根的书：第一层文件夹已经是一级卡，
+    // 在它的页里再列一遍会重复；@legacy/@name 入口也没有层级语义。
+    if (path.isEmpty() || path.startsWith("@")) return emptyList()
+    val prefix = if (path.isEmpty()) "" else "$path/"
+    val groups = LinkedHashMap<String, MutableList<BookRecord>>()
+    books.forEach { book ->
+        val leafPath = leafSeriesOf(book).first
+        if (leafPath.startsWith("@") || leafPath == path) return@forEach
+        if (!leafPath.startsWith(prefix)) return@forEach
+        val rest = leafPath.removePrefix(prefix)
+        if (rest.isEmpty()) return@forEach
+        val segment = rest.substringBefore('/')
+        val childPath = if (path.isEmpty()) segment else "$path/$segment"
+        groups.getOrPut(childPath) { mutableListOf() } += book
+    }
+    return groups.map { (p, list) -> SeriesNode(p, seriesNameOf(p), list) }
+}
+
+/** 扁平模式：直接包含书的那一层目录各成一系列（同名不同父加父目录名后缀）。 */
+private fun flatSeriesNodes(books: List<BookRecord>): List<SeriesNode> {
+    val groups = LinkedHashMap<String, MutableList<BookRecord>>()
+    books.forEach { book ->
+        groups.getOrPut(leafSeriesOf(book).first) { mutableListOf() } += book
+    }
+    val nameCounts = groups.keys.groupingBy { seriesNameOf(it) }.eachCount()
+    return groups.map { (path, list) ->
+        val raw = seriesNameOf(path)
+        val name = if ((nameCounts[raw] ?: 0) > 1) {
+            val parent = when {
+                path.startsWith("@") || !path.contains('/') -> "库根"
+                else -> path.substringBeforeLast('/').substringAfterLast('/')
+            }
+            "$raw · $parent"
+        } else {
+            raw
+        }
+        SeriesNode(path, name, list)
+    }
+}
+
+private fun seriesNodesFor(books: List<BookRecord>, mode: String): List<SeriesNode> =
+    if (mode == SettingsKeys.SERIES_MODE_FLAT) flatSeriesNodes(books) else topSeriesNodes(books)
+
+/** 书是否属于某系列节点：层级模式 = 子树；扁平 / 按名入口 = 精确 / 按名。 */
+private fun bookInSeries(book: BookRecord, path: String, mode: String): Boolean {
+    val (leafPath, leafName) = leafSeriesOf(book)
+    if (path.startsWith(LibraryTarget.Series.NAME_PREFIX)) {
+        val name = path.removePrefix(LibraryTarget.Series.NAME_PREFIX)
+        // 旧数据 leafName 已按 series ?: title 兜底，这里不再单独匹配书名（防多收）
+        return leafName == name || book.series == name
+    }
+    if (path.isEmpty()) return leafPath.isEmpty()
+    return if (mode == SettingsKeys.SERIES_MODE_FLAT) {
+        leafPath == path
+    } else {
+        leafPath == path || leafPath.startsWith("$path/")
+    }
+}
+
+/** 层级模式的返回父级：只在真实文件夹路径上有父节点（@旧数据/@按名 没有父级）。 */
+private fun parentSeriesTarget(target: LibraryTarget.Series): LibraryTarget.Series? {
+    val path = target.path
+    if (path.startsWith("@") || !path.contains('/')) return null
+    val parentPath = path.substringBeforeLast('/')
+    return LibraryTarget.Series(parentPath, seriesNameOf(parentPath))
 }
 
 /**
@@ -230,7 +370,7 @@ private fun targetKeyOf(target: LibraryTarget?): String? = when (target) {
     null -> null
     is LibraryTarget.User -> "user:${target.id}"
     is LibraryTarget.System -> "system:${target.kind.name}"
-    is LibraryTarget.Series -> "series:${target.name}"
+    is LibraryTarget.Series -> "series:${target.path}"
 }
 
 /** 二级页标题行高度（48 的返回/排序按钮行 + 8 与网格的间距）：计入头部内容高。 */
@@ -317,11 +457,57 @@ private suspend fun restoreGridPositionImpl(
 }
 
 /**
+ * 列表容器版滚动落位（书架列表样式跨方向恢复用）：与 [restoreGridPosition] 同思路，
+ * 但目标行定高、无逐帧重申需求——等 item 数稳定后 scrollToItem 落位一次即可。
+ */
+private suspend fun restoreListPosition(
+    state: LazyListState,
+    index: Int,
+    offset: Int,
+    tag: String,
+) {
+    var prevCount = -1
+    var stable = 0
+    var attempts = 0
+    while (attempts < 40) {
+        val count = state.layoutInfo.totalItemsCount
+        if (count == prevCount) {
+            stable++
+        } else {
+            stable = 0
+            prevCount = count
+        }
+        if (stable >= 2 && count > index) break
+        delay(16)
+        attempts++
+    }
+    if (state.layoutInfo.totalItemsCount > index) {
+        runCatching { state.scrollToItem(index, offset) }
+    }
+    Log.d(
+        "InkvolOpen",
+        "diag restore $tag done attempts=$attempts " +
+            "list=(${state.firstVisibleItemIndex},${state.firstVisibleItemScrollOffset}) " +
+            "count=${state.layoutInfo.totalItemsCount}",
+    )
+}
+
+/**
  * 视图行在网格滚动中的纵向位移（px，正数 = 向上移出）。
  * 网格 item 0 是行高占位：index 0 时按滚动偏移跟手，滚过 item 0 即完全移出。
  * 只应在 graphicsLayer 的 draw 阶段调用（读网格状态不触发重组）。
  */
 private fun viewHeaderScrollPx(state: LazyGridState, headerHeightPx: Float): Float {
+    if (headerHeightPx <= 0f) return 0f
+    return if (state.firstVisibleItemIndex > 0) {
+        headerHeightPx
+    } else {
+        state.firstVisibleItemScrollOffset.toFloat().coerceIn(0f, headerHeightPx)
+    }
+}
+
+/** 列表容器版（书夹列表样式）：语义与网格版一致（item 0 = 行高占位 Spacer）。 */
+private fun viewHeaderScrollPx(state: LazyListState, headerHeightPx: Float): Float {
     if (headerHeightPx <= 0f) return 0f
     return if (state.firstVisibleItemIndex > 0) {
         headerHeightPx
@@ -426,6 +612,33 @@ fun LibraryScreen(
             }
         }
     }
+    // 书架列表样式（library_shelf_view=list）一级页的滚动状态：视图 × 分类 9 个组合
+    // 各持一份 LazyListState（书夹/系列/平铺列表共用此 map——AnimatedContent 转场期间
+    // 新旧两页并存，共用状态会串味，网格 gridStates 同款教训）。离开书架时若列表样式
+    // 活跃，位置落进 LibraryShelfListScroll（进程级），再次进入书架首帧恢复——与
+    // LibraryGridScroll 同范式；网格/列表两套状态互不覆盖，样式来回切换各自原位恢复。
+    val shelfListStates = remember {
+        buildMap<Pair<String, String?>, LazyListState> {
+            for (vm in libraryViewOrder) {
+                for (tf in libraryTypeOrder) {
+                    put(
+                        vm to tf,
+                        if (LibraryShelfListScroll.active &&
+                            LibraryShelfListScroll.viewMode == vm &&
+                            LibraryShelfListScroll.typeFilter == tf
+                        ) {
+                            LazyListState(
+                                firstVisibleItemIndex = LibraryShelfListScroll.index,
+                                firstVisibleItemScrollOffset = LibraryShelfListScroll.offset,
+                            )
+                        } else {
+                            LazyListState()
+                        },
+                    )
+                }
+            }
+        }
+    }
     // 二级页网格：每个 target 一个实例（普通 HashMap，非响应式——实例不需要触发重组）。
     // 放在顶层按需创建而不是内容 lambda 里的 remember(t)：① 头部状态机与恢复逻辑要按
     // 「当前显示的网格」取状态，必须能在顶层拿到；② AnimatedContent 退场页按旧 t 仍取到
@@ -483,16 +696,39 @@ fun LibraryScreen(
                 val restoreSortDescending = snapshot?.let {
                     settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT_DESC, "1")
                 } != "0"
+                val restoreSeriesMode = snapshot?.let {
+                    settingsRepository.stringOf(
+                        it,
+                        SettingsKeys.LIBRARY_SERIES_MODE,
+                        SettingsKeys.SERIES_MODE_HIERARCHY,
+                    )
+                } ?: SettingsKeys.SERIES_MODE_HIERARCHY
+                // 层级系列页的网格前面多了「子系列标题 + 系列卡 + 书籍标题」条目：
+                // 锚点算出的书本序号要加这段偏移，否则旋转返回会落偏到子系列区。
+                val detailSubOffset = if (
+                    restoreSeriesMode == SettingsKeys.SERIES_MODE_HIERARCHY &&
+                    detailTarget is LibraryTarget.Series
+                ) {
+                    val all = libraryRepository.books.value
+                    val tf = LibraryUiState.typeFilter
+                    val source = if (tf == null) all else all.filter { it.type == tf }
+                    val subCount = childSeriesNodes(source, detailTarget.path).size
+                    if (subCount > 0) subCount + 2 else 0
+                } else {
+                    0
+                }
                 index = LibraryGridScroll.anchorBookId?.let { anchorId ->
                     sortBooks(
                         booksOf(
                             detailTarget,
                             libraryRepository.books.value,
                             libraryRepository.categoryBookIds.value,
+                            restoreSeriesMode,
                         ),
                         restoreSortMode,
                         restoreSortDescending,
                     ).indexOfFirst { it.id == anchorId }.takeIf { it >= 0 }
+                        ?.plus(detailSubOffset)
                 } ?: LibraryDetailScroll.index
                 offset = 0
             }
@@ -504,6 +740,64 @@ fun LibraryScreen(
             return@LaunchedEffect
         }
         // ---- 一级书架（视图 × 分类组合）----
+        // 列表样式（library_shelf_view=list，三视图联动）回来时显示页是 LazyColumn：
+        // 跳过网格恢复——restoreGridPosition 会去滚一个没组合的 LazyGridState（settling
+        // 等不到 totalItemsCount），拖住本协程、gridSettled 放不出来（状态栏显隐被挂起）。
+        // 列表位置已由 shelfListStates 初值携带（holder 恢复）。
+        val restoreShelfView = settingsRepository.cachedPreferences()?.let {
+            settingsRepository.stringOf(
+                it,
+                SettingsKeys.LIBRARY_SHELF_VIEW,
+                SettingsKeys.SHELF_VIEW_GRID,
+            )
+        } ?: SettingsKeys.SHELF_VIEW_GRID
+        if (restoreShelfView == SettingsKeys.SHELF_VIEW_LIST) {
+            if (crossOrientation) {
+                // 跨方向：列表行定高，index（线性序号）仍有效、offset 是旧方向像素语义
+                // → 归零。平铺列表的书行会开书，优先锚点到最近打开的书（返回动画的
+                // 飞回目标行要在视口内能回报坐标）；书夹/系列行不开书退回原 index。
+                // 排序档走 cachedPreferences 同步快照（网格跨方向恢复同款模式）。
+                // item 0 = 视图行等高占位，书序号 +1 补偿。
+                var listIndex = LibraryShelfListScroll.index
+                if (restoreViewMode == SettingsKeys.VIEW_FLAT) {
+                    val anchorId = LibraryGridScroll.anchorBookId
+                    if (anchorId != null) {
+                        val snapshot = settingsRepository.cachedPreferences()
+                        val flatBooks = sortBooks(
+                            when (restoreTypeFilter) {
+                                null -> libraryRepository.books.value
+                                else -> libraryRepository.books.value.filter {
+                                    it.type == restoreTypeFilter
+                                }
+                            },
+                            snapshot?.let {
+                                settingsRepository.stringOf(
+                                    it,
+                                    SettingsKeys.LIBRARY_SORT,
+                                    SettingsKeys.SORT_RECENT,
+                                )
+                            } ?: SettingsKeys.SORT_RECENT,
+                            snapshot?.let {
+                                settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT_DESC, "1")
+                            } != "0",
+                        )
+                        flatBooks.indexOfFirst { it.id == anchorId }
+                            .takeIf { it >= 0 }
+                            ?.plus(1)
+                            ?.let { listIndex = it }
+                    }
+                }
+                restoreListPosition(
+                    shelfListStates.getValue(restoreViewMode to restoreTypeFilter),
+                    listIndex,
+                    0,
+                    "shelf-list",
+                )
+            }
+            gridSettled = true
+            Log.d("InkvolOpen", "diag restore gridSettled=true (shelf-list)")
+            return@LaunchedEffect
+        }
         val restoreState = gridStates.getValue(restoreViewMode to restoreTypeFilter)
         var index = LibraryGridScroll.index
         var offset = LibraryGridScroll.offset
@@ -585,6 +879,15 @@ fun LibraryScreen(
     val sortDescending = prefs?.let {
         settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT_DESC, "1")
     } != "0"
+    // 系列视图结构（设置→书架）：层级（默认）/ 扁平。共用同一份 folder_path，
+    // 切换只改渲染、不重扫；未知值回落层级。
+    val seriesMode = prefs?.let {
+        settingsRepository.stringOf(
+            it,
+            SettingsKeys.LIBRARY_SERIES_MODE,
+            SettingsKeys.SERIES_MODE_HIERARCHY,
+        )
+    } ?: SettingsKeys.SERIES_MODE_HIERARCHY
     // 书夹视图（一级）书夹卡排序：单独记忆（library_folder_sort / _desc），缺省
     // custom + 升序 = 现状拖拽序 + 名称自然方向，与全局书排序互不影响。
     val folderSortMode = prefs?.let {
@@ -593,11 +896,19 @@ fun LibraryScreen(
     val folderSortDescending = prefs?.let {
         settingsRepository.stringOf(it, SettingsKeys.LIBRARY_FOLDER_SORT_DESC, "0")
     } == "1"
+    // 书架展示样式：grid 网格（缺省=现状卡）/ list 列表（仿历史页行卡）。作用于
+    // 书夹/系列/平铺三视图的一级页（全局一份联动）；二级页不受影响。
+    // 设置页与两个排序菜单入口写同一键、此处派生即时生效。冷启动 prefs 缓存未热时
+    // 会短暂显示默认网格再淡入实际样式（viewMode 同款已知行为）。
+    val folderView = prefs?.let {
+        settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SHELF_VIEW, SettingsKeys.SHELF_VIEW_GRID)
+    } ?: SettingsKeys.SHELF_VIEW_GRID
 
     // 闭包/effect 内读「实时视图档」：viewMode 是普通 val（重组时重建），LaunchedEffect /
     // onDispose 这类不随重组重启的闭包捕获的是首帧值（切过视图后会陈旧），必须经
     // rememberUpdatedState 中转；typeFilter 是快照态委托，读到的天然是最新值。
     val currentViewMode by rememberUpdatedState(viewMode)
+    val currentFolderView by rememberUpdatedState(folderView)
 
     // 离开书架（进阅读器）时记下滚动位置，供下次进入恢复。
     // 取「当前组合」的状态：currentViewMode/typeFilter 经委托读取，onDispose 时刻
@@ -632,6 +943,21 @@ fun LibraryScreen(
             val viewport = leavingState.layoutInfo.viewportSize
             LibraryGridScroll.landscape =
                 viewport.width > viewport.height && viewport.width > 0
+            // 书架列表样式：离开时若列表活跃，位置落进独立 holder（与网格互不覆盖，
+            // 网格/列表各自记住自己的位置）。非活跃时只翻 active 位——保留列表自己的
+            // 记忆值，但恢复链据此知道「离开时显示的不是列表」。
+            val leavingShelfList = currentFolderView == SettingsKeys.SHELF_VIEW_LIST
+            LibraryShelfListScroll.active = leavingShelfList
+            if (leavingShelfList) {
+                val leavingListState = shelfListStates.getValue(currentViewMode to typeFilter)
+                LibraryShelfListScroll.viewMode = currentViewMode
+                LibraryShelfListScroll.typeFilter = typeFilter
+                LibraryShelfListScroll.index = leavingListState.firstVisibleItemIndex
+                LibraryShelfListScroll.offset = leavingListState.firstVisibleItemScrollOffset
+                val listViewport = leavingListState.layoutInfo.viewportSize
+                LibraryShelfListScroll.landscape =
+                    listViewport.width > listViewport.height && listViewport.width > 0
+            }
         }
     }
 
@@ -671,22 +997,42 @@ fun LibraryScreen(
     //    与进书前的隐藏态打架 = 用户看到的「状态栏消失又出现」）。
     val activeDetailState = target?.let { detailStateOf(it) }
     val activeGridState = activeDetailState ?: gridStates.getValue(viewMode to typeFilter)
-    val headerState = rememberGlassHeaderState(
-        // 切档/进出二级页时实例变化，core 内 remember(stateKey) 会重建滚动连接 / 方向监听。
-        gridState = activeGridState,
-        // resetKey：视图/分类切换、二级页进出都是离散时机，头部滑回展开
-        //（二级页标题行必须在状态栏下方，进页先展开一次）。
-        resetKey = viewMode to typeFilter to targetKeyOf(target),
-        frozenStatusBarTop = frozenStatusBarTop,
-        closingHold = readerOpenCtl?.phase == ReaderOpenPhase.Closing,
-        // 恢复落位完成前不动系统栏：Closing 只覆盖反向动画那一段，逐帧重申 + 数据
-        // 稳定会延续到 Idle 之后，这期间显隐判定读到的是瞬态位置（先 show 后 hide）。
-        statusBarHold = !gridSettled,
-        // 书夹排上移 10dp：默认 118 的呼吸留白砍 10，历史/设置页用列表版重载不受影响。
-        // 二级页头部多一行标题行（随折叠一起上移、折满整块出屏）。
-        headerContentHeight = 108.dp +
-            if (activeDetailState != null) DETAIL_TITLE_ROW_HEIGHT else 0.dp,
-    )
+    // 列表样式（三视图联动，一级、无二级页）时头部绑定列表容器：LazyListState 版重载
+    // 与网格版同返回类型、语义一致（折叠驱动 / 短内容守卫）。切样式时实例变化，core 内
+    // remember(stateKey) 重建滚动连接；resetKey 拼上 folderView 保证头部滑回展开。
+    val shelfListHeaderActive = activeDetailState == null &&
+        folderView == SettingsKeys.SHELF_VIEW_LIST
+    val activeShelfListState = shelfListStates.getValue(viewMode to typeFilter)
+    val headerState = if (shelfListHeaderActive) {
+        rememberGlassHeaderState(
+            listState = activeShelfListState,
+            // resetKey：样式/视图/分类切换、二级页进出都是离散时机，头部滑回展开。
+            resetKey = viewMode to typeFilter to targetKeyOf(target) to folderView,
+            frozenStatusBarTop = frozenStatusBarTop,
+            closingHold = readerOpenCtl?.phase == ReaderOpenPhase.Closing,
+            statusBarHold = !gridSettled,
+            // 与网格版同一几何（书夹排上移 10dp 的 108dp）；书架页接进程级 holder。
+            headerContentHeight = 108.dp,
+            useLibraryHolder = true,
+        )
+    } else {
+        rememberGlassHeaderState(
+            // 切档/进出二级页时实例变化，core 内 remember(stateKey) 会重建滚动连接 / 方向监听。
+            gridState = activeGridState,
+            // resetKey：视图/分类切换、二级页进出都是离散时机，头部滑回展开
+            //（二级页标题行必须在状态栏下方，进页先展开一次）。
+            resetKey = viewMode to typeFilter to targetKeyOf(target),
+            frozenStatusBarTop = frozenStatusBarTop,
+            closingHold = readerOpenCtl?.phase == ReaderOpenPhase.Closing,
+            // 恢复落位完成前不动系统栏：Closing 只覆盖反向动画那一段，逐帧重申 + 数据
+            // 稳定会延续到 Idle 之后，这期间显隐判定读到的是瞬态位置（先 show 后 hide）。
+            statusBarHold = !gridSettled,
+            // 书夹排上移 10dp：默认 118 的呼吸留白砍 10，历史/设置页用列表版重载不受影响。
+            // 二级页头部多一行标题行（随折叠一起上移、折满整块出屏）。
+            headerContentHeight = 108.dp +
+                if (activeDetailState != null) DETAIL_TITLE_ROW_HEIGHT else 0.dp,
+        )
+    }
     // 让位量由折叠量单点导出：折叠量与「前置滚动消费」同源，
     // 折叠期间列表不滚、让位收缩多少内容就上移多少（与头部 1:1 同行）。
     val shelfGridTop = headerState.gridTopPadding
@@ -696,12 +1042,23 @@ fun LibraryScreen(
     // 回顶事件要落在「当前显示网格」上：LaunchedEffect(Unit) 不随重组重启，
     // 直接读 activeGridState 会捕获首帧实例（二级页切进来后仍是旧的一级网格）。
     val currentActiveGrid by rememberUpdatedState(activeGridState)
+    // 列表样式回顶：一级显示 LazyColumn 时滚列表（否则滚网格）。事件闭包读
+    // rememberUpdatedState 中转的实时值，不随重组重启、不捕获首帧实例。
+    val currentShelfListHeaderActive by rememberUpdatedState(shelfListHeaderActive)
+    val currentShelfListState by rememberUpdatedState(activeShelfListState)
     LaunchedEffect(Unit) {
         scrollToTop.events.collect {
-            // 回顶落在当前真正显示的网格上（二级页时是二级页自己的列表）
-            val topState = currentActiveGrid
-            if (topState.layoutInfo.totalItemsCount > 0) {
-                topState.animateScrollToItem(0)
+            if (currentShelfListHeaderActive) {
+                val listTopState = currentShelfListState
+                if (listTopState.layoutInfo.totalItemsCount > 0) {
+                    listTopState.animateScrollToItem(0)
+                }
+            } else {
+                // 回顶落在当前真正显示的网格上（二级页时是二级页自己的列表）
+                val topState = currentActiveGrid
+                if (topState.layoutInfo.totalItemsCount > 0) {
+                    topState.animateScrollToItem(0)
+                }
             }
             headerState.expand()
             libraryRepository.refresh()
@@ -715,6 +1072,18 @@ fun LibraryScreen(
     var moveSheetOpen by remember { mutableStateOf(false) }
     var deleteSheetOpen by remember { mutableStateOf(false) }
     var metadataSheetOpen by remember { mutableStateOf(false) }
+    // 多选条「⋯」溢出菜单（编辑 / 移出 / 导出 / 分享 / 删除）
+    var selectionMenuOpen by remember { mutableStateOf(false) }
+    // 阅读类型互转确认（EPUB 小说 ↔ 漫画）
+    var retypeSheetOpen by remember { mutableStateOf(false) }
+    var retypeTargets by remember { mutableStateOf<List<String>>(emptyList()) }
+    var retypeToComic by remember { mutableStateOf(false) }
+    // 菜单关闭到退场结束之间保持多选条可见、宿主 chrome 不隐藏：
+    // 菜单锚在底部条上，chrome 一收起条就会跟着位移，锚点会漂走
+    var selectionMenuHeld by remember { mutableStateOf(false) }
+    // 导出 launcher 的待处理数据（单本走 CreateDocument，多本走 OpenDocumentTree）
+    var exportSingleTarget by remember { mutableStateOf<BookRecord?>(null) }
+    var exportBatchTargets by remember { mutableStateOf<List<BookRecord>>(emptyList()) }
     // 离开书架（开书/切 Tab 被 NavHost 卸载）时保留二级页与筛选；显式清除（回一级、
     // 点回「全部」）会先写 null，离页时自然落 null。与上面的滚动落值互不干扰。
     DisposableEffect(Unit) {
@@ -742,13 +1111,75 @@ fun LibraryScreen(
         moveSheetOpen || deleteSheetOpen || metadataSheetOpen
     // 用 present（含退场）而不是 target：多选条/底栏都要等面板退完再出现
     val overlayShowing = overlayActive || overlayPresence.present
-    LaunchedEffect(overlayShowing) { overlayController.setActive(overlayShowing) }
+    // 「⋯」菜单锚在多选条正上方：菜单打开/退场期间不能让宿主底栏淡出，
+    // 否则条随 chrome 位移、锚点一起漂走。菜单关闭到退场结束之间保持「占位」。
+    LaunchedEffect(selectionMenuOpen, overlayPresence.present) {
+        selectionMenuHeld = selectionMenuOpen || (selectionMenuHeld && overlayPresence.present)
+    }
+    val chromeObscured = overlayActive || (overlayPresence.present && !selectionMenuHeld)
+    LaunchedEffect(chromeObscured) { overlayController.setActive(chromeObscured) }
     DisposableEffect(Unit) {
         onDispose { overlayController.setActive(false) }
     }
 
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) libraryRepository.importTree(uri)
+    }
+
+    // 单本导出：SAF 保存对话框（用户可改名/选位置），零存储权限
+    val exportFileLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream"),
+    ) { uri ->
+        val book = exportSingleTarget
+        exportSingleTarget = null
+        if (uri != null && book != null) {
+            scope.launch {
+                BookFileTransfer.exportTo(context, book, uri)
+                    .onSuccess { glassNotice.show("已导出《${book.title}》") }
+                    .onFailure { glassNotice.show("导出失败：${it.message ?: "未知"}") }
+            }
+        }
+    }
+
+    // 多本导出：选一个目录，逐本 createDocument 写入
+    val exportTreeLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
+    ) { treeUri ->
+        val targets = exportBatchTargets
+        exportBatchTargets = emptyList()
+        if (treeUri != null && targets.isNotEmpty()) {
+            scope.launch {
+                val resolver = context.contentResolver
+                runCatching {
+                    resolver.takePersistableUriPermission(
+                        treeUri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                    )
+                }
+                val parent = DocumentsContract.buildDocumentUriUsingTree(
+                    treeUri,
+                    DocumentsContract.getTreeDocumentId(treeUri),
+                )
+                var ok = 0
+                var failed = 0
+                targets.forEach { book ->
+                    val result = runCatching {
+                        val mime = BookFileTransfer.mimeOf(BookFileTransfer.extOf(book))
+                        val doc = DocumentsContract.createDocument(
+                            resolver,
+                            parent,
+                            mime,
+                            BookFileTransfer.fileNameOf(book),
+                        ) ?: error("无法创建文件")
+                        BookFileTransfer.exportTo(context, book, doc).getOrThrow()
+                    }
+                    if (result.isSuccess) ok++ else failed++
+                }
+                glassNotice.show(
+                    if (failed == 0) "已导出 $ok 本" else "导出完成 · 成功 $ok · 失败 $failed",
+                )
+            }
+        }
     }
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) libraryRepository.importDocument(uri)
@@ -765,25 +1196,58 @@ fun LibraryScreen(
     }
     // 返回书架时校验恢复的二级页仍有效（书夹可能在阅读期间被删除或重扫清空），
     // 失效静默落回一级，不弹提示；System 档按 readStatus 过滤，恒有效。
-    LaunchedEffect(target, books, categories) {
+    LaunchedEffect(target, books, categories, seriesMode) {
         val t = target ?: return@LaunchedEffect
         val valid = when (t) {
             is LibraryTarget.User -> categories.any { it.id == t.id }
             is LibraryTarget.System -> true
-            is LibraryTarget.Series -> books.any {
-                (it.series?.takeIf { s -> s.isNotBlank() } ?: it.title) == t.name
-            }
+            is LibraryTarget.Series -> books.any { bookInSeries(it, t.path, seriesMode) }
         }
         if (!valid) target = null
     }
 
+    // 二级页返回：层级系列回父系列（面包屑逐级退出），扁平系列 / 按名入口 / 一级回书架。
+    fun closeDetailTarget() {
+        val t = target
+        val parent = if (t is LibraryTarget.Series &&
+            seriesMode != SettingsKeys.SERIES_MODE_FLAT
+        ) {
+            parentSeriesTarget(t)
+        } else {
+            null
+        }
+        if (t != null) {
+            detailStates.remove(targetKeyOf(t).orEmpty())
+            LibraryDetailScroll.key = null
+        }
+        target = parent
+    }
+
+    // 「⋯」菜单数据源：选中集 → 书本；文件夹型漫画没有单文件，导出/分享置灰
+    val selectionTargetUser = target as? LibraryTarget.User
+    val selectedBooks = remember(selected, books) { books.filter { it.id in selected } }
+    val transferableSelected = remember(selectedBooks) {
+        selectedBooks.filter { BookFileTransfer.isTransferable(it) }
+    }
+    // EPUB/MOBI 小说 / 漫画互转：选中项必须全是 EPUB/MOBI 且类型一致（混合或其它格式置灰）
+    val retypeUniformType = selectedBooks.map { it.type }.distinct().size == 1
+    val retypeAllConvertible = selectedBooks.isNotEmpty() && selectedBooks.all {
+        it.format.equals("EPUB", ignoreCase = true) || it.format.equals("MOBI", ignoreCase = true)
+    }
+    val retypeSupported = retypeUniformType && retypeAllConvertible
+    val retypeTargetIsNovel = retypeSupported && selectedBooks.firstOrNull()?.type == "NOVEL"
+    LaunchedEffect(selected.isEmpty()) {
+        if (selected.isEmpty()) selectionMenuOpen = false
+    }
+
     BackHandler(
-        enabled = selected.isNotEmpty() || target != null || metadataSheetOpen,
+        enabled = selected.isNotEmpty() || target != null || metadataSheetOpen || selectionMenuOpen,
     ) {
         when {
+            selectionMenuOpen -> selectionMenuOpen = false
             metadataSheetOpen -> metadataSheetOpen = false
             selected.isNotEmpty() -> selected = emptySet()
-            else -> target = null
+            else -> closeDetailTarget()
         }
     }
 
@@ -915,7 +1379,12 @@ fun LibraryScreen(
             AnimatedContent(
                 targetState = target,
                 transitionSpec = {
-                    val forward = initialState == null
+                    // 一级→二级 = 前进；层级系列下钻 = 前进，上钻 = 后退。
+                    val from = initialState
+                    val to = targetState
+                    val forward = from == null ||
+                        (from is LibraryTarget.Series && to is LibraryTarget.Series &&
+                            (from.path.isEmpty() || to.path.startsWith("${from.path}/")))
                     val spec = tween<IntOffset>(280, easing = FastOutSlowInEasing)
                     slideInHorizontally(spec) { full -> if (forward) full else -full } togetherWith
                         slideOutHorizontally(spec) { full -> if (forward) -full else full }
@@ -946,6 +1415,14 @@ fun LibraryScreen(
                         // 行位移的驱动源 = 当前组合的网格（转场期间跟进入页）。
                         val headerOverlayState by rememberUpdatedState(
                             gridStates.getValue(viewMode to typeFilter),
+                        )
+                        // 列表样式（三视图联动）：行位移驱动源切列表容器（视图行在两种
+                        // 样式下都是 item 0 占位）。驱动状态按当前视图 × 分类组合取。
+                        val headerOverlayListState by rememberUpdatedState(
+                            shelfListStates.getValue(viewMode to typeFilter),
+                        )
+                        val headerOverlayListActive by rememberUpdatedState(
+                            folderView == SettingsKeys.SHELF_VIEW_LIST,
                         )
                         Box(
                             modifier = Modifier
@@ -1026,67 +1503,151 @@ fun LibraryScreen(
                                 )
                                 val pageGridState = gridStates.getValue(vm to tf)
                                 when (vm) {
-                                    SettingsKeys.VIEW_SERIES -> SeriesGrid(
-                                        books = pageBooks,
-                                        state = pageGridState,
-                                        sortMode = sortMode,
-                                        descending = sortDescending,
-                                        headerSpacerHeight = headerSpacerDp,
-                                        chromeBottom = chrome.contentBottomForPage,
-                                        onOpenSeries = { name -> target = LibraryTarget.Series(name) },
-                                    )
-
-                                    SettingsKeys.VIEW_FLAT -> Box(modifier = Modifier.fillMaxSize()) {
-                                        BookGrid(
-                                            books = pageBooks,
-                                            state = pageGridState,
-                                            headerSpacerHeight = headerSpacerDp,
-                                            selected = selected,
-                                            reportSettled = gridSettled,
-                                            chromeBottom = chrome.contentBottomForPage,
-                                            onClick = { book, rect ->
-                                                if (selected.isEmpty()) {
-                                                    onOpenBook(book, rect)
-                                                } else {
-                                                    selected = if (book.id in selected) selected - book.id else selected + book.id
-                                                }
-                                            },
-                                            onLongClick = { book ->
-                                                selected = if (book.id in selected) selected - book.id else selected + book.id
-                                            },
-                                        )
-                                    }
-
-                                    else -> BookcaseGrid(
-                                        books = pageBooks,
-                                        state = pageGridState,
-                                        headerSpacerHeight = headerSpacerDp,
-                                        categories = categories,
-                                        categoryBookIds = categoryBookIds,
-                                        chromeBottom = chrome.contentBottomForPage,
-                                        onOpenSystem = { kind -> target = LibraryTarget.System(kind) },
-                                        onOpenCategory = { category ->
-                                            target = LibraryTarget.User(category.id, category.name, category.color)
-                                        },
-                                        onEditCategory = { category ->
-                                            editor = CategoryEditorState(
-                                                id = category.id,
-                                                name = category.name,
-                                                color = category.color,
+                                    SettingsKeys.VIEW_SERIES -> ShelfStyleSwitch(
+                                        style = folderView,
+                                        list = {
+                                            SeriesList(
+                                                books = pageBooks,
+                                                state = shelfListStates.getValue(vm to tf),
+                                                headerSpacerHeight = headerSpacerDp,
+                                                chromeBottom = chrome.contentBottomForPage,
+                                                seriesMode = seriesMode,
+                                                sortMode = sortMode,
+                                                descending = sortDescending,
+                                                onOpenSeries = { target = it },
                                             )
                                         },
-                                        onNewCategory = { editor = CategoryEditorState() },
-                                        folderSortMode = folderSortMode,
-                                        folderSortDescending = folderSortDescending,
-                                        onReorderCategory = { orderedIds ->
-                                            libraryRepository.reorderCategories(orderedIds)
-                                            // 拖完自动切回自定义顺序档（文件管理器同款行为）
-                                            scope.launch {
-                                                settingsRepository.putString(
-                                                    SettingsKeys.LIBRARY_FOLDER_SORT,
-                                                    SettingsKeys.FOLDER_SORT_CUSTOM,
+                                        grid = {
+                                            SeriesGrid(
+                                                books = pageBooks,
+                                                state = pageGridState,
+                                                sortMode = sortMode,
+                                                descending = sortDescending,
+                                                headerSpacerHeight = headerSpacerDp,
+                                                chromeBottom = chrome.contentBottomForPage,
+                                                seriesMode = seriesMode,
+                                                onOpenSeries = { target = it },
+                                            )
+                                        },
+                                    )
+
+                                    SettingsKeys.VIEW_FLAT -> ShelfStyleSwitch(
+                                        style = folderView,
+                                        list = {
+                                            FlatList(
+                                                books = pageBooks,
+                                                state = shelfListStates.getValue(vm to tf),
+                                                headerSpacerHeight = headerSpacerDp,
+                                                selected = selected,
+                                                reportSettled = gridSettled,
+                                                chromeBottom = chrome.contentBottomForPage,
+                                                onClick = { book, rect ->
+                                                    if (selected.isEmpty()) {
+                                                        onOpenBook(book, rect)
+                                                    } else {
+                                                        selected = if (book.id in selected) selected - book.id else selected + book.id
+                                                    }
+                                                },
+                                                onLongClick = { book ->
+                                                    selected = if (book.id in selected) selected - book.id else selected + book.id
+                                                },
+                                            )
+                                        },
+                                        grid = {
+                                            Box(modifier = Modifier.fillMaxSize()) {
+                                                BookGrid(
+                                                    books = pageBooks,
+                                                    state = pageGridState,
+                                                    headerSpacerHeight = headerSpacerDp,
+                                                    selected = selected,
+                                                    reportSettled = gridSettled,
+                                                    chromeBottom = chrome.contentBottomForPage,
+                                                    onClick = { book, rect ->
+                                                        if (selected.isEmpty()) {
+                                                            onOpenBook(book, rect)
+                                                        } else {
+                                                            selected = if (book.id in selected) selected - book.id else selected + book.id
+                                                        }
+                                                    },
+                                                    onLongClick = { book ->
+                                                        selected = if (book.id in selected) selected - book.id else selected + book.id
+                                                    },
                                                 )
                                             }
+                                        },
+                                    )
+
+                                    else -> ShelfStyleSwitch(
+                                        style = folderView,
+                                        list = {
+                                            BookcaseList(
+                                                books = pageBooks,
+                                                state = shelfListStates.getValue(vm to tf),
+                                                headerSpacerHeight = headerSpacerDp,
+                                                categories = categories,
+                                                categoryBookIds = categoryBookIds,
+                                                folderSortMode = folderSortMode,
+                                                folderSortDescending = folderSortDescending,
+                                                chromeBottom = chrome.contentBottomForPage,
+                                                onOpenSystem = { kind ->
+                                                    target = LibraryTarget.System(kind)
+                                                },
+                                                onOpenCategory = { category ->
+                                                    target = LibraryTarget.User(
+                                                        category.id,
+                                                        category.name,
+                                                        category.color,
+                                                    )
+                                                },
+                                                onEditCategory = { category ->
+                                                    editor = CategoryEditorState(
+                                                        id = category.id,
+                                                        name = category.name,
+                                                        color = category.color,
+                                                    )
+                                                },
+                                                onNewCategory = { editor = CategoryEditorState() },
+                                            )
+                                        },
+                                        grid = {
+                                            BookcaseGrid(
+                                                books = pageBooks,
+                                                state = pageGridState,
+                                                headerSpacerHeight = headerSpacerDp,
+                                                categories = categories,
+                                                categoryBookIds = categoryBookIds,
+                                                chromeBottom = chrome.contentBottomForPage,
+                                                onOpenSystem = { kind ->
+                                                    target = LibraryTarget.System(kind)
+                                                },
+                                                onOpenCategory = { category ->
+                                                    target = LibraryTarget.User(
+                                                        category.id,
+                                                        category.name,
+                                                        category.color,
+                                                    )
+                                                },
+                                                onEditCategory = { category ->
+                                                    editor = CategoryEditorState(
+                                                        id = category.id,
+                                                        name = category.name,
+                                                        color = category.color,
+                                                    )
+                                                },
+                                                onNewCategory = { editor = CategoryEditorState() },
+                                                folderSortMode = folderSortMode,
+                                                folderSortDescending = folderSortDescending,
+                                                onReorderCategory = { orderedIds ->
+                                                    libraryRepository.reorderCategories(orderedIds)
+                                                    // 拖完自动切回自定义顺序档（文件管理器同款行为）
+                                                    scope.launch {
+                                                        settingsRepository.putString(
+                                                            SettingsKeys.LIBRARY_FOLDER_SORT,
+                                                            SettingsKeys.FOLDER_SORT_CUSTOM,
+                                                        )
+                                                    }
+                                                },
+                                            )
                                         },
                                     )
                                 }
@@ -1099,10 +1660,17 @@ fun LibraryScreen(
                                     .align(Alignment.TopStart)
                                     .onSizeChanged { viewHeaderHeightPx = it.height.toFloat() }
                                     .graphicsLayer {
-                                        translationY = -viewHeaderScrollPx(
-                                            headerOverlayState,
-                                            viewHeaderHeightPx,
-                                        )
+                                        translationY = -if (headerOverlayListActive) {
+                                            viewHeaderScrollPx(
+                                                headerOverlayListState,
+                                                viewHeaderHeightPx,
+                                            )
+                                        } else {
+                                            viewHeaderScrollPx(
+                                                headerOverlayState,
+                                                viewHeaderHeightPx,
+                                            )
+                                        }
                                     },
                             )
                         }
@@ -1119,16 +1687,47 @@ fun LibraryScreen(
                         // 全 App 一份排序，SSMH 同款）；方向也共用全局键。
                         val targetBooks = sortBooks(
                             // 分类过滤贯穿二级页：智能/我的/系列都只显示当前漫画/小说筛选下的成员
-                            booksOf(t, filteredBooks, categoryBookIds),
+                            booksOf(t, filteredBooks, categoryBookIds, seriesMode),
                             sortMode,
                             sortDescending,
                         )
+                        // 层级系列：本节点下的子系列卡（分类筛选同源，子节点聚合其子树书数）
+                        val subSeries = if (
+                            seriesMode == SettingsKeys.SERIES_MODE_HIERARCHY &&
+                            t is LibraryTarget.Series
+                        ) {
+                            sortSeriesNodes(
+                                childSeriesNodes(filteredBooks, t.path),
+                                sortMode,
+                                sortDescending,
+                            )
+                        } else {
+                            emptyList()
+                        }
+                        // 层级系列页的网格书区只放「本目录直属书」：子目录的书已由上面的
+                        // 子系列卡代表，父页再铺一遍会重复（计数/排序仍用子树集合）。
+                        val gridBooks = if (
+                            seriesMode == SettingsKeys.SERIES_MODE_HIERARCHY &&
+                            t is LibraryTarget.Series
+                        ) {
+                            targetBooks.filter { leafSeriesOf(it).first == t.path }
+                        } else {
+                            targetBooks
+                        }
                         val emptyBecauseFiltered = typeFilter != null &&
-                            targetBooks.isEmpty() &&
-                            booksOf(t, books, categoryBookIds).isNotEmpty()
+                            gridBooks.isEmpty() &&
+                            subSeries.isEmpty() &&
+                            booksOf(t, books, categoryBookIds, seriesMode).isNotEmpty()
                         CategoryContentView(
-                            books = targetBooks,
+                            books = gridBooks,
+                            subSeries = subSeries,
                             emptyBecauseFiltered = emptyBecauseFiltered,
+                            emptyTitle = if (t is LibraryTarget.Series) "这个系列还没有书" else null,
+                            emptyHint = if (t is LibraryTarget.Series) {
+                                "换一个文件夹系列，或回到书架下拉重新扫描。"
+                            } else {
+                                null
+                            },
                             state = targetGridState,
                             selected = selected,
                             reportSettled = gridSettled,
@@ -1136,6 +1735,7 @@ fun LibraryScreen(
                                 selected = if (id in selected) selected - id else selected + id
                             },
                             onOpenBook = onOpenBook,
+                            onOpenSeries = { target = it },
                             chromeBottom = chrome.contentBottomForPage,
                         )
                     }
@@ -1267,17 +1867,30 @@ fun LibraryScreen(
         if (detailTitleTarget != null) {
             // 计数与二级页网格同源（排序不再由本行承载——全 App 一份全局排序，
             // 入口只有侧栏/一级标题行的排序钮）
-            val detailBooks = booksOf(detailTitleTarget, filteredBooks, categoryBookIds)
+            val detailBooks = booksOf(detailTitleTarget, filteredBooks, categoryBookIds, seriesMode)
             val detailTypeLabel = when (typeFilter) {
                 "COMIC" -> "漫画"
                 "NOVEL" -> "小说"
                 else -> null
             }
+            // 层级系列页：子系列数量单独提示（标题行空间足够时才有意义，短文案兜底）
+            val detailSubCount = if (
+                seriesMode == SettingsKeys.SERIES_MODE_HIERARCHY &&
+                detailTitleTarget is LibraryTarget.Series
+            ) {
+                childSeriesNodes(filteredBooks, detailTitleTarget.path).size
+            } else {
+                0
+            }
             DetailTitleRow(
                 title = detailTypeLabel?.let { "${targetTitle(detailTitleTarget)} · $it" }
                     ?: targetTitle(detailTitleTarget),
                 countText = if (selected.isEmpty()) {
-                    "${detailBooks.size} 本"
+                    if (detailSubCount > 0) {
+                        "${detailBooks.size} 本 · $detailSubCount 个系列"
+                    } else {
+                        "${detailBooks.size} 本"
+                    }
                 } else {
                     "已选 ${selected.size}"
                 },
@@ -1286,23 +1899,18 @@ fun LibraryScreen(
                     .graphicsLayer { translationY = headerState.headerOffsetPx }
                     .padding(top = headerState.statusBarTop + 108.dp)
                     .padding(start = 20.dp, end = 20.dp + chrome.railEndInset),
-                onBack = {
-                    detailStates.remove(targetKeyOf(detailTitleTarget).orEmpty())
-                    LibraryDetailScroll.key = null
-                    target = null
-                },
+                onBack = { closeDetailTarget() },
             )
         }
 
     AnimatedVisibility(
-        visible = selected.isNotEmpty() && !overlayShowing,
+        visible = selected.isNotEmpty() && (!overlayShowing || selectionMenuHeld),
         enter = fadeIn(tween(GlassMotion.OVERLAY_ENTER_MS)) +
             slideInVertically(tween(GlassMotion.OVERLAY_ENTER_MS)) { it / 3 },
         exit = fadeOut(tween(GlassMotion.OVERLAY_EXIT_MS)) +
             slideOutVertically(tween(GlassMotion.OVERLAY_EXIT_MS)) { it / 3 },
         modifier = Modifier.align(Alignment.BottomCenter),
     ) {
-        val userTarget = target as? LibraryTarget.User
         SelectionBar(
             backdrop = pageBackdrop,
             count = selected.size,
@@ -1312,19 +1920,25 @@ fun LibraryScreen(
                 bottom = chrome.contentBottomForPage + 8.dp,
             ),
             actions = {
-                TextButton(onClick = { selected = emptySet() }) { Text("取消") }
-                Spacer(Modifier.weight(1f))
-                if (userTarget != null) {
-                    TextButton(onClick = {
-                        libraryRepository.removeBooksFromCategory(selected, userTarget.id)
-                        selected = emptySet()
-                    }) { Text("移出") }
-                }
-                TextButton(onClick = { metadataSheetOpen = true }) { Text("编辑") }
                 TextButton(onClick = { deleteSheetOpen = true }) {
                     Text("删除", color = MaterialTheme.colorScheme.error)
                 }
                 Button(onClick = { moveSheetOpen = true }) { Text("书夹") }
+                Spacer(Modifier.size(8.dp))
+                // 溢出菜单入口：编辑 / 移出 / 导出 / 分享 / 删除 的二级收口。
+                // 与「书夹」同一套 M3 Button 主题色 token（primary / onPrimary），
+                // 只收窄成 52×40 短胶囊，形状与高度都和书夹齐平。
+                Button(
+                    onClick = { selectionMenuOpen = true },
+                    contentPadding = PaddingValues(0.dp),
+                    modifier = Modifier.size(width = 52.dp, height = 40.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.MoreHoriz,
+                        contentDescription = "更多操作",
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                    )
+                }
             },
         )
     }
@@ -1363,6 +1977,118 @@ fun LibraryScreen(
             .fillMaxWidth(),
     )
 
+    // 多选「⋯」菜单：锚在多选条右上角（⋯ 按钮正上方），从右下角放大出来。
+    // 菜单打开期间不让 chrome 让位（chromeObscured 已排除），锚点不会随底栏淡出漂移。
+    SelectionMenuOverlay(
+        visible = selectionMenuOpen,
+        presence = overlayPresence,
+        backdrop = pageBackdrop,
+        onDismiss = { selectionMenuOpen = false },
+        onEdit = {
+            selectionMenuOpen = false
+            metadataSheetOpen = true
+        },
+        onRemoveFromCategory = selectionTargetUser?.let { user ->
+            {
+                selectionMenuOpen = false
+                libraryRepository.removeBooksFromCategory(selected, user.id)
+                selected = emptySet()
+            }
+        },
+        onRetype = {
+            selectionMenuOpen = false
+            retypeTargets = selectedBooks.map { it.id }
+            retypeToComic = retypeTargetIsNovel
+            retypeSheetOpen = true
+        },
+        retypeTitle = when {
+            !retypeSupported -> "切换阅读类型"
+            retypeTargetIsNovel -> "按漫画打开（转为漫画）"
+            else -> "按小说打开（转为小说）"
+        },
+        retypeHint = when {
+            retypeSupported && retypeTargetIsNovel -> "按图片页重建，小说进度会清除"
+            retypeSupported -> "重新解析章节，漫画进度会清除"
+            selectedBooks.isEmpty() -> ""
+            else -> "仅支持 EPUB / MOBI 小说与漫画互转"
+        },
+        retypeEnabled = retypeSupported,
+        onExport = {
+            val targets = transferableSelected
+            selectionMenuOpen = false
+            if (targets.size == 1) {
+                val book = targets.first()
+                exportSingleTarget = book
+                exportFileLauncher.launch(BookFileTransfer.fileNameOf(book))
+            } else if (targets.size > 1) {
+                exportBatchTargets = targets
+                exportTreeLauncher.launch(null)
+            }
+        },
+        onShare = {
+            val targets = transferableSelected
+            selectionMenuOpen = false
+            when {
+                targets.isEmpty() -> glassNotice.show("选中项里没有可分享的单文件书籍")
+                targets.size > BookFileTransfer.MAX_SHARE_COUNT ->
+                    glassNotice.show("一次最多分享 ${BookFileTransfer.MAX_SHARE_COUNT} 本")
+                else -> scope.launch {
+                    BookFileTransfer.share(context, targets)
+                        .onFailure { glassNotice.show("分享失败：${it.message ?: "未知"}") }
+                }
+            }
+        },
+        onDelete = {
+            selectionMenuOpen = false
+            deleteSheetOpen = true
+        },
+        canTransfer = transferableSelected.isNotEmpty(),
+        alignment = Alignment.BottomEnd,
+        origin = TransformOrigin(1f, 1f),
+        modifier = Modifier
+            .padding(
+                start = 20.dp,
+                end = 20.dp + chrome.railEndInset + 8.dp,
+                // 底 = 多选条底距 + 条高 56 + 间隙 8
+                bottom = chrome.contentBottomForPage + 8.dp + 56.dp + 8.dp,
+            )
+            .widthIn(max = 300.dp)
+            .fillMaxWidth(),
+    )
+
+    // 阅读类型互转确认：进度会清零，先讲清楚再执行（原文件不受影响）
+    if (retypeSheetOpen) {
+        AlertDialog(
+            onDismissRequest = { retypeSheetOpen = false },
+            title = { Text(if (retypeToComic) "转为漫画" else "转为小说") },
+            text = {
+                Text(
+                    if (retypeToComic) {
+                        "将以图片页重新建立阅读内容，当前小说进度与章节会清除；原文件不受影响。"
+                    } else {
+                        "将重新解析章节文本，当前漫画进度与页书签会清除；原文件不受影响。"
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        retypeSheetOpen = false
+                        val ids = retypeTargets
+                        val toComic = retypeToComic
+                        scope.launch {
+                            libraryRepository.retypeBooks(ids, toComic)
+                            selected = emptySet()
+                        }
+                    },
+                ) { Text("转换") }
+            },
+            dismissButton = {
+                TextButton(onClick = { retypeSheetOpen = false }) { Text("取消") }
+            },
+        )
+    }
+
     // 手机端排序菜单：与加号菜单完全同位（同一 top / end / origin，菜单右缘贴屏
     // 幕右 20dp）——贴排序钮左缘会把 260dp 宽的菜单整体拽向屏幕中部，与标题行
     // 视觉脱节。互斥已有：打开本菜单先收加号菜单（点排序钮时），反之亦然。
@@ -1392,6 +2118,22 @@ fun LibraryScreen(
                     )
                 }
                 scrollToTop.request()
+            },
+            // 展示样式切换：写全局键即生效（prefs flow 回流派生值），不回顶——
+            // 网格/列表各自记住自己的滚动位置。
+            viewStyle = folderView,
+            onViewStyleToggle = {
+                sortMenuOpen = false
+                scope.launch {
+                    settingsRepository.putString(
+                        SettingsKeys.LIBRARY_SHELF_VIEW,
+                        if (folderView == SettingsKeys.SHELF_VIEW_LIST) {
+                            SettingsKeys.SHELF_VIEW_GRID
+                        } else {
+                            SettingsKeys.SHELF_VIEW_LIST
+                        },
+                    )
+                }
             },
             alignment = Alignment.TopEnd,
             origin = TransformOrigin(1f, 0f),
@@ -1425,6 +2167,26 @@ fun LibraryScreen(
                 )
             }
             scrollToTop.request()
+        },
+        // 展示样式切换：仅一级平铺/系列渲染（二级页打开时不传，样式只作用一级）。
+        // 与书夹菜单的切换行写同一全局键（library_shelf_view，三视图联动）。
+        viewStyle = if (target == null) folderView else null,
+        onViewStyleToggle = if (target == null) {
+            {
+                sortMenuOpen = false
+                scope.launch {
+                    settingsRepository.putString(
+                        SettingsKeys.LIBRARY_SHELF_VIEW,
+                        if (folderView == SettingsKeys.SHELF_VIEW_LIST) {
+                            SettingsKeys.SHELF_VIEW_GRID
+                        } else {
+                            SettingsKeys.SHELF_VIEW_LIST
+                        },
+                    )
+                }
+            }
+        } else {
+            null
         },
         alignment = Alignment.TopEnd,
         origin = TransformOrigin(1f, 0f),
@@ -1545,9 +2307,11 @@ private fun BookcaseGrid(
     /** 拖拽结束：把拖拽后的完整卡片顺序原样提交（固化为 sort_key）。 */
     onReorderCategory: (List<Long>) -> Unit,
 ) {
-    val unclassifiedCount = books.count { book ->
+    // 未分类 = 不在任何书夹里的书（虚拟卡，无书可归时整卡隐藏）
+    val unclassifiedBooks = books.filter { book ->
         categoryBookIds.values.none { book.id in it }
     }
+    val unclassifiedCount = unclassifiedBooks.size
     var dragState by remember(categories) { mutableStateOf<DragSortState?>(null) }
     val itemBounds = remember { mutableStateMapOf<Long, Rect>() }
     var orderedCategories by remember(categories) { mutableStateOf(categories) }
@@ -1622,58 +2386,11 @@ private fun BookcaseGrid(
             SectionLabel("智能书夹")
         }
         item(span = { GridItemSpan(maxLineSpan) }) {
-            val rowState = rememberLazyListState()
-            LazyRow(
-                // 左右双缘渐隐取代旧的行级圆角硬裁切：offscreen 层内 DstIn 只淡出本行内容；
-                // 左缘渐隐仅在本行滚动过后显示（draw 作用域读 state，滚动失效重绘不重组）。
-                modifier = Modifier
-                    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
-                    .drawWithContent {
-                        drawContent()
-                        val pastStart = rowState.firstVisibleItemIndex > 0 ||
-                            rowState.firstVisibleItemScrollOffset > 0
-                        val brush = if (pastStart) {
-                            Brush.horizontalGradient(
-                                0f to Color.Transparent,
-                                0.08f to Color.Black,
-                                0.92f to Color.Black,
-                                1f to Color.Transparent,
-                            )
-                        } else {
-                            Brush.horizontalGradient(
-                                0f to Color.Black,
-                                0.92f to Color.Black,
-                                1f to Color.Transparent,
-                            )
-                        }
-                        drawRect(brush = brush, blendMode = BlendMode.DstIn)
-                    },
-                state = rowState,
-                contentPadding = PaddingValues(end = 20.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                items(systemFolders()) { folder ->
-                    SystemFolderCard(
-                        label = folder.label,
-                        count = when (folder) {
-                            SystemCategory.UNREAD -> books.count { it.readStatus == BookRecord.READ_UNREAD }
-                            SystemCategory.READING -> books.count { it.readStatus == BookRecord.READ_READING }
-                            SystemCategory.FINISHED -> books.count { it.readStatus == BookRecord.READ_FINISHED }
-                            SystemCategory.BOOKMARKED -> 0
-                            SystemCategory.UNCLASSIFIED -> unclassifiedCount
-                        },
-                        accent = when (folder) {
-                            SystemCategory.UNREAD -> InfoBlue
-                            SystemCategory.READING -> WarningAmber
-                            SystemCategory.FINISHED -> SuccessGreen
-                            SystemCategory.BOOKMARKED -> BookmarkPurple
-                            SystemCategory.UNCLASSIFIED -> LocalFixedFolderColors.current.onCardMuted
-                        },
-                        onClick = { onOpenSystem(folder) },
-                        modifier = Modifier.width(104.dp),
-                    )
-                }
-            }
+            SystemFoldersRow(
+                books = books,
+                unclassifiedCount = unclassifiedCount,
+                onOpenSystem = onOpenSystem,
+            )
         }
 
         item(span = { GridItemSpan(maxLineSpan) }) {
@@ -1717,19 +2434,329 @@ private fun BookcaseGrid(
                 )
             }
         }
+        // 虚拟书夹「未分类」：固定钉在最后一格，不参与排序档与拖拽排序；
+        // 全部书都已归入书夹时（数量为 0）自动隐藏。
+        if (unclassifiedBooks.isNotEmpty()) {
+            item(key = "cat_unclassified") {
+                FolderCard(
+                    title = SystemCategory.UNCLASSIFIED.label,
+                    count = unclassifiedBooks.size,
+                    covers = unclassifiedBooks.take(4).map { it.coverPath },
+                    accent = LocalFixedFolderColors.current.onCardMuted,
+                    onClick = { onOpenSystem(SystemCategory.UNCLASSIFIED) },
+                    onLongClick = {},
+                    dragEnabled = false,
+                )
+            }
+        }
         item {
             NewFolderCard(onClick = onNewCategory)
         }
     }
 }
 
+/**
+ * 智能书夹横滚行：网格/列表两种书夹展示样式共用（视觉与行为完全一致）。
+ * 左右双缘渐隐取代旧的行级圆角硬裁切：offscreen 层内 DstIn 只淡出本行内容；
+ * 左缘渐隐仅在本行滚动过后显示（draw 作用域读 state，滚动失效重绘不重组）。
+ */
 @Composable
-private fun SectionLabel(text: String) {
+private fun SystemFoldersRow(
+    books: List<BookRecord>,
+    unclassifiedCount: Int,
+    onOpenSystem: (SystemCategory) -> Unit,
+) {
+    val rowState = rememberLazyListState()
+    LazyRow(
+        modifier = Modifier
+            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+            .drawWithContent {
+                drawContent()
+                val pastStart = rowState.firstVisibleItemIndex > 0 ||
+                    rowState.firstVisibleItemScrollOffset > 0
+                val brush = if (pastStart) {
+                    Brush.horizontalGradient(
+                        0f to Color.Transparent,
+                        0.08f to Color.Black,
+                        0.92f to Color.Black,
+                        1f to Color.Transparent,
+                    )
+                } else {
+                    Brush.horizontalGradient(
+                        0f to Color.Black,
+                        0.92f to Color.Black,
+                        1f to Color.Transparent,
+                    )
+                }
+                drawRect(brush = brush, blendMode = BlendMode.DstIn)
+            },
+        state = rowState,
+        contentPadding = PaddingValues(end = 20.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        items(systemFolders()) { folder ->
+            SystemFolderCard(
+                label = folder.label,
+                count = when (folder) {
+                    SystemCategory.UNREAD -> books.count { it.readStatus == BookRecord.READ_UNREAD }
+                    SystemCategory.READING -> books.count { it.readStatus == BookRecord.READ_READING }
+                    SystemCategory.FINISHED -> books.count { it.readStatus == BookRecord.READ_FINISHED }
+                    SystemCategory.BOOKMARKED -> 0
+                    SystemCategory.UNCLASSIFIED -> unclassifiedCount
+                },
+                accent = when (folder) {
+                    SystemCategory.UNREAD -> InfoBlue
+                    SystemCategory.READING -> WarningAmber
+                    SystemCategory.FINISHED -> SuccessGreen
+                    SystemCategory.BOOKMARKED -> BookmarkPurple
+                    SystemCategory.UNCLASSIFIED -> LocalFixedFolderColors.current.onCardMuted
+                },
+                onClick = { onOpenSystem(folder) },
+                modifier = Modifier.width(104.dp),
+            )
+        }
+    }
+}
+
+// ---------------- 书架列表样式 ----------------
+
+/**
+ * 书架展示样式（网格/列表）切换的交叉淡化包装：书夹/系列/平铺三视图共用同一动效
+ * （~200ms fade，不与外层视图/分类的左右滑动转场打架）。
+ */
+@Composable
+private fun ShelfStyleSwitch(
+    style: String,
+    grid: @Composable () -> Unit,
+    list: @Composable () -> Unit,
+) {
+    AnimatedContent(
+        targetState = style,
+        transitionSpec = {
+            fadeIn(tween(200, easing = FastOutSlowInEasing)) togetherWith
+                fadeOut(tween(200, easing = FastOutSlowInEasing))
+        },
+        label = "shelfViewStyle",
+    ) { current ->
+        if (current == SettingsKeys.SHELF_VIEW_LIST) list() else grid()
+    }
+}
+
+// ---------------- 书夹视图 · 列表样式 ----------------
+
+/**
+ * 书夹一级的列表样式（仿历史页行卡）：整宽行卡 + 左侧迷你拼贴 + 名称/数量。
+ * 智能书夹区保留横滚行（[SystemFoldersRow] 两种样式共用）；拖拽排序仅网格样式提供，
+ * 列表样式 custom 档仍按 sort_key 显示序生效（排序菜单里提示回网格拖动）。
+ */
+@Composable
+private fun BookcaseList(
+    books: List<BookRecord>,
+    state: LazyListState,
+    headerSpacerHeight: androidx.compose.ui.unit.Dp,
+    categories: List<CategoryRecord>,
+    categoryBookIds: Map<Long, Set<String>>,
+    folderSortMode: String,
+    folderSortDescending: Boolean,
+    chromeBottom: androidx.compose.ui.unit.Dp,
+    onOpenSystem: (SystemCategory) -> Unit,
+    onOpenCategory: (CategoryRecord) -> Unit,
+    onEditCategory: (CategoryRecord) -> Unit,
+    onNewCategory: () -> Unit,
+) {
+    // 未分类 = 不在任何书夹里的书（虚拟行，无书可归时整行隐藏）
+    val unclassifiedBooks = books.filter { book ->
+        categoryBookIds.values.none { book.id in it }
+    }
+    // 显示顺序与网格卡同源：档位排序 × 方向（custom = sort_key 序，不受方向影响）。
+    // 列表不支持拖拽，无 orderedCategories 覆盖，直接以 categories（sort_key 序）为基准。
+    val displayCategories = remember(
+        categories,
+        folderSortMode,
+        folderSortDescending,
+        books,
+        categoryBookIds,
+    ) {
+        val sorted = when (folderSortMode) {
+            SettingsKeys.FOLDER_SORT_NAME -> categories.sortedBy { it.name.lowercase() }
+            SettingsKeys.FOLDER_SORT_COUNT -> categories.sortedBy { category ->
+                books.count { it.id in categoryBookIds[category.id].orEmpty() }
+            }
+            else -> categories
+        }
+        if (folderSortMode != SettingsKeys.FOLDER_SORT_CUSTOM && folderSortDescending) {
+            sorted.reversed()
+        } else {
+            sorted
+        }
+    }
+    LazyColumn(
+        state = state,
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = chromeBottom + GlassDimens.ListBottomExtraScroll),
+    ) {
+        // item 0 = 视图行等高占位（与网格样式同结构，行覆盖层位移语义一致）
+        item(key = "header-spacer") {
+            Spacer(Modifier.height(headerSpacerHeight))
+        }
+        item(key = "system-label") {
+            SectionLabel("智能书夹", topPadding = 16.dp, bottomPadding = 8.dp)
+        }
+        item(key = "system-row") {
+            SystemFoldersRow(
+                books = books,
+                unclassifiedCount = unclassifiedBooks.size,
+                onOpenSystem = onOpenSystem,
+            )
+        }
+        item(key = "mine-label") {
+            SectionLabel("我的书夹", topPadding = 16.dp, bottomPadding = 8.dp)
+        }
+        items(displayCategories, key = { "cat_${it.id}" }) { category ->
+            FolderListRow(
+                title = category.name,
+                // 与网格卡角标同源：按当前漫画/小说过滤计数，点进二级页数量一致
+                count = books.count { it.id in categoryBookIds[category.id].orEmpty() },
+                color = category.color,
+                covers = books.filter { it.id in categoryBookIds[category.id].orEmpty() }
+                    .take(4)
+                    .map { it.coverPath },
+                onClick = { onOpenCategory(category) },
+                onLongClick = { onEditCategory(category) },
+            )
+            Spacer(Modifier.height(10.dp))
+        }
+        // 虚拟书夹「未分类」：固定钉在末尾，不参与排序档；无书自动隐藏。
+        if (unclassifiedBooks.isNotEmpty()) {
+            item(key = "cat_unclassified") {
+                FolderListRow(
+                    title = SystemCategory.UNCLASSIFIED.label,
+                    count = unclassifiedBooks.size,
+                    color = "",
+                    covers = unclassifiedBooks.take(4).map { it.coverPath },
+                    accent = LocalFixedFolderColors.current.onCardMuted,
+                    onClick = { onOpenSystem(SystemCategory.UNCLASSIFIED) },
+                    onLongClick = {},
+                )
+                Spacer(Modifier.height(10.dp))
+            }
+        }
+        item(key = "new-folder") {
+            NewFolderRow(onClick = onNewCategory)
+        }
+    }
+}
+
+/** 书夹列表行：迷你拼贴 + 名称/数量（视觉语言仿历史页行卡）。 */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun FolderListRow(
+    title: String,
+    count: Int,
+    color: String,
+    covers: List<String?>,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    /** 非空时覆盖 color 解析出的拼贴底色（虚拟书夹「未分类」无 color 字段）。 */
+    accent: Color? = null,
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(InkvolRadius.card)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
+        shape = InkvolRadius.card,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .width(64.dp)
+                    .aspectRatio(1.12f)
+                    .clip(InkvolRadius.collection),
+                contentAlignment = Alignment.Center,
+            ) {
+                Collage(
+                    covers = covers,
+                    accent = accent ?: runCatching {
+                        Color(android.graphics.Color.parseColor(color))
+                    }.getOrDefault(MaterialTheme.colorScheme.primary),
+                    shape = InkvolRadius.collection,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    text = "$count 本",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/** 「新建书夹」列表行：网格样式 NewFolderCard 的行版。 */
+@Composable
+private fun NewFolderRow(onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(18.dp),
+        color = Color.Transparent,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.CreateNewFolder,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(22.dp),
+            )
+            Text(
+                text = "新建书夹",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+    }
+}
+
+/**
+ * 区块标题（智能书夹 / 我的书夹）。缺省间距给网格样式：上下由
+ * LazyVerticalGrid 的 spacedBy(14.dp) 补足（实际 上18/下14），零回归。
+ * 列表样式（LazyColumn 默认行距 0）调用时显式传 (16, 8)——历史页同款节奏。
+ */
+@Composable
+private fun SectionLabel(
+    text: String,
+    topPadding: androidx.compose.ui.unit.Dp = 4.dp,
+    bottomPadding: androidx.compose.ui.unit.Dp = 0.dp,
+) {
     Text(
         text = text,
         style = MaterialTheme.typography.labelLarge,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(top = 4.dp),
+        modifier = Modifier.padding(top = topPadding, bottom = bottomPadding),
     )
 }
 
@@ -1793,10 +2820,14 @@ private fun SystemFolderCard(
 private fun FolderCard(
     title: String,
     count: Int,
-    color: String,
+    color: String = "#8A8F98",
     covers: List<String?>,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
+    /** 非空时覆盖 color 解析出的拼贴底色（虚拟书夹无 color 字段）。 */
+    accent: Color? = null,
+    /** false 时不渲染右上角拖拽手柄（虚拟书夹不可排序）。 */
+    dragEnabled: Boolean = true,
     dropTarget: Boolean = false,
     onDragStart: (Offset) -> Unit = {},
     onDrag: (Offset) -> Unit = {},
@@ -1822,21 +2853,24 @@ private fun FolderCard(
         Box {
             Collage(
                 covers = covers,
-                accent = runCatching { Color(android.graphics.Color.parseColor(color)) }
-                    .getOrDefault(MaterialTheme.colorScheme.primary),
+                accent = accent ?: runCatching {
+                    Color(android.graphics.Color.parseColor(color))
+                }.getOrDefault(MaterialTheme.colorScheme.primary),
                 shape = InkvolRadius.collection,
                 modifier = Modifier
                     .fillMaxWidth()
                     .aspectRatio(1.12f),
             )
-            DragHandle(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(8.dp),
-                onDragStart = onDragStart,
-                onDrag = onDrag,
-                onDragEnd = onDragEnd,
-            )
+            if (dragEnabled) {
+                DragHandle(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(8.dp),
+                    onDragStart = onDragStart,
+                    onDrag = onDrag,
+                    onDragEnd = onDragEnd,
+                )
+            }
         }
         Spacer(Modifier.height(4.dp))
         Column(
@@ -1993,17 +3027,14 @@ private fun SeriesGrid(
     descending: Boolean,
     headerSpacerHeight: androidx.compose.ui.unit.Dp,
     chromeBottom: androidx.compose.ui.unit.Dp,
-    onOpenSeries: (String) -> Unit,
+    seriesMode: String,
+    onOpenSeries: (LibraryTarget.Series) -> Unit,
 ) {
-    // 系列卡排序 = 成员书聚合键（与一级书排序档同源）：收藏时间/最近阅读/进度取
-    // 成员 MAX，页数/大小取成员求和，标题档即系列名。方向规则与 sortBooks 一致。
-    val groups = remember(books, sortMode, descending) {
-        sortSeriesGroups(
-            books.groupBy { book -> book.series?.takeIf { it.isNotBlank() } ?: book.title }
-                .toList(),
-            sortMode,
-            descending,
-        )
+    // 层级模式：一级卡 = 库根下第一层文件夹（卡数量/封面 = 子树聚合）；
+    // 扁平模式：直接含书的那层目录各一张卡（同名不同父加后缀）。
+    // 排序 = 成员书聚合键（与一级书排序档同源），标题档即卡名。
+    val nodes = remember(books, seriesMode, sortMode, descending) {
+        sortSeriesNodes(seriesNodesFor(books, seriesMode), sortMode, descending)
     }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 150.dp),
@@ -2016,43 +3047,55 @@ private fun SeriesGrid(
         item(span = { GridItemSpan(maxLineSpan) }) {
             Spacer(Modifier.height(headerSpacerHeight))
         }
-        items(groups, key = { it.first }) { (name, group) ->
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(InkvolRadius.collection)
-                    .clickable { onOpenSeries(name) },
-            ) {
-                Collage(
-                    covers = group.take(4).map { it.coverPath },
-                    accent = MaterialTheme.colorScheme.primary,
-                    shape = InkvolRadius.collection,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .aspectRatio(1.12f),
-                )
-                Spacer(Modifier.height(4.dp))
-                Column(
-                    modifier = Modifier.padding(
-                        start = 8.dp,
-                        end = 8.dp,
-                        bottom = 8.dp,
-                    ),
-                ) {
-                    Text(
-                        text = name,
-                        style = MaterialTheme.typography.titleSmall,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        text = "${group.size} 卷",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            }
+        items(nodes, key = { it.path }) { node ->
+            SeriesCard(
+                node = node,
+                onClick = { onOpenSeries(LibraryTarget.Series(node.path, node.name)) },
+            )
+        }
+    }
+}
+
+/** 系列卡（一级网格与二级页「子系列」区共用）：拼贴封面 + 名称 + 子树书数。 */
+@Composable
+private fun SeriesCard(
+    node: SeriesNode,
+    onClick: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(InkvolRadius.collection)
+            .clickable(onClick = onClick),
+    ) {
+        Collage(
+            covers = node.books.take(4).map { it.coverPath },
+            accent = MaterialTheme.colorScheme.primary,
+            shape = InkvolRadius.collection,
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1.12f),
+        )
+        Spacer(Modifier.height(4.dp))
+        Column(
+            modifier = Modifier.padding(
+                start = 8.dp,
+                end = 8.dp,
+                bottom = 8.dp,
+            ),
+        ) {
+            Text(
+                text = node.name,
+                style = MaterialTheme.typography.titleSmall,
+                color = MaterialTheme.colorScheme.onBackground,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = "${node.books.size} 卷",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }
@@ -2091,18 +3134,275 @@ private fun BookGrid(
     }
 }
 
+// ---------------- 系列 / 平铺 · 列表样式 ----------------
+
+/** 系列一级列表样式：系列行卡（迷你拼贴 + 名称 + 卷数），点击进系列二级页。 */
+@Composable
+private fun SeriesList(
+    books: List<BookRecord>,
+    state: LazyListState,
+    headerSpacerHeight: androidx.compose.ui.unit.Dp,
+    chromeBottom: androidx.compose.ui.unit.Dp,
+    seriesMode: String,
+    sortMode: String,
+    descending: Boolean,
+    onOpenSeries: (LibraryTarget.Series) -> Unit,
+) {
+    // 层级/扁平结构与排序档与网格版完全同源（seriesNodesFor + sortSeriesNodes）。
+    val nodes = remember(books, seriesMode, sortMode, descending) {
+        sortSeriesNodes(seriesNodesFor(books, seriesMode), sortMode, descending)
+    }
+    LazyColumn(
+        state = state,
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = chromeBottom + GlassDimens.ListBottomExtraScroll),
+    ) {
+        item(key = "header-spacer") {
+            Spacer(Modifier.height(headerSpacerHeight))
+        }
+        items(nodes, key = { it.path }) { node ->
+            SeriesListRow(
+                node = node,
+                onClick = { onOpenSeries(LibraryTarget.Series(node.path, node.name)) },
+            )
+            Spacer(Modifier.height(10.dp))
+        }
+    }
+}
+
+/** 系列列表行：迷你拼贴 + 系列名 + 卷数（视觉语言仿书夹列表行）。 */
+@Composable
+private fun SeriesListRow(
+    node: SeriesNode,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(InkvolRadius.card)
+            .clickable(onClick = onClick),
+        shape = InkvolRadius.card,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .width(64.dp)
+                    .aspectRatio(1.12f)
+                    .clip(InkvolRadius.collection),
+                contentAlignment = Alignment.Center,
+            ) {
+                Collage(
+                    covers = node.books.take(4).map { it.coverPath },
+                    accent = MaterialTheme.colorScheme.primary,
+                    shape = InkvolRadius.collection,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = node.name,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(3.dp))
+                Text(
+                    text = "${node.books.size} 卷",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/** 平铺一级列表样式：书行卡（封面 + 书名 + 页数/格式/进度），开书 + 长按多选。 */
+@Composable
+private fun FlatList(
+    books: List<BookRecord>,
+    state: LazyListState,
+    headerSpacerHeight: androidx.compose.ui.unit.Dp,
+    selected: Set<String>,
+    reportSettled: Boolean,
+    chromeBottom: androidx.compose.ui.unit.Dp,
+    onClick: (BookRecord, ReaderOpenRect?) -> Unit,
+    onLongClick: (BookRecord) -> Unit,
+) {
+    LazyColumn(
+        state = state,
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(bottom = chromeBottom + GlassDimens.ListBottomExtraScroll),
+    ) {
+        item(key = "header-spacer") {
+            Spacer(Modifier.height(headerSpacerHeight))
+        }
+        items(books, key = { it.id }) { book ->
+            BookListRow(
+                book = book,
+                selected = book.id in selected,
+                reportSettled = reportSettled,
+                onClick = { rect -> onClick(book, rect) },
+                onLongClick = { onLongClick(book) },
+            )
+            Spacer(Modifier.height(10.dp))
+        }
+    }
+}
+
+/**
+ * 书行卡（平铺列表样式）：视觉仿历史页行卡；封面矩形经
+ * [LocalReaderOpenController] 回报（一镜到底飞入/飞回），语义与网格版
+ * [BookCell] 逐字一致；多选遮罩/勾选同网格样式。副标题与书网格/搜索结果卡
+ * 同口径：读完=「已读完」，在读追加百分比，未读不加。
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun BookListRow(
+    book: BookRecord,
+    selected: Boolean,
+    reportSettled: Boolean,
+    onClick: (ReaderOpenRect?) -> Unit,
+    onLongClick: () -> Unit,
+) {
+    var coverBounds by remember { mutableStateOf<ReaderOpenRect?>(null) }
+    val openController = LocalReaderOpenController.current
+    // settled 翻 true 时用最后已知位置补发一次（恢复落位后卡片不再移动、
+    // onGloballyPositioned 不再回调），闭环「恢复完成 → 可信回报 → 起飞」。
+    LaunchedEffect(reportSettled) {
+        if (reportSettled) {
+            coverBounds?.let { openController?.updateSourceRect(book.id, it, true) }
+        }
+    }
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(InkvolRadius.card)
+            .combinedClickable(
+                onClick = { onClick(coverBounds) },
+                onLongClick = onLongClick,
+            ),
+        shape = InkvolRadius.card,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .width(56.dp)
+                    .aspectRatio(0.72f)
+                    .clip(InkvolRadius.cover)
+                    .onGloballyPositioned { coords ->
+                        val bounds = coords.boundsInRoot()
+                        val rect = ReaderOpenRect(
+                            left = bounds.left,
+                            top = bounds.top,
+                            width = bounds.width,
+                            height = bounds.height,
+                        )
+                        coverBounds = rect
+                        // reportSettled=false（列表还在恢复）时坐标不可信，controller 忽略。
+                        openController?.updateSourceRect(book.id, rect, reportSettled)
+                    }
+                    .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                contentAlignment = Alignment.Center,
+            ) {
+                val cover = book.coverPath
+                if (cover != null) {
+                    AsyncImage(
+                        model = File(cover),
+                        contentDescription = book.title,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize(),
+                    )
+                } else {
+                    Text(
+                        text = book.title.take(1),
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (selected) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.28f)),
+                    )
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(6.dp)
+                            .size(22.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Check,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                }
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = book.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(3.dp))
+                val base = if (book.type == "NOVEL") {
+                    "${book.pageCount} 章 · ${book.format}"
+                } else {
+                    "${book.pageCount} 页 · ${book.format}"
+                }
+                val progress = when {
+                    book.readStatus == BookRecord.READ_FINISHED -> " · 已读完"
+                    book.percent > 0.0 -> " · ${(book.percent * 100).toInt()}%"
+                    else -> ""
+                }
+                Text(
+                    text = base + progress,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
 // ---------------- 分类页 ----------------
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun CategoryContentView(
     books: List<BookRecord>,
+    /** 层级系列页的子系列卡（书夹 / 智能书夹恒为空）。 */
+    subSeries: List<SeriesNode> = emptyList(),
     emptyBecauseFiltered: Boolean = false,
+    /** 系列页专用空态文案；null = 书夹空态（长按加入书夹）。 */
+    emptyTitle: String? = null,
+    emptyHint: String? = null,
     state: LazyGridState,
     selected: Set<String>,
     reportSettled: Boolean,
     onToggleSelect: (String) -> Unit,
     onOpenBook: (BookRecord, ReaderOpenRect?) -> Unit,
+    onOpenSeries: (LibraryTarget.Series) -> Unit = {},
     chromeBottom: androidx.compose.ui.unit.Dp,
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
@@ -2110,7 +3410,7 @@ private fun CategoryContentView(
         // 它要随折叠一起上移出屏，放在内容区只能停在屏幕顶部。
         // 标题行高 + 间距已由头部让位（DETAIL_TITLE_ROW_HEIGHT）承担。
 
-        if (books.isEmpty()) {
+        if (books.isEmpty() && subSeries.isEmpty()) {
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = InkvolRadius.card,
@@ -2119,15 +3419,19 @@ private fun CategoryContentView(
             ) {
                 Column(Modifier.padding(20.dp)) {
                     Text(
-                        text = if (emptyBecauseFiltered) "当前分类下没有书" else "这个书夹还是空的",
+                        text = when {
+                            emptyBecauseFiltered -> "当前分类下没有书"
+                            else -> emptyTitle ?: "这个书夹还是空的"
+                        },
                         style = MaterialTheme.typography.titleSmall,
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        text = if (emptyBecauseFiltered) {
-                            "书夹里有书，但都不属于当前选中的分类。返回书架切换到「全部」查看。"
-                        } else {
-                            "回到书架长按书本，选择「加入书夹」。"
+                        text = when {
+                            emptyBecauseFiltered ->
+                                "书夹里有书，但都不属于当前选中的分类。返回书架切换到「全部」查看。"
+
+                            else -> emptyHint ?: "回到书架长按书本，选择「加入书夹」。"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -2143,6 +3447,36 @@ private fun CategoryContentView(
                 verticalArrangement = Arrangement.spacedBy(16.dp),
                 contentPadding = PaddingValues(top = 4.dp, bottom = chromeBottom + 16.dp),
             ) {
+                // 子系列区（层级系列页）：小标题 + 系列卡，书卡排在后面。
+                // 系列卡与书卡同列宽（自适应），实现最稳、不动滚动/锚点容器结构。
+                if (subSeries.isNotEmpty()) {
+                    item(span = { GridItemSpan(maxLineSpan) }, key = "subSeriesHeader") {
+                        Text(
+                            text = "系列 · ${subSeries.size}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
+                        )
+                    }
+                    items(subSeries, key = { "series:${it.path}" }) { node ->
+                        SeriesCard(
+                            node = node,
+                            onClick = {
+                                onOpenSeries(LibraryTarget.Series(node.path, node.name))
+                            },
+                        )
+                    }
+                    if (books.isNotEmpty()) {
+                        item(span = { GridItemSpan(maxLineSpan) }, key = "subBooksHeader") {
+                            Text(
+                                text = "书籍 · ${books.size}",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 8.dp, bottom = 2.dp),
+                            )
+                        }
+                    }
+                }
                 items(books, key = { it.id }) { book ->
                     BookCell(
                         book = book,
@@ -2215,7 +3549,9 @@ private fun SelectionBar(
     GlassRounded(
         backdrop = backdrop,
         tier = GlassTier.Full,
-        radius = 18.dp,
+        // 同心圆：内部按钮 40dp 高 → 圆角 20dp，垂直/水平内边距均 8dp
+        // ⇒ 28 = 20 + 8（同时 28 = 56/2，条本身即完整胶囊）
+        radius = 28.dp,
         blurRadius = GlassDimens.StrongBlur,
         edge = GlassEdge.Outline,
         modifier = modifier
@@ -2336,12 +3672,19 @@ private fun BookCell(
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
+        val base = if (book.type == "NOVEL") {
+            "${book.pageCount} 章 · ${book.format}"
+        } else {
+            "${book.pageCount} 页 · ${book.format}"
+        }
+        // 与搜索结果卡（SearchComponents）同口径：读完=「已读完」，在读追加百分比，未读不加。
+        val progress = when {
+            book.readStatus == BookRecord.READ_FINISHED -> " · 已读完"
+            book.percent > 0.0 -> " · ${(book.percent * 100).toInt()}%"
+            else -> ""
+        }
         Text(
-            text = if (book.type == "NOVEL") {
-                "${book.pageCount} 章 · ${book.format}"
-            } else {
-                "${book.pageCount} 页 · ${book.format}"
-            },
+            text = base + progress,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -2678,15 +4021,20 @@ private fun DeleteConfirmOverlay(
     ) {
         Column(modifier = Modifier.padding(20.dp)) {
             Text(
-                text = "移除 $count 本漫画？",
+                text = "删除 $count 本？",
                 style = MaterialTheme.typography.titleMedium,
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = if (singleFileCount > 0) {
-                    "其中 $singleFileCount 本为单文件导入；放入回收站保留 30 天，可随时恢复。"
-                } else {
-                    "放入回收站保留 30 天，可随时恢复；连文件删除会永久删除源文件，不可撤销。"
+                text = when {
+                    singleFileCount == count && count > 0 ->
+                        "这 $count 本为单文件导入：删除会同时删掉手机里选中的原文件，不可撤销；" +
+                            "只想从书架移除请选「移入回收站」（保留 30 天，不删文件）。"
+                    singleFileCount > 0 ->
+                        "其中 $singleFileCount 本为单文件导入，删除会同时删掉这些原文件；" +
+                            "移入回收站则保留 30 天可恢复。"
+                    else ->
+                        "放入回收站保留 30 天，可随时恢复；删源文件会永久删除手机里的文件，不可撤销。"
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -2700,19 +4048,19 @@ private fun DeleteConfirmOverlay(
                 )
             }
             Spacer(Modifier.height(16.dp))
-            if (singleFileCount < count) {
-                Button(
-                    onClick = onDeleteFiles,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error,
-                        contentColor = MaterialTheme.colorScheme.onError,
-                    ),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("连文件删除")
-                }
-                Spacer(Modifier.height(8.dp))
+            // 单文件导入同样给硬删入口：源文件按 doc_id 直删（原先这里按 singleFileCount 隐藏，
+            // 纯单文件选中时只剩「移入回收站」，等于没有立即删除的办法）
+            Button(
+                onClick = onDeleteFiles,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError,
+                ),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(if (singleFileCount == count) "删除（含原文件）" else "连文件删除")
             }
+            Spacer(Modifier.height(8.dp))
             OutlinedButton(
                 onClick = onRemoveOnly,
                 modifier = Modifier.fillMaxWidth(),
@@ -2823,20 +4171,20 @@ private fun sortBooks(books: List<BookRecord>, mode: String, descending: Boolean
 
 /**
  * 系列卡排序：成员书聚合键。收藏时间/最近阅读/阅读进度取成员最大值（一个系列
- * 只要有一卷新/被读过就前移），页数/文件大小取求和（系列体量），标题档即系列名。
+ * 只要有一卷新/被读过就前移），页数/文件大小取求和（系列体量），标题档即卡名。
  */
-private fun sortSeriesGroups(
-    groups: List<Pair<String, List<BookRecord>>>,
+private fun sortSeriesNodes(
+    nodes: List<SeriesNode>,
     mode: String,
     descending: Boolean,
-): List<Pair<String, List<BookRecord>>> {
+): List<SeriesNode> {
     val sorted = when (mode) {
-        SettingsKeys.SORT_TITLE -> groups.sortedBy { it.first.lowercase() }
-        SettingsKeys.SORT_LAST_READ -> groups.sortedBy { group -> group.second.maxOf { it.lastReadAt } }
-        SettingsKeys.SORT_PAGES -> groups.sortedBy { group -> group.second.sumOf { it.pageCount } }
-        SettingsKeys.SORT_PROGRESS -> groups.sortedBy { group -> group.second.maxOf { it.percent } }
-        SettingsKeys.SORT_SIZE -> groups.sortedBy { group -> group.second.sumOf { it.fileSize } }
-        else -> groups.sortedBy { group -> group.second.maxOf { it.addedAt } }
+        SettingsKeys.SORT_TITLE -> nodes.sortedBy { it.name.lowercase() }
+        SettingsKeys.SORT_LAST_READ -> nodes.sortedBy { node -> node.books.maxOf { it.lastReadAt } }
+        SettingsKeys.SORT_PAGES -> nodes.sortedBy { node -> node.books.sumOf { it.pageCount } }
+        SettingsKeys.SORT_PROGRESS -> nodes.sortedBy { node -> node.books.maxOf { it.percent } }
+        SettingsKeys.SORT_SIZE -> nodes.sortedBy { node -> node.books.sumOf { it.fileSize } }
+        else -> nodes.sortedBy { node -> node.books.maxOf { it.addedAt } }
     }
     return if (descending) sorted.reversed() else sorted
 }
@@ -2845,6 +4193,7 @@ private fun booksOf(
     target: LibraryTarget,
     books: List<BookRecord>,
     categoryBookIds: Map<Long, Set<String>>,
+    seriesMode: String = SettingsKeys.SERIES_MODE_HIERARCHY,
 ): List<BookRecord> = when (target) {
     is LibraryTarget.User -> {
         val ids = categoryBookIds[target.id].orEmpty()
@@ -2862,11 +4211,13 @@ private fun booksOf(
         }
     }
 
-    is LibraryTarget.Series -> books.filter {
-        (it.series?.takeIf { value -> value.isNotBlank() } ?: it.title) == target.name
-    }
+    is LibraryTarget.Series -> books.filter { bookInSeries(it, target.path, seriesMode) }
 }
 
-private fun systemFolders(): List<SystemCategory> = SystemCategory.entries
+/**
+ * 智能书夹行。未分类已迁到「我的书夹」网格末尾（数量为 0 自动隐藏），此处不再列出。
+ */
+private fun systemFolders(): List<SystemCategory> =
+    SystemCategory.entries.filter { it != SystemCategory.UNCLASSIFIED }
 
 

@@ -1,6 +1,7 @@
 ﻿package com.inkvol.app.data.sync
 
 import android.content.Context
+import androidx.datastore.preferences.core.Preferences
 import com.inkvol.app.data.local.InkvolDatabase
 import com.inkvol.app.data.repository.LibraryRepository
 import com.inkvol.app.data.settings.SettingsKeys
@@ -62,6 +63,12 @@ class SyncRepository(
         val lastResult: String = "",
         val deviceName: String = "",
         val serverHost: String = "",
+        /** 文件同步范围摘要（设置页展示）。 */
+        val fileScopeSummary: String = "",
+        /** 自动同步被「仅 WiFi」门禁拦下（状态行提示，避免误以为坏掉）。 */
+        val waitingWifi: Boolean = false,
+        /** 失败冷却截止时间（0=未冷却）。 */
+        val cooldownUntil: Long = 0,
     )
 
     /** 一次同步的配置快照（密码解密后仅在内存流转，不落盘不进日志）。 */
@@ -73,6 +80,14 @@ class SyncRepository(
         val basePath: String,
         val deviceId: String,
         val deviceName: String,
+        val allowInsecureTls: Boolean = false,
+    )
+
+    /** 同步范围编辑器的数据（一次读取，供面板渲染）。 */
+    data class ScopeEditorData(
+        val scope: SyncFileScope,
+        val folders: List<InkvolDatabase.ScopeFolderRow>,
+        val singleLibraryBooks: Int,
     )
 
     // ---------- 状态与配置 ----------
@@ -85,6 +100,7 @@ class SyncRepository(
             val account = settings.stringOf(prefs, SettingsKeys.SYNC_ACCOUNT, "")
             val hasPassword = settings.stringOf(prefs, SettingsKeys.SYNC_PASSWORD_ENC, "").isNotBlank()
             val configured = server.isNotBlank() && account.isNotBlank() && hasPassword
+            val fileScope = readFileScope(prefs)
             _state.update {
                 it.copy(
                     configured = configured,
@@ -94,9 +110,24 @@ class SyncRepository(
                     deviceName = DeviceIdentity.deviceName(settings),
                     serverHost = server.takeIf { s -> s.isNotBlank() }
                         ?.removePrefix("https://")?.removePrefix("http://")?.substringBefore('/') ?: "",
+                    fileScopeSummary = scopeSummary(fileScope),
+                    cooldownUntil = settings.longOf(prefs, SettingsKeys.SYNC_COOLDOWN_UNTIL, 0),
                 )
             }
         }
+    }
+
+    private fun scopeSummary(scope: SyncFileScope): String = when {
+        scope.all -> "全部同步"
+        scope.isEmpty -> "仅进度与标注"
+        scope.single && scope.folderIds.isEmpty() -> "仅单文件导入"
+        scope.single -> "单文件 + ${scope.folderIds.size} 个文件夹"
+        else -> "${scope.folderIds.size} 个文件夹"
+    }
+
+    /** 自动同步门禁状态回填（等待 WiFi / 失败冷却），供状态行展示。 */
+    fun noteGated(waitingWifi: Boolean, cooldownUntil: Long = 0) {
+        _state.update { it.copy(waitingWifi = waitingWifi, cooldownUntil = cooldownUntil) }
     }
 
     /** 读取配置；未配置（服务器/账号/密码任一缺失）返回 null。密码密文解密失败按未配置。 */
@@ -118,7 +149,55 @@ class SyncRepository(
             basePath = basePath,
             deviceId = DeviceIdentity.deviceId(settings),
             deviceName = DeviceIdentity.deviceName(settings),
+            allowInsecureTls = settings.booleanOf(prefs, SettingsKeys.SYNC_ALLOW_INSECURE_TLS, false),
         )
+    }
+
+    // ---------- 文件同步范围 ----------
+
+    /**
+     * 读取文件同步范围；键缺失时按旧布尔（SYNC_FILES_SINGLE / SYNC_FILES_ALL）迁移：
+     * all=true → 全部；single=true → 仅散书；两者都关 → 仅元数据（空范围）。
+     */
+    private fun readFileScope(prefs: Preferences): SyncFileScope {
+        val raw = settings.stringOf(prefs, SettingsKeys.SYNC_FILE_SCOPE, "")
+        if (raw.isNotBlank()) {
+            runCatching {
+                return json.decodeFromString(SyncFileScope.serializer(), raw)
+            }
+        }
+        @Suppress("DEPRECATION")
+        val legacyAll = settings.booleanOf(prefs, SettingsKeys.SYNC_FILES_ALL, false)
+        @Suppress("DEPRECATION")
+        val legacySingle = settings.booleanOf(prefs, SettingsKeys.SYNC_FILES_SINGLE, true)
+        return if (legacyAll) {
+            SyncFileScope(all = true, single = true)
+        } else {
+            SyncFileScope(all = false, single = legacySingle, folderIds = emptyList())
+        }
+    }
+
+    suspend fun fileScope(): SyncFileScope = withContext(Dispatchers.IO) {
+        readFileScope(settings.snapshotPreferences())
+    }
+
+    fun encodeFileScope(scope: SyncFileScope): String =
+        json.encodeToString(SyncFileScope.serializer(), scope)
+
+    /** 面板数据：当前范围 + 文件夹候选（含书数）+ 单文件导入书数。 */
+    suspend fun loadScopeEditor(): ScopeEditorData = withContext(Dispatchers.IO) {
+        val prefs = settings.snapshotPreferences()
+        ScopeEditorData(
+            scope = readFileScope(prefs),
+            folders = db.queryScopeFolders(),
+            singleLibraryBooks = db.countSingleLibraryBooks(),
+        )
+    }
+
+    /** 保存范围（供设置面板 / 测试用）。 */
+    suspend fun saveFileScope(scope: SyncFileScope) {
+        settings.putString(SettingsKeys.SYNC_FILE_SCOPE, encodeFileScope(scope))
+        refreshState()
     }
 
     // ---------- 同步入口 ----------
@@ -136,20 +215,28 @@ class SyncRepository(
             return@withContext SyncLogEntry(at = startedAt, ok = false, errorKind = "offline", message = "同步未启用")
         }
         syncMutex.withLock {
-            _state.update { it.copy(syncing = true) }
+            _state.update { it.copy(syncing = true, waitingWifi = false) }
             try {
-                val client = WebDavClient(config.server, config.basePath, config.account, config.password)
+                val client = WebDavClient(
+                    config.server,
+                    config.basePath,
+                    config.account,
+                    config.password,
+                    allowInsecureTls = config.allowInsecureTls,
+                )
                 var requests = 0
-                // 1) 基目录探测 + 首次建目录（404 才 MKCOL，省请求）
+                // 1) 基目录探测 + 缺目录才逐级 MKCOL（幂等：405=已存在；父级不存在也能建）
                 val baseEntries = runCatching { client.list("") }
                     .onSuccess { requests++ }
                     .getOrElse { return@withContext fail(startedAt, reason, it, requests) }
-                if (baseEntries.isEmpty()) {
-                    runCatching {
-                        client.makeCollection("")
-                        client.makeCollection(DEVICE_DIR)
-                        client.makeCollection(BOOK_DIR)
-                    }.onSuccess { requests += 3 }
+                val names = baseEntries.map { it.name }.toSet()
+                val missingDirs = buildList {
+                    if ("devices" !in names) add(DEVICE_DIR)
+                    if ("books" !in names) add(BOOK_DIR)
+                }
+                if (baseEntries.isEmpty() || missingDirs.isNotEmpty()) {
+                    runCatching { client.ensureCollections(*missingDirs.toTypedArray()) }
+                        .onSuccess { requests += missingDirs.size + 1 }
                         .getOrElse { return@withContext fail(startedAt, reason, it, requests) }
                 }
                 // 2) pull：其它设备文档（Last-Modified 未变则跳过 GET）
@@ -267,9 +354,8 @@ class SyncRepository(
         onRequest: () -> Unit,
     ): SyncFiles.Outcome? {
         val prefs = settings.snapshotPreferences()
-        val single = settings.booleanOf(prefs, SettingsKeys.SYNC_FILES_SINGLE, true)
-        val all = settings.booleanOf(prefs, SettingsKeys.SYNC_FILES_ALL, false)
-        if (!single && !all) return null
+        val scope = readFileScope(prefs)
+        if (scope.isEmpty) return null
         val tombstonedIds = ownTombstonedBookIds()
         val remoteTitles = remotes.mapNotNull { it.parsed }
             .flatMap { doc -> doc.books.map { it.bookId to it.title } }
@@ -280,7 +366,7 @@ class SyncRepository(
             config = config,
             remoteTitles = remoteTitles,
             tombstonedBookIds = tombstonedIds,
-            scopeAll = all,
+            scope = scope,
             onRequest = onRequest,
             onProgress = { },
         )
@@ -296,7 +382,10 @@ class SyncRepository(
     suspend fun listCloudBooks(): Result<List<SyncFiles.CloudBookInfo>> = withContext(Dispatchers.IO) {
         val config = readConfig()
             ?: return@withContext Result.failure(IllegalStateException("同步未配置"))
-        val client = WebDavClient(config.server, config.basePath, config.account, config.password)
+        val client = WebDavClient(
+            config.server, config.basePath, config.account, config.password,
+            allowInsecureTls = config.allowInsecureTls,
+        )
         Result.success(syncFiles.listCloudBooks(client) { })
     }
 
@@ -304,7 +393,10 @@ class SyncRepository(
     suspend fun downloadCloudBook(info: SyncFiles.CloudBookInfo): Result<Unit> = withContext(Dispatchers.IO) {
         val config = readConfig()
             ?: return@withContext Result.failure(IllegalStateException("同步未配置"))
-        val client = WebDavClient(config.server, config.basePath, config.account, config.password)
+        val client = WebDavClient(
+            config.server, config.basePath, config.account, config.password,
+            allowInsecureTls = config.allowInsecureTls,
+        )
         val remotes = pullRemoteDocs(client, config) { }.getOrDefault(emptyList())
         val title = remotes.mapNotNull { it.parsed }
             .firstOrNull { doc -> doc.books.any { it.bookId == info.bookId } }
@@ -651,14 +743,41 @@ class SyncRepository(
 
     // ---------- 成败收尾 ----------
 
-    private fun classify(e: Throwable): Pair<String, String> = when {
-        e is DavException && e.statusCode == 401 -> "auth" to "账号或应用密码错误（401）"
-        e is DavException && e.statusCode == 403 -> "auth" to "权限被拒绝（403）"
-        e is DavException && e.statusCode == 503 -> "server" to "服务端繁忙（503），稍后自动重试"
-        e is DavException && e.statusCode in 500..599 -> "server" to "服务器错误（${e.statusCode}）"
-        e is DavException && e.statusCode in 400..499 -> "server" to "请求被拒绝（${e.statusCode}）"
-        e is DavException -> "network" to "网络错误：${e.message ?: ""}"
-        else -> "network" to "网络不可达：${e.message ?: ""}"
+    /**
+     * 错误归类：先看最深层 cause（DNS/超时/证书/明文被拦），再看 HTTP 状态码。
+     * 文案要求可直接执行（告诉用户改什么），不再一律叫「网络不可达」。
+     */
+    private fun classify(error: Throwable): Pair<String, String> {
+        val root = generateSequence(error as Throwable?) { it.cause }.last()
+        when {
+            root is java.net.UnknownHostException ->
+                return "network" to "服务器地址无法解析，请检查地址与网络"
+            root is java.net.SocketTimeoutException ->
+                return "network" to "连接超时，服务器无响应或端口不通"
+            root is javax.net.ssl.SSLException ->
+                return "network" to "HTTPS 证书校验失败，自签证书请开启「允许自签证书」"
+            root is IllegalArgumentException ->
+                return "network" to "服务器地址无效：${root.message ?: ""}"
+            (root.message ?: "").contains("Cleartext HTTP traffic") ->
+                return "network" to "该服务器是 http 明文地址且被系统拦截"
+        }
+        if (error is DavException) {
+            return when (error.statusCode) {
+                401 -> "auth" to "账号或应用密码错误（401）"
+                403 -> "auth" to "权限被拒绝（403），同步目录可能不可写"
+                404 -> "server" to "远端目录不存在（404）"
+                405 -> "server" to "操作不被允许（405），请检查同步目录权限"
+                409 -> "server" to "父目录不存在（409），请检查同步目录层级"
+                301, 302, 307, 308 -> "server" to "服务器要求重定向（${error.statusCode}），请检查同步目录"
+                423 -> "server" to "资源被锁定（423），稍后自动重试"
+                429 -> "server" to "请求过于频繁（429），稍后自动重试"
+                503 -> "server" to "服务端繁忙（503），稍后自动重试"
+                in 500..599 -> "server" to "服务器错误（${error.statusCode}）"
+                in 400..499 -> "server" to "请求被拒绝（${error.statusCode}）"
+                else -> "network" to (error.message ?: "网络错误")
+            }
+        }
+        return "network" to ("未知错误：" + error.javaClass.simpleName + " " + (error.message ?: "")).trim()
     }
 
     private suspend fun fail(

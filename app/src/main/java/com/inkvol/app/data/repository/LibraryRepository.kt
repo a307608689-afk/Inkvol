@@ -6,10 +6,16 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import android.util.Log
+import com.inkvol.app.data.import.ArchiveProber
+import com.inkvol.app.data.import.EpubParser
 import com.inkvol.app.data.import.LibraryScanner
+import com.inkvol.app.data.import.MobiParser
+import com.inkvol.app.data.import.NovelCoverGenerator
 import com.inkvol.app.data.import.SingleFileImporter
+import com.inkvol.app.data.import.TxtNovelParser
 import com.inkvol.app.data.local.InkvolDatabase
 import com.inkvol.app.data.model.BookRecord
+import com.inkvol.app.data.model.BookSectionRecord
 import com.inkvol.app.data.model.CategoryRecord
 import com.inkvol.app.data.model.DuplicateGroup
 import com.inkvol.app.data.model.LibraryRecord
@@ -26,6 +32,7 @@ import com.inkvol.app.data.model.FolderFacet
 import com.inkvol.app.data.model.FullTextEvent
 import com.inkvol.app.data.model.FullTextHit
 import com.inkvol.app.data.model.SearchChapterRow
+import com.inkvol.app.data.model.SearchNoteRow
 import com.inkvol.app.data.model.SearchFacets
 import com.inkvol.app.data.model.SearchFilter
 import com.inkvol.app.data.model.SearchFilterCodec
@@ -40,6 +47,9 @@ import com.inkvol.app.data.settings.SettingsRepository
 import com.inkvol.app.ui.reader.panel.PanelLayoutCache
 import com.inkvol.app.data.source.BookContentSource
 import com.inkvol.app.data.source.BookSourceFactory
+import com.inkvol.app.data.source.EpubImageSource
+import com.inkvol.app.data.source.MobiImageSource
+import com.inkvol.app.data.source.SectionedContentSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -54,6 +64,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -67,12 +79,23 @@ class LibraryRepository(
     private val settingsRepository: SettingsRepository,
 ) {
 
+    /**
+     * 应用私有根目录。EPUB 插图的 marker 是相对路径（epub_images/{bookId}/xxx），
+     * 分页量图片宽高比时需要拼这个根（否则 decodeFile 找不到文件、比例全部按 4:3 兜底）。
+     */
+    val filesDir: File get() = context.filesDir
+
     private val db = InkvolDatabase(context)
     private val scanner = LibraryScanner(context, db)
     private val singleImporter = SingleFileImporter(context, db)
     private val sourceFactory = BookSourceFactory(context)
     private val novelChapterCache = android.util.LruCache<String, String>(6)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /**
+     * 扫描互斥：LibraryScanner 是单例且带成员计数器，并发调用会互相污染；
+     * 同时保护「v12 路径回填」与用户主动重扫/导入不撞车。
+     */
+    private val scanMutex = Mutex()
 
     private val _books = MutableStateFlow<List<BookRecord>>(emptyList())
     val books: StateFlow<List<BookRecord>> = _books.asStateFlow()
@@ -151,6 +174,74 @@ class LibraryRepository(
     init {
         scope.launch { reload() }
         scope.launch { restoreSearchSession() }
+        // v12 无感迁移：旧库的 book_locations.folder_path 为空（系列视图只能按旧
+        // series 名退化），冷启动延迟 6s 后台重扫一次回填文件夹层级；失败 24h 后再试。
+        scope.launch {
+            delay(6_000)
+            backfillSeriesPaths()
+        }
+    }
+
+    /** 扫描深度（设置→书架，缺省 3 层）：每次扫描前读一次，改动即时生效。 */
+    private suspend fun scanDepth(): Int = runCatching {
+        val prefs = settingsRepository.snapshotPreferences()
+        settingsRepository.stringOf(prefs, SettingsKeys.LIBRARY_SCAN_DEPTH, "3")
+            .toIntOrNull()
+            ?.coerceIn(1, 6)
+            ?: 3
+    }.getOrDefault(3)
+
+    /**
+     * v12 系列路径回填（无感迁移）：只扫「非单文件」文件夹库，已存在的书走 skip
+     * 分支由 [InkvolDatabase.updateBookLocationFolder] 顺带补 folder_path。
+     * 成功一轮后 hasMissingFolderPath() 自然为 false，此后不再触发。
+     * 与用户主动扫描互斥（tryLock 失败直接放弃，下次冷启动再试）。
+     */
+    private suspend fun backfillSeriesPaths() {
+        val folders = withContext(Dispatchers.IO) {
+            if (_scan.value.running || !db.hasMissingFolderPath()) {
+                return@withContext emptyList<InkvolDatabase.FolderRow>()
+            }
+            val all = db.queryFolders().filter { it.treeUri != SingleFileImporter.SINGLE_LIBRARY_URI }
+            if (all.isEmpty()) return@withContext emptyList()
+            val lastTry = runCatching {
+                settingsRepository.stringOf(
+                    settingsRepository.snapshotPreferences(),
+                    SettingsKeys.SERIES_PATH_BACKFILL_AT,
+                    "0",
+                ).toLongOrNull() ?: 0L
+            }.getOrDefault(0L)
+            if (System.currentTimeMillis() - lastTry < 24L * 60 * 60 * 1000) {
+                return@withContext emptyList()
+            }
+            runCatching {
+                settingsRepository.putString(
+                    SettingsKeys.SERIES_PATH_BACKFILL_AT,
+                    System.currentTimeMillis().toString(),
+                )
+            }
+            all
+        }
+        if (folders.isEmpty()) return
+        val depth = scanDepth()
+        if (!scanMutex.tryLock()) return
+        try {
+            folders.forEach { folder ->
+                runCatching {
+                    scanner.scan(
+                        Uri.parse(folder.treeUri),
+                        folder.libraryId,
+                        folder.id,
+                        depthLimit = depth,
+                    ) { _, _ -> }
+                }.onFailure {
+                    Log.w("InkvolScan", "series path backfill failed: ${folder.treeUri}", it)
+                }
+            }
+        } finally {
+            scanMutex.unlock()
+        }
+        reload()
     }
 
     suspend fun refresh() = withContext(Dispatchers.IO) { reload() }
@@ -210,23 +301,27 @@ class LibraryRepository(
     fun rescanLibrary(library: LibraryRecord) {
         scope.launch {
             _scan.value = ScanState(running = true, current = "扫描「${library.name}」…")
-            runCatching {
-                val folders = withContext(Dispatchers.IO) {
-                    db.queryFolders().filter { it.libraryId == library.id }
-                }
-                folders.forEach { folder ->
-                    // 单文件导入的虚拟文件夹不是 SAF 目录，跳过
-                    if (folder.treeUri == SingleFileImporter.SINGLE_LIBRARY_URI) return@forEach
-                    scanner.scan(
-                        Uri.parse(folder.treeUri),
-                        folder.libraryId,
-                        folder.id,
-                    ) { count, current ->
-                        _scan.value = ScanState(running = true, scanned = count, current = current)
+            val depth = scanDepth()
+            scanMutex.withLock {
+                runCatching {
+                    val folders = withContext(Dispatchers.IO) {
+                        db.queryFolders().filter { it.libraryId == library.id }
                     }
+                    folders.forEach { folder ->
+                        // 单文件导入的虚拟文件夹不是 SAF 目录，跳过
+                        if (folder.treeUri == SingleFileImporter.SINGLE_LIBRARY_URI) return@forEach
+                        scanner.scan(
+                            Uri.parse(folder.treeUri),
+                            folder.libraryId,
+                            folder.id,
+                            depthLimit = depth,
+                        ) { count, current ->
+                            _scan.value = ScanState(running = true, scanned = count, current = current)
+                        }
+                    }
+                }.onFailure {
+                    Log.w("InkvolScan", "library scan failed: ${library.name}", it)
                 }
-            }.onFailure {
-                Log.w("InkvolScan", "library scan failed: ${library.name}", it)
             }
             reload()
             _scan.value = ScanState(running = false)
@@ -286,6 +381,119 @@ class LibraryRepository(
 
     suspend fun openSource(book: BookRecord): BookContentSource =
         sourceFactory.open(book)
+
+    data class RetypeResult(val ok: Int, val failed: Int)
+
+    /**
+     * EPUB / MOBI 阅读类型互转。
+     *
+     * - toComic = true：按图片页重建（pageCount = 图片页数，封面取第一页），清小说章节与进度；
+     * - toComic = false：重新解析章节文本，清漫画页进度与页书签；
+     * - 成功后写 book_type_overrides，重扫不再自动判定覆盖用户的选择。
+     *
+     * 源文件不动，只改书架记录与派生数据；进度按提示从 0 开始。
+     */
+    /**
+     * P3：章节落库 write-through——库中无记录才写（存量书打开一次即补齐）。
+     * 阅读路径始终从内容源现算，DB 只服务备份，不做读取缓存。
+     */
+    fun saveBookSectionsIfEmpty(
+        bookId: String,
+        sections: List<com.inkvol.app.data.source.BookSection>,
+    ) {
+        if (sections.isEmpty()) return
+        runCatching {
+            if (db.queryBookSections(bookId).isNotEmpty()) return
+            db.replaceBookSections(
+                bookId,
+                sections.map { BookSectionRecord(it.idx, it.title, it.pageStart) },
+            )
+        }
+    }
+
+    suspend fun retypeBooks(ids: Collection<String>, toComic: Boolean): RetypeResult =
+        withContext(Dispatchers.IO) {
+            if (ids.isEmpty()) return@withContext RetypeResult(0, 0)
+            var ok = 0
+            var failed = 0
+            ids.forEach { id ->
+                runCatching {
+                    val book = db.queryBook(id) ?: error("书不见了")
+                    val ext = book.format.lowercase()
+                    if (ext != "epub" && ext != "mobi") error("仅支持 EPUB / MOBI")
+                    val local = sourceFactory.localFile(book, ext)
+
+                    if (toComic) {
+                        if (book.type == "COMIC") return@runCatching
+                        val source = if (ext == "epub") EpubImageSource(local) else MobiImageSource(local)
+                        try {
+                            val pages = source.pageCount
+                            if (pages <= 0) error("没有可用的图片页")
+                            val cover = ArchiveProber(context)
+                                .saveCover(id) { index -> source.openPage(index) }
+                            db.updateBookKind(id, "COMIC", book.format.uppercase(), pages, cover)
+                            // P3：章节落库（备份用）
+                            runCatching {
+                                db.replaceBookSections(
+                                    id,
+                                    (source as? SectionedContentSource)?.listSections().orEmpty()
+                                        .map {
+                                            BookSectionRecord(it.idx, it.title, it.pageStart)
+                                        },
+                                )
+                            }
+                        } finally {
+                            source.close()
+                        }
+                        // 小说侧派生数据整体清掉，避免搜索命中 / 继续阅读串味
+                        db.deleteNovelProgress(id)
+                        runCatching { File(context.filesDir, "epub_images/$id").deleteRecursively() }
+                        runCatching { TxtNovelParser.deleteText(context, id) }
+                    } else {
+                        if (book.type == "NOVEL") return@runCatching
+                        // 两个 parse 返回类型不同，不能写成三元分支（会推断成 Any）
+                        val parsedChapters: List<NovelChapterRecord>
+                        val parsedCover: String?
+                        if (ext == "epub") {
+                            val parsed = EpubParser.parse(context, id, local)
+                            parsedChapters = parsed.chapters
+                            parsedCover = parsed.coverPath
+                        } else {
+                            val parsed = MobiParser.parse(context, id, local)
+                            parsedChapters = parsed.chapters
+                            parsedCover = parsed.coverPath
+                        }
+                        if (parsedChapters.isEmpty()) error("没有解析出章节")
+                        db.replaceNovelChapters(id, parsedChapters)
+                        val cover = parsedCover
+                            ?: NovelCoverGenerator.save(context, id, book.title, parsedChapters.size)
+                        db.updateBookKind(id, "NOVEL", book.format.uppercase(), parsedChapters.size, cover)
+                        db.deleteComicProgress(id)
+                        // 漫画侧章节区间随之作废
+                        runCatching { db.clearBookSections(id) }
+                        runCatching { PanelLayoutCache.clear(context, id) }
+                    }
+                    db.markTypeOverridden(id)
+                    ok++
+                }.onFailure { error ->
+                    failed++
+                    Log.w(
+                        "InkvolRetype",
+                        "retype failed: $id -> ${if (toComic) "COMIC" else "NOVEL"}",
+                        error,
+                    )
+                }
+            }
+            if (ok > 0) reload()
+            postNotice(
+                if (failed == 0) {
+                    "已转换 $ok 本"
+                } else {
+                    "已转换 $ok 本，失败 $failed 本"
+                },
+            )
+            RetypeResult(ok, failed)
+        }
 
     suspend fun novelChapters(bookId: String): List<NovelChapterRecord> = withContext(Dispatchers.IO) {
         db.queryNovelChapters(bookId)
@@ -439,6 +647,38 @@ class LibraryRepository(
             rows.filter { it.bookId in allowed }
         }
 
+    /**
+     * 笔记搜索：annotations 表（划线/批注/书签同表），note（批注文字）/ snippet（划线原文）
+     * 任一命中即出，最近修改优先；书级筛选（类型/格式/状态/书夹/文件夹）与书目同口径。
+     */
+    suspend fun searchNotes(query: String, filter: SearchFilter): List<SearchNoteRow> =
+        withContext(Dispatchers.IO) {
+            val q = query.trim()
+            if (q.isEmpty()) return@withContext emptyList()
+            val annotations = db.queryAllAnnotations()
+            if (annotations.isEmpty()) return@withContext emptyList()
+            val booksById = db.queryBooks().associateBy { it.id }
+            val allowed: Set<String>? = if (filter.isEmpty()) {
+                null
+            } else {
+                filterBooks(
+                    db.queryBooks(),
+                    "",
+                    filter,
+                    db.queryCategoryBookIds(),
+                    db.queryBookFolderIds(),
+                ).map { it.id }.toSet()
+            }
+            annotations.mapNotNull { ann ->
+                val book = booksById[ann.bookId] ?: return@mapNotNull null
+                val noteHit = ann.note?.contains(q, ignoreCase = true) == true
+                val snippetHit = ann.snippet.contains(q, ignoreCase = true)
+                if (!noteHit && !snippetHit) return@mapNotNull null
+                if (allowed != null && ann.bookId !in allowed) return@mapNotNull null
+                SearchNoteRow(book, ann)
+            }.let { if (it.size > 100) it.take(100) else it }
+        }
+
     /** 筛选 facet 数据源（进页一次预载：书夹/文件夹/系列/标签/作者 distinct）。 */
     suspend fun searchFacets(): SearchFacets = withContext(Dispatchers.IO) {
         val books = db.queryBooks()
@@ -543,6 +783,7 @@ class LibraryRepository(
             searched = q.isNotEmpty(),
             loading = q.isNotEmpty(),
             books = emptyList(),
+            notes = emptyList(),
             chapterHits = emptyList(),
             bodyGroups = emptyList(),
             bodyScanned = 0,
@@ -558,18 +799,21 @@ class LibraryRepository(
         }
         pushHistory(q)
         searchJob = scope.launch {
-            val books = searchBooks(q, filter)
-            val chapters = searchChapterHits(q, filter)
+            // 分区筛选：关掉的分区查询直接短路（正文关=不起扫描，见 startBodyScan）
+            val books = if (filter.sectionOn(SearchFilter.SECTION_BOOK)) searchBooks(q, filter) else emptyList()
+            val chapters = if (filter.sectionOn(SearchFilter.SECTION_CHAPTER)) searchChapterHits(q, filter) else emptyList()
+            val notes = if (filter.sectionOn(SearchFilter.SECTION_NOTE)) searchNotes(q, filter) else emptyList()
             // 本 Job 已被更新的 runSearch 取消时不再写回旧结果
             currentCoroutineContext().ensureActive()
-            _search.value = _search.value.copy(loading = false, books = books, chapterHits = chapters)
+            _search.value = _search.value.copy(loading = false, books = books, chapterHits = chapters, notes = notes)
         }
         startBodyScan(q, filter, bodyDebounceMs)
     }
 
     private fun startBodyScan(q: String, filter: SearchFilter, debounceMs: Long) {
         bodyScanJob?.cancel()
-        if (q.length < 2 || filter.type == "COMIC") return
+        // 正文分区被筛选关掉：不起扫描（runSearch 已把 bodyGroups/bodyTotal 复位）。
+        if (q.length < 2 || filter.type == "COMIC" || !filter.sectionOn(SearchFilter.SECTION_BODY)) return
         bodyScanJob = scope.launch {
             if (debounceMs > 0) delay(debounceMs)
             currentCoroutineContext().ensureActive()
@@ -619,6 +863,7 @@ class LibraryRepository(
             searched = false,
             loading = false,
             books = emptyList(),
+            notes = emptyList(),
             chapterHits = emptyList(),
             bodyGroups = emptyList(),
             bodyScanned = 0,
@@ -927,7 +1172,14 @@ class LibraryRepository(
     fun importDocument(uri: Uri) {
         scope.launch {
             _scan.value = ScanState(running = true, current = "导入文件…")
+            // 持久化写权限：单文件导入是引用式，日后「删除源文件」要直接 deleteDocument，
+            // 只拿读权限重启后必失败；部分 Provider 不授写权，降级只拿读权限，不阻塞导入。
             runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            }.recoverCatching {
                 context.contentResolver.takePersistableUriPermission(
                     uri,
                     Intent.FLAG_GRANT_READ_URI_PERMISSION,
@@ -959,21 +1211,25 @@ class LibraryRepository(
                 return@launch
             }
             _scan.value = ScanState(running = true, current = "重新扫描…")
+            val depth = scanDepth()
             var added = 0
             val failedNames = ArrayList<String>()
-            folders.forEach { folder ->
-                runCatching {
-                    val result = scanner.scan(
-                        Uri.parse(folder.treeUri),
-                        folder.libraryId,
-                        folder.id,
-                    ) { count, current ->
-                        _scan.value = ScanState(running = true, scanned = count, current = current)
+            scanMutex.withLock {
+                folders.forEach { folder ->
+                    runCatching {
+                        val result = scanner.scan(
+                            Uri.parse(folder.treeUri),
+                            folder.libraryId,
+                            folder.id,
+                            depthLimit = depth,
+                        ) { count, current ->
+                            _scan.value = ScanState(running = true, scanned = count, current = current)
+                        }
+                        added += result.added
+                    }.onFailure {
+                        failedNames += folder.name
+                        Log.w("InkvolScan", "rescan failed: ${folder.treeUri}", it)
                     }
-                    added += result.added
-                }.onFailure {
-                    failedNames += folder.name
-                    Log.w("InkvolScan", "rescan failed: ${folder.treeUri}", it)
                 }
             }
             reload()
@@ -1007,13 +1263,16 @@ class LibraryRepository(
             val libraryId = db.findOrCreateLibrary(uri.toString(), displayName)
             val folderId = db.findOrCreateFolder(libraryId, uri.toString(), displayName)
 
-            val result = scanner.scan(uri, libraryId, folderId) { count, current ->
-                _scan.value = ScanState(
-                    running = true,
-                    scanned = count,
-                    added = count,
-                    current = current,
-                )
+            val depth = scanDepth()
+            val result = scanMutex.withLock {
+                scanner.scan(uri, libraryId, folderId, depthLimit = depth) { count, current ->
+                    _scan.value = ScanState(
+                        running = true,
+                        scanned = count,
+                        added = count,
+                        current = current,
+                    )
+                }
             }
             reload()
             _scan.value = ScanState(running = false, scanned = result.added, added = result.added)
@@ -1037,8 +1296,8 @@ class LibraryRepository(
     )
 
     /**
-     * 删除书本。deleteFiles=true 时尝试删除源文件（仅树内文件；单文件导入无树权限自动跳过）。
-     * 删除失败（无写权限 / Provider 不支持）降级为仅从书架移除。
+     * 删除书本。deleteFiles=true 时尝试删除源文件（文件夹内文件 / 单文件导入引用 / 同步下载文件）。
+     * 删除失败（无写入权限 / Provider 不支持）降级为仅从书架移除。
      */
     suspend fun deleteBooks(ids: Collection<String>, deleteFiles: Boolean): DeleteResult =
         withContext(Dispatchers.IO) {
@@ -1048,17 +1307,11 @@ class LibraryRepository(
             if (deleteFiles) {
                 ids.forEach { id ->
                     db.queryBookLocations(id).forEach { loc ->
-                        if (loc.treeUri.isBlank() || loc.treeUri == SingleFileImporter.SINGLE_LIBRARY_URI) {
-                            return@forEach
+                        when (deleteSourceFile(loc)) {
+                            true -> filesDeleted++
+                            false -> filesFailed++
+                            null -> Unit
                         }
-                        val docUri = DocumentsContract.buildDocumentUriUsingTree(
-                            Uri.parse(loc.treeUri),
-                            loc.docId,
-                        )
-                        val ok = runCatching {
-                            DocumentsContract.deleteDocument(context.contentResolver, docUri)
-                        }.getOrDefault(false)
-                        if (ok) filesDeleted++ else filesFailed++
                     }
                 }
             }
@@ -1068,11 +1321,66 @@ class LibraryRepository(
             reload()
             _notice.value = when {
                 deleteFiles && filesFailed == 0 && filesDeleted > 0 -> "已删除 ${ids.size} 本（含源文件）"
-                deleteFiles && filesFailed > 0 -> "已删除 ${ids.size} 本，其中 $filesFailed 本文件删除失败（可能无写入权限）"
+                deleteFiles && filesFailed > 0 -> "已删除 ${ids.size} 本，$filesFailed 个源文件未能删除（无写入权限或不支持）"
                 else -> "已从书架移除 ${ids.size} 本"
             }
             DeleteResult(removed = ids.size, filesDeleted = filesDeleted, filesFailed = filesFailed)
         }
+
+    /**
+     * 删除一处源文件。按 doc_id 形态分三支（单文件导入原先被整体跳过，导致永远删不掉）：
+     * - content:// 完整 document URI（单文件 SAF 导入）：直接 deleteDocument——不能再过
+     *   buildDocumentUriUsingTree，它的 tree 是虚拟串 inkvol://single-file，拼出来是非法的；
+     * - file://（M4.5 同步下载到 filesDir/library）：App 私有文件，直接删；
+     * - 其它（文件夹扫描导入的树内 child docId）：维持 buildDocumentUriUsingTree。
+     * 返回 null 表示无可用信息（老数据 tree_uri 缺失等），不计成功也不计失败。
+     */
+    private fun deleteSourceFile(loc: InkvolDatabase.BookLocation): Boolean? {
+        val docId = loc.docId
+        if (docId.isBlank()) return null
+        return try {
+            when {
+                docId.startsWith("content://") -> {
+                    val docUri = Uri.parse(docId)
+                    val ok = DocumentsContract.deleteDocument(context.contentResolver, docUri)
+                    if (ok) releaseSourcePermission(docUri)
+                    ok
+                }
+                docId.startsWith("file://") -> {
+                    val path = Uri.parse(docId).path
+                    if (path.isNullOrBlank()) {
+                        null
+                    } else {
+                        File(path).delete()
+                    }
+                }
+                loc.treeUri.isNotBlank() && loc.treeUri != SingleFileImporter.SINGLE_LIBRARY_URI -> {
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(
+                        Uri.parse(loc.treeUri),
+                        docId,
+                    )
+                    DocumentsContract.deleteDocument(context.contentResolver, docUri)
+                }
+                else -> null
+            }
+        } catch (error: Throwable) {
+            Log.w("InkvolDelete", "delete source failed: $docId", error)
+            false
+        }
+    }
+
+    /** 源文件已删：收回持久化授权，避免 grant 累积到系统上限（失败无妨）。 */
+    private fun releaseSourcePermission(uri: Uri) {
+        val resolver = context.contentResolver
+        runCatching {
+            resolver.releasePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+        }.recoverCatching {
+            resolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+    }
 
     private fun cleanupBookFiles(ids: Collection<String>, covers: List<String>) {
         covers.forEach { path -> runCatching { File(path).delete() } }
@@ -1084,8 +1392,13 @@ class LibraryRepository(
             runCatching { File(context.filesDir, "epub_images/$id").deleteRecursively() }
         }
         File(context.cacheDir, "import").listFiles()?.filter { file ->
-            file.isFile && idSet.any { id -> file.name == id || file.name.startsWith("$id.") }
-        }?.forEach { runCatching { it.delete() } }
+            idSet.any { id -> file.name == id || file.name.startsWith("$id.") }
+        }?.forEach { file ->
+            runCatching {
+                // 目录 = 嵌套归档（P2）的子包解包目录，递归清
+                if (file.isDirectory) file.deleteRecursively() else file.delete()
+            }
+        }
     }
 
     // ---------------- 书夹 ----------------
