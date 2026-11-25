@@ -56,7 +56,28 @@ docs/handoff*.md
 
 # 临时日志
 build_log.txt
+build_log*.txt
 build_release_log.txt
+*.log
+*.hprof
+
+# 密钥/证书类补充（除 jks 外）
+*.p12
+*.pem
+*.key
+*.der
+/keys/
+
+# 崩溃日志/截图/备份文件：可能含书名、路径与阅读数据
+crash-*.txt
+/screenshots/
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
+
+# 本地图书抓取目录
+/epub_comic_*/
 
 # 发版归档（APK/AAB/mapping，体积大且含混淆映射）
 /dist/
