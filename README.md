@@ -113,6 +113,12 @@ Kotlin · Jetpack Compose · Material 3 · 液态玻璃设计体系
 - 系统云备份（若开启）可能包含书库索引、阅读进度与设置；封面、EPUB 提取图片、TXT 解析缓存与崩溃日志**不参与**云备份
 - 崩溃日志仅写入本机私有目录，最多保留 5 份，需要用户在应用内主动导出
 
+## 开发与发版
+
+- 参与开发、提交规范与安全红线：[CONTRIBUTING.md](CONTRIBUTING.md)
+- 发版流程、版本号规则、**允许/禁止上传清单**：[docs/发版规范.md](docs/发版规范.md)
+- 安全漏洞请走私密报告：[SECURITY.md](.github/SECURITY.md)
+
 ## 构建
 
 ```
