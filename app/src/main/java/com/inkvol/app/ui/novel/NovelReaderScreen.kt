@@ -99,6 +99,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -106,6 +107,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
@@ -389,6 +391,72 @@ private fun panelColor(theme: NovelTheme): Color =
 @Composable
 private fun novelOutline(theme: NovelTheme): Color =
     MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+
+/**
+ * 左右边缘竖向拖动（移植自漫画 readerEdgeDrag）：左缘调亮度、右缘调色温。
+ * 只在真实屏幕边缘起手且竖向主导时触发，避免大面积误触；双指出现立即让位捏合。
+ * 与漫画版的唯一差异：激活前任何一帧发现事件被子层消费（LazyColumn 滚动 /
+ * Pager 横向拖拽 / 手柄拦截层）即整手放弃——scroll 档边缘竖滑=正常滚动，
+ * 斜滑翻页与选区手柄拖动零回归。本层声明在根 Box 手势链尾，能看到前序层消费。
+ */
+private fun Modifier.novelEdgeDrag(
+    onDrag: (Boolean, Float, Float) -> Unit,
+    leftEnabled: Boolean,
+    rightEnabled: Boolean,
+): Modifier = pointerInput(leftEnabled, rightEnabled) {
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        val width = size.width.toFloat()
+        val height = size.height.toFloat()
+        val edgeWidth = 20.dp.toPx()
+        val topGuard = 56.dp.toPx()
+        val bottomGuard = 64.dp.toPx()
+
+        // 必须从真实屏幕边缘起手；从中间滑到边缘不算。
+        val left = leftEnabled && down.position.x <= edgeWidth
+        val right = rightEnabled && down.position.x >= width - edgeWidth
+        val verticalStart = down.position.y > topGuard &&
+            down.position.y < height - bottomGuard
+        if (height <= topGuard + bottomGuard || (!left && !right) || !verticalStart) {
+            return@awaitEachGesture
+        }
+
+        var active = false
+        var lastY = down.position.y
+        while (true) {
+            val event = awaitPointerEvent()
+
+            // 双指出现时立刻让位给捏合缩放。
+            if (event.changes.size > 1) {
+                event.changes.forEach { change ->
+                    if (change.id == down.id && active) change.consume()
+                }
+                break
+            }
+
+            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+            // 子层/前序兄弟层已消费（滚动、翻页拖拽、手柄拖动）：整手放弃。
+            if (change.isConsumed) {
+                if (active) change.consume()
+                return@awaitEachGesture
+            }
+            val total = change.position - down.position
+            if (!active &&
+                abs(total.y) > viewConfiguration.touchSlop &&
+                abs(total.y) > abs(total.x) * 1.5f
+            ) {
+                active = true
+            }
+            if (active) {
+                val dy = change.position.y - lastY
+                if (dy != 0f) onDrag(left, dy, height)
+                change.consume()
+            }
+            lastY = change.position.y
+            if (!change.pressed) break
+        }
+    }
+}
 
 internal fun novelTextStyle(
     prefs: NovelReadingPrefs,
@@ -691,6 +759,35 @@ fun NovelReaderScreen(
             darkFollow = settingsRepository.booleanOf(snapshot, SettingsKeys.NOVEL_DARK_FOLLOW, true)
         }
     }
+    // 边缘手势开关（移植自漫画）：左缘竖滑调系统亮度 / 右缘竖滑调色温。
+    // 纵向连续（scroll）档不支持——边缘竖滑被 LazyColumn 消费，手势层自动让位。
+    var novelEdgeBrightnessOn by remember { mutableStateOf(true) }
+    var novelEdgeColorTempOn by remember { mutableStateOf(true) }
+    LaunchedEffect(bookId) {
+        val snapshot = settingsRepository.snapshotPreferences()
+        novelEdgeBrightnessOn = settingsRepository.booleanOf(
+            snapshot,
+            SettingsKeys.NOVEL_EDGE_BRIGHTNESS,
+            true,
+        )
+        novelEdgeColorTempOn = settingsRepository.booleanOf(
+            snapshot,
+            SettingsKeys.NOVEL_EDGE_COLOR_TEMP,
+            true,
+        )
+        settingsRepository.preferences.collect { snap ->
+            novelEdgeBrightnessOn = settingsRepository.booleanOf(
+                snap,
+                SettingsKeys.NOVEL_EDGE_BRIGHTNESS,
+                true,
+            )
+            novelEdgeColorTempOn = settingsRepository.booleanOf(
+                snap,
+                SettingsKeys.NOVEL_EDGE_COLOR_TEMP,
+                true,
+            )
+        }
+    }
     // 派生不落盘：跟随开启且 App 深色 → 背景强制墨黑；prefs.theme（含 per-book 单独记忆）不被污染，
     // 回浅色自动恢复手动档。面板选浅色档会走 onPickTheme 关闭跟随（用户接管）。
     val darkFollowActive = darkFollow && appDark
@@ -704,6 +801,41 @@ fun NovelReaderScreen(
     // 挖孔兜底记忆：设备曾上报过的最大挖孔 inset（dp）。
     // 部分平板横屏 displayCutout 全 0（挖孔被并入状态栏语义），用该值对左右补偿。
     var rememberedCutoutDp by remember { mutableStateOf(0f) }
+
+    // 边缘手势的会话状态（不持久化，同漫画）：brightness -1 = 未接管过系统亮度。
+    var novelBrightness by rememberSaveable { mutableFloatStateOf(-1f) }
+    var novelColorTemp by rememberSaveable { mutableFloatStateOf(0f) }
+    // HUD 是连续反馈（拖动时每帧改文案），动画只认"有无"，文案走保留变量（漫画同款）。
+    var novelHudText by remember { mutableStateOf<String?>(null) }
+    var novelHudHeld by remember { mutableStateOf("") }
+
+    // 左缘拖动接管系统亮度；离开阅读器恢复系统档（-1f）。与漫画各自恢复，互不影响。
+    LaunchedEffect(novelBrightness) {
+        if (novelBrightness >= 0f) {
+            (context as? Activity)?.window?.let { window ->
+                val params = window.attributes
+                params.screenBrightness = novelBrightness.coerceIn(0.05f, 1f)
+                window.attributes = params
+            }
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            (context as? Activity)?.window?.let { window ->
+                val params = window.attributes
+                params.screenBrightness = -1f
+                window.attributes = params
+            }
+        }
+    }
+    LaunchedEffect(novelHudText) {
+        val text = novelHudText
+        if (text != null) {
+            novelHudHeld = text
+            kotlinx.coroutines.delay(900)
+            novelHudText = null
+        }
+    }
     val fontList = listOf(
         "system" to "系统默认",
         "serif" to "衬线",
@@ -2092,6 +2224,24 @@ fun NovelReaderScreen(
                     selection == null && bubble == null && previewCharStart < 0,
             )
 
+            // 边缘拖动（移植自漫画 ReaderScreen）：左缘=亮度、右缘=色温。
+            // heightPx 由手势层传入（pointerInput 内才有 size），方向语义与漫画逐字一致：
+            // 上滑变亮/变冷，下滑变暗/变暖。
+            val novelEdgeDrag: (Boolean, Float, Float) -> Unit = { left, dy, heightPx ->
+                if (left) {
+                    val base = if (novelBrightness < 0f) 0.5f else novelBrightness
+                    novelBrightness = (base - dy / heightPx).coerceIn(0.05f, 1f)
+                    novelHudText = "亮度 ${(novelBrightness * 100).roundToInt()}%"
+                } else {
+                    novelColorTemp = (novelColorTemp - dy / heightPx * 1.6f).coerceIn(-1f, 1f)
+                    novelHudText = when {
+                        abs(novelColorTemp) < 0.05f -> "色温 中性"
+                        novelColorTemp > 0f -> "色温 暖 ${(novelColorTemp * 100).roundToInt()}%"
+                        else -> "色温 冷 ${(-novelColorTemp * 100).roundToInt()}%"
+                    }
+                }
+            }
+
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -2678,6 +2828,14 @@ fun NovelReaderScreen(
                             cb.onDragActive(null)
                         }
                     }
+                    // 边缘手势层（移植自漫画）：挂在链尾——先于本层声明的兄弟层（分区点击 /
+                    // 覆盖滑动 / 跨章拖拽 / 手柄拦截）一旦消费，本层即让位（见 novelEdgeDrag
+                    // 内 isConsumed 检查），保证选区拖动、翻页拖拽、滚动语义零回归。
+                    .novelEdgeDrag(
+                        onDrag = novelEdgeDrag,
+                        leftEnabled = novelEdgeBrightnessOn,
+                        rightEnabled = novelEdgeColorTempOn,
+                    )
                     .onGloballyPositioned { screenOrigin = it.positionInRoot() }
             ) {
                 // M6-G 跨章覆盖档：旧页快照垫在最底层（新内容从侧面盖入，必须画在页面之下）。
@@ -3178,6 +3336,40 @@ fun NovelReaderScreen(
                 }
 
                 }
+
+            // 色温叠加层（移植自漫画）：暖橙/冷蓝半透明罩，画在正文之上、顶底栏之下。
+            if (novelColorTemp != 0f) {
+                val tempAlpha = (abs(novelColorTemp) * 0.18f).coerceIn(0f, 0.18f)
+                val tempColor = if (novelColorTemp > 0f) Color(0xFFFF8A00) else Color(0xFF4A90FF)
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(tempColor.copy(alpha = tempAlpha)),
+                )
+            }
+
+            // 拖动反馈 HUD（移植自漫画）：亮度/色温胶囊，拖动每帧更新、松手 900ms 淡出。
+            AnimatedVisibility(
+                visible = novelHudText != null,
+                enter = fadeIn(tween(100)) + scaleIn(tween(120), initialScale = 0.96f),
+                exit = fadeOut(tween(80)),
+                modifier = Modifier.align(Alignment.Center),
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(22.dp),
+                    color = panelColor(theme),
+                    border = BorderStroke(1.dp, novelOutline(theme)),
+                ) {
+                    Text(
+                        // 显示中直接读实时文案（保留变量晚一帧，会闪一下空胶囊）；
+                        // 退场时 novelHudText 已置空，用保留值撑完淡出
+                        text = novelHudText ?: novelHudHeld,
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 10.dp),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = theme.text,
+                    )
+                }
+            }
 
             AnimatedVisibility(
                 visible = chromeVisible && !quickPanel && !chapterListOpen &&

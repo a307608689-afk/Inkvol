@@ -1806,6 +1806,20 @@ private fun buildSettingsGroups(
                             SettingChoice(SettingsKeys.DOUBLE_PAGE_OFF, "关闭"),
                         ),
                     ) { next -> putString(SettingsKeys.NOVEL_DOUBLE_PAGE, next) },
+                    toggle(
+                        id = "novel_edge_brightness",
+                        title = "左缘亮度",
+                        subtitle = "屏幕左边缘 20dp 内竖滑调节（纵向连续滚动档不支持）",
+                        key = SettingsKeys.NOVEL_EDGE_BRIGHTNESS,
+                        default = true,
+                    ),
+                    toggle(
+                        id = "novel_edge_color_temp",
+                        title = "右缘色温",
+                        subtitle = "屏幕右边缘 20dp 内竖滑调节（纵向连续滚动档不支持）",
+                        key = SettingsKeys.NOVEL_EDGE_COLOR_TEMP,
+                        default = true,
+                    ),
                     ActionSpec(
                         id = "novel_global_apply",
                         title = "应用到所有小说",

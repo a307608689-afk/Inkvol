@@ -136,6 +136,11 @@ object SettingsKeys {
     const val NOVEL_PAGE_TRANSITION = "novel_page_transition"
     const val PAGE_TRANSITION_CURL = "curl" // 仿真：点击翻页的纸张卷曲（小说专属档）
 
+    // 小说阅读器边缘手势（移植自漫画）：左缘竖滑调系统亮度、右缘竖滑调色温。
+    // 纵向连续（scroll）档不支持（边缘竖滑让位给滚动）。
+    const val NOVEL_EDGE_BRIGHTNESS = "novel_edge_brightness"
+    const val NOVEL_EDGE_COLOR_TEMP = "novel_edge_color_temp"
+
     // M6.1-B 小说阅读
     const val NOVEL_FONTS = "novel_fonts"
     const val NOVEL_BOOK_PREFIX = "novel_book_"
