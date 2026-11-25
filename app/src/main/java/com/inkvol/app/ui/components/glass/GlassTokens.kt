@@ -138,8 +138,19 @@ object GlassMotion {
     const val OVERLAY_EXIT_MS = 170
 
     // 阅读器内三块面板快一档（沉浸场景连续操作，不打断阅读节奏）
-    const val READER_ENTER_MS = 200
-    const val READER_EXIT_MS = 150
+    const val READER_ENTER_MS = 220
+    const val READER_EXIT_MS = 160
+
+    /**
+     * 阅读器面板位移用「自身高度比例」而不是固定 dp：
+     * 面板高度随内容变化（短则半屏、长则近满屏），固定 40dp 在高面板上只占 6%，
+     * 看起来只是"黏着飘了一下"；按比例才有明确"升起来"的行程。
+     */
+    const val READER_PANEL_RISE_FRAC = 0.20f
+    const val READER_PANEL_FALL_FRAC = 0.12f
+
+    /** 阅读器面板轻微缩放（进场 0.96 → 1，退场回 0.96），补"体量生成"的观感 */
+    const val READER_PANEL_SCALE = 0.96f
 
     /** 底部面板进场起始位移（只用 40dp，不做整页滑入：背景不压暗，模态感要弱） */
     const val PANEL_RISE_DP = 40f

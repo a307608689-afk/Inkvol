@@ -1763,15 +1763,27 @@ private fun buildSettingsGroups(
                     ChoiceSpec(
                         id = "novel_global_theme",
                         title = "默认背景",
-                        subtitle = "纸白 / 米黄 / 护眼绿 / 墨黑",
+                        subtitle = "纸白 / 米黄 / 牛皮纸 / 护眼绿 / 雾蓝 / 樱粉 / 墨黑 / 深灰蓝",
                         value = defaults.theme,
                         options = listOf(
                             SettingChoice(SettingsKeys.NOVEL_THEME_PAPER, "纸白"),
                             SettingChoice(SettingsKeys.NOVEL_THEME_SEPIA, "米黄"),
+                            SettingChoice(SettingsKeys.NOVEL_THEME_KRAFT, "牛皮纸"),
                             SettingChoice(SettingsKeys.NOVEL_THEME_GREEN, "护眼绿"),
+                            SettingChoice(SettingsKeys.NOVEL_THEME_MIST, "雾蓝"),
+                            SettingChoice(SettingsKeys.NOVEL_THEME_SAKURA, "樱粉"),
                             SettingChoice(SettingsKeys.NOVEL_THEME_DARK, "墨黑"),
+                            SettingChoice(SettingsKeys.NOVEL_THEME_SLATE, "深灰蓝"),
                         ),
                     ) { next -> putGlobal(defaults.copy(theme = next)) },
+                    // 深色跟随：与外观组同一全局键（两处入口实时同步）；阅读器排版面板不再提供开关行。
+                    toggle(
+                        id = "novel_dark_follow_novel",
+                        title = "深色时背景自动切换",
+                        subtitle = "App 进入深色时小说背景自动切到墨黑，回浅色恢复原档",
+                        key = SettingsKeys.NOVEL_DARK_FOLLOW,
+                        default = true,
+                    ),
                     ChoiceSpec(
                         id = "novel_page_transition",
                         title = "动画",

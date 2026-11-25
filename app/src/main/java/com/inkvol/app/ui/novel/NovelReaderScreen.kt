@@ -89,11 +89,13 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -357,16 +359,40 @@ internal fun novelTheme(id: String): NovelTheme = when (id) {
         secondary = Color(0xFF8D7764),
         dark = false,
     )
+    SettingsKeys.NOVEL_THEME_KRAFT -> NovelTheme(
+        background = Color(0xFFF0E4CB),
+        text = Color(0xFF3B3025),
+        secondary = Color(0xFF8A7A63),
+        dark = false,
+    )
     SettingsKeys.NOVEL_THEME_GREEN -> NovelTheme(
         background = Color(0xFFEAF3E5),
         text = Color(0xFF263A26),
         secondary = Color(0xFF5B7A5B),
         dark = false,
     )
+    SettingsKeys.NOVEL_THEME_MIST -> NovelTheme(
+        background = Color(0xFFE7EDF5),
+        text = Color(0xFF242B34),
+        secondary = Color(0xFF66707C),
+        dark = false,
+    )
+    SettingsKeys.NOVEL_THEME_SAKURA -> NovelTheme(
+        background = Color(0xFFFAEDEF),
+        text = Color(0xFF3A2A2D),
+        secondary = Color(0xFF8A7075),
+        dark = false,
+    )
     SettingsKeys.NOVEL_THEME_DARK -> NovelTheme(
         background = Color(0xFF121212),
         text = Color(0xFFDADADA),
         secondary = Color(0xFF9A9A9A),
+        dark = true,
+    )
+    SettingsKeys.NOVEL_THEME_SLATE -> NovelTheme(
+        background = Color(0xFF1B2027),
+        text = Color(0xFFC8CDD6),
+        secondary = Color(0xFF8A929E),
         dark = true,
     )
     else -> NovelTheme(
@@ -3558,12 +3584,6 @@ fun NovelReaderScreen(
                     pageTransitionMode = value
                     scope.launch { settingsRepository.putString(SettingsKeys.NOVEL_PAGE_TRANSITION, value) }
                 },
-                darkFollow = darkFollow,
-                onSetDarkFollow = { enable ->
-                    // 立即同步本地状态（面板即时生效），异步持久化；与设置-外观同一键。
-                    darkFollow = enable
-                    scope.launch { settingsRepository.putBoolean(SettingsKeys.NOVEL_DARK_FOLLOW, enable) }
-                },
                 onPickTheme = { value ->
                     // 跟随生效期间手动选浅色档 = 用户接管：自动关闭跟随（与设置项同步），选中即生效。
                     if (darkFollowActive && value != SettingsKeys.NOVEL_THEME_DARK) {
@@ -5781,8 +5801,6 @@ private fun NovelQuickPanel(
     onSetDoublePageMode: (String) -> Unit,
     pageTransitionMode: String,
     onSetPageTransition: (String) -> Unit,
-    darkFollow: Boolean,
-    onSetDarkFollow: (Boolean) -> Unit,
     onPickTheme: (String) -> Unit,
     effectiveThemeId: String,
     fonts: List<Pair<String, String>>,
@@ -5804,8 +5822,12 @@ private fun NovelQuickPanel(
     val themeOptions = listOf(
         NovelSettingOption(SettingsKeys.NOVEL_THEME_PAPER, "纸白"),
         NovelSettingOption(SettingsKeys.NOVEL_THEME_SEPIA, "米黄"),
+        NovelSettingOption(SettingsKeys.NOVEL_THEME_KRAFT, "牛皮纸"),
         NovelSettingOption(SettingsKeys.NOVEL_THEME_GREEN, "护眼绿"),
+        NovelSettingOption(SettingsKeys.NOVEL_THEME_MIST, "雾蓝"),
+        NovelSettingOption(SettingsKeys.NOVEL_THEME_SAKURA, "樱粉"),
         NovelSettingOption(SettingsKeys.NOVEL_THEME_DARK, "墨黑"),
+        NovelSettingOption(SettingsKeys.NOVEL_THEME_SLATE, "深灰蓝"),
     )
     val pagingOptions = listOf(
         NovelSettingOption(SettingsKeys.NOVEL_PAGE_HORIZONTAL, "左右翻页"),
@@ -5841,6 +5863,8 @@ private fun NovelQuickPanel(
                         detectTapGestures { onDismiss() }
                     },
             )
+            // 面板内未显式给 color 的 Text 统一跟随当前档正文色：InkvolTheme 不提供
+            // LocalContentColor（默认纯黑），墨黑 / 深灰蓝档下会「黑字压深底」不可读。
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
@@ -5853,6 +5877,7 @@ private fun NovelQuickPanel(
                     .background(panelColor(theme))
                     .border(1.dp, novelOutline(theme), RoundedCornerShape(20.dp)),
             ) {
+                CompositionLocalProvider(LocalContentColor provides theme.text) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -5961,29 +5986,6 @@ private fun NovelQuickPanel(
                         onPick = onPickTheme,
                     )
                     Spacer(Modifier.height(8.dp))
-                    // 深色跟随开关（与设置-外观同一全局键）：App 深色时背景自动切墨黑，
-                    // 回浅色恢复手动档；整行单击切换。
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable { onSetDarkFollow(!darkFollow) }
-                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f))
-                            .padding(horizontal = 12.dp, vertical = 12.dp),
-                    ) {
-                        Text(
-                            "深色自动切换",
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.weight(1f),
-                        )
-                        Text(
-                            text = if (darkFollow) "开启" else "关闭",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                    }
-                    Spacer(Modifier.height(8.dp))
                     // 翻页动画为全局档（独立键）：仅点击翻页生效，拖拽与跳页保持瞬时。
                     // M6.5 纵向连续档没有翻页语义，隐藏本行（档位保留，切回翻页档恢复）。
                     if (prefs.pagingMode != SettingsKeys.NOVEL_PAGE_SCROLL) {
@@ -6037,6 +6039,7 @@ private fun NovelQuickPanel(
                             color = MaterialTheme.colorScheme.primary,
                         )
                     }
+                }
                 }
             }
         }

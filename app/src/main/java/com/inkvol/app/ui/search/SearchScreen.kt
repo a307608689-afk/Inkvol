@@ -10,10 +10,10 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -32,7 +32,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsIgnoringVisibility
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -59,13 +59,11 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -99,6 +97,7 @@ import com.inkvol.app.ui.components.glass.GlassRounded
 import com.inkvol.app.ui.components.glass.GlassTier
 import com.inkvol.app.ui.components.glass.LocalGlassChrome
 import com.inkvol.app.ui.components.glass.rememberGlassOverlayPresence
+import com.inkvol.app.ui.components.rememberScrollDirectionVisibility
 import com.inkvol.app.ui.library.LibraryTarget
 import com.inkvol.app.ui.library.LibraryUiState
 import com.inkvol.app.ui.theme.InkvolRadius
@@ -106,7 +105,6 @@ import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -155,7 +153,13 @@ internal fun SearchScreen(
     // 捕获 = Idle 且实时 inset>0（显示态稳定终值；阅读器/滚动隐显的隐藏态不覆盖）；
     // 消费 = Closing 期间顶部占位与搜索框行改用冻结值，其余场景实时值零变化。
     var frozenStatusBarTopDp by rememberSaveable { mutableStateOf(Float.NaN) }
-    val liveStatusBarTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    // 基准取「忽略可见性」的状态栏高度（GlassImmersiveHeader / LibraryScreen / GlassRail
+    // 同口径）：状态栏随滚动显隐时 inset 恒定，顶部占位与搜索栏让位不会每帧变高。
+    // 用实时 statusBars 会让唤出期间网格每帧重排 + 搜索栏被二次下推，
+    // 叠加进出场动画即「动画中段顿一下」。
+    val liveStatusBarTop = WindowInsets.statusBarsIgnoringVisibility
+        .asPaddingValues()
+        .calculateTopPadding()
     val statusBarTop = if (closing && !frozenStatusBarTopDp.isNaN()) {
         frozenStatusBarTopDp.dp
     } else {
@@ -187,23 +191,14 @@ internal fun SearchScreen(
         runCatching { gridState.scrollToItem(0) }
     }
 
-    // 搜索框行滚动隐显（SSMH 同款迟滞）
-    var headerVisible by remember { mutableStateOf(true) }
-    var lastScrollPos by remember { mutableIntStateOf(0) }
-    LaunchedEffect(gridState) {
-        snapshotFlow {
+    // 搜索框行滚动隐显：复用工程既有方向显隐（含首帧守卫）。
+    // 旧实现就地 collect，上滑 fling 末段出现 1~2 帧反向就会把 visible 翻回去，
+    // 进出场动画中途折返 = 又一处「顿」。
+    val headerVisible = rememberScrollDirectionVisibility(
+        positionProvider = {
             gridState.firstVisibleItemIndex * 10000 + gridState.firstVisibleItemScrollOffset
-        }
-            .distinctUntilChanged()
-            .collect { position ->
-                val delta = position - lastScrollPos
-                when {
-                    delta > 3 -> headerVisible = false
-                    delta < -3 -> headerVisible = true
-                }
-                lastScrollPos = position
-            }
-    }
+        },
+    )
 
     // 系统状态栏随滚动隐显（规范 §3.4 / §12-13）。
     // 退场 show 已移除（GlassImmersiveHeader 同款）：NavHost 转场结束才 dispose，
@@ -213,11 +208,15 @@ internal fun SearchScreen(
     LaunchedEffect(headerVisible) {
         runCatching {
             val controller = WindowCompat.getInsetsController(view.context.findWindow(), view)
-            controller.systemBarsBehavior =
-                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             if (headerVisible) {
+                // show 前复位成非瞬态（GlassImmersiveHeader 同坑）：阅读器设过
+                // TRANSIENT 且退出不复位，这里不复位的话唤出会被系统当成「临时唤出」，
+                // 几秒后自动缩回 → inset 再变一次 → 搜索栏/顶部占位又跳一下。
+                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
                 controller.show(WindowInsetsCompat.Type.statusBars())
             } else {
+                controller.systemBarsBehavior =
+                    WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
                 controller.hide(WindowInsetsCompat.Type.statusBars())
             }
         }
@@ -526,8 +525,12 @@ internal fun SearchScreen(
         // 悬浮玻璃搜索框行（滚动隐显；采集层兄弟节点）
         AnimatedVisibility(
             visible = headerVisible,
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically(),
+            // 位移 + 淡入，不做高度动画：expandVertically 每帧改自身测量尺寸（clip 裁切
+            // 出「压扁再撑开」），中段 spring 速度最慢，观感就是「动画顿一下」。
+            // slide 走 placement 偏移、不改高度，搜索栏整体从状态栏后方滑下来。
+            enter = fadeIn(tween(180)) +
+                slideInVertically(tween(220, easing = FastOutSlowInEasing)) { -it },
+            exit = fadeOut(tween(120)) + slideOutVertically(tween(160)) { -it },
             modifier = Modifier.align(Alignment.TopCenter),
         ) {
             SearchBarRow(

@@ -146,8 +146,14 @@ object SettingsKeys {
     const val NOVEL_BOOK_PREFIX = "novel_book_"
     const val NOVEL_THEME_PAPER = "paper"
     const val NOVEL_THEME_SEPIA = "sepia"
+    // 2026-11-26 背景扩档（4→8）：新增四档补齐「浓暖纸 / 冷调浅色 / 粉调 / 第二深色」四个空位。
+    // 按 id 字符串持久化，追加新值对旧存档安全（旧版本读到未知值走 novelTheme 的纸白兜底）。
+    const val NOVEL_THEME_KRAFT = "kraft" // 牛皮纸（浓暖，接近旧书页）
     const val NOVEL_THEME_GREEN = "green"
+    const val NOVEL_THEME_MIST = "mist" // 雾蓝（唯一冷调浅色）
+    const val NOVEL_THEME_SAKURA = "sakura" // 樱粉（唯一非中性色相）
     const val NOVEL_THEME_DARK = "dark"
+    const val NOVEL_THEME_SLATE = "slate" // 深灰蓝（深色族第二档，低对比不刺眼）
     const val NOVEL_PAGE_HORIZONTAL = "horizontal"
     const val NOVEL_PAGE_VERTICAL = "vertical"
     // M6.5 纵向连续：单章信息流式连续滚动（LazyColumn）。

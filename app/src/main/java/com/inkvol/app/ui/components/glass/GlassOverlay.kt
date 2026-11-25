@@ -48,7 +48,10 @@ enum class GlassOverlayMotion {
     /** C-2 底部面板：40dp 浮起 */
     BottomPanel,
 
-    /** 阅读器底部面板：同上但快一档 */
+    /**
+     * 阅读器底部面板：位移按**自身高度比例**（0.20 / 0.12）+ 0.96 缩放 + 无延迟淡入。
+     * 面板高度随内容变化，固定 dp 在高面板上几乎看不出"升起"，故用比例。
+     */
     ReaderPanel,
 }
 
@@ -120,37 +123,41 @@ fun GlassOverlay(
         GlassOverlayMotion.Anchored -> 140
         GlassOverlayMotion.Card -> 160
         GlassOverlayMotion.BottomPanel -> 160
-        GlassOverlayMotion.ReaderPanel -> 120
+        // 与位移同步收尾：淡入不再滞后、也不提前结束（否则会看到"先冒出来再漂一下"）
+        GlassOverlayMotion.ReaderPanel -> 190
     }
     val alphaEnterDelay = when (motion) {
         GlassOverlayMotion.BottomPanel -> 40
-        GlassOverlayMotion.ReaderPanel -> 60
+        // 阅读器面板不做延迟：打开瞬间的第一个不可见帧会被读成"点了没反应"
         else -> 0
     }
     val alphaExitMs = when (motion) {
         GlassOverlayMotion.Anchored -> 90
         GlassOverlayMotion.Card -> 120
         GlassOverlayMotion.BottomPanel -> 120
-        GlassOverlayMotion.ReaderPanel -> 100
+        // 别早于位移结束，否则末段在"隐形平移"
+        GlassOverlayMotion.ReaderPanel -> 140
     }
     val scaleFrom = when (motion) {
         GlassOverlayMotion.Anchored -> GlassMotion.MENU_SCALE_FROM
         GlassOverlayMotion.Card -> GlassMotion.CARD_SCALE_FROM
-        else -> 1f
+        GlassOverlayMotion.ReaderPanel -> GlassMotion.READER_PANEL_SCALE
+        GlassOverlayMotion.BottomPanel -> 1f
     }
     val scaleTo = when (motion) {
         GlassOverlayMotion.Anchored -> GlassMotion.MENU_SCALE_TO
         GlassOverlayMotion.Card -> GlassMotion.CARD_SCALE_TO
-        else -> 1f
+        GlassOverlayMotion.ReaderPanel -> GlassMotion.READER_PANEL_SCALE
+        GlassOverlayMotion.BottomPanel -> 1f
     }
+    // 阅读器面板：位移以「自身高度比例」为单位（panelRiseByHeight 分支），其余动效仍用 px
+    val panelRiseByHeight = motion == GlassOverlayMotion.ReaderPanel
     val enterOffsetPx = with(density) {
         when (motion) {
             // 起手在锚点上方 8dp，落下来收口（"从按钮里掉出来"）
             GlassOverlayMotion.Anchored -> (-GlassMotion.MENU_LIFT_DP).dp.toPx()
-            GlassOverlayMotion.BottomPanel,
-            GlassOverlayMotion.ReaderPanel,
-            -> GlassMotion.PANEL_RISE_DP.dp.toPx()
-
+            GlassOverlayMotion.BottomPanel -> GlassMotion.PANEL_RISE_DP.dp.toPx()
+            GlassOverlayMotion.ReaderPanel -> GlassMotion.READER_PANEL_RISE_FRAC
             GlassOverlayMotion.Card -> 0f
         }
     }
@@ -158,10 +165,8 @@ fun GlassOverlay(
         when (motion) {
             // 退场往上收一点，与进入方向一致
             GlassOverlayMotion.Anchored -> (-GlassMotion.MENU_LIFT_DP / 2f).dp.toPx()
-            GlassOverlayMotion.BottomPanel,
-            GlassOverlayMotion.ReaderPanel,
-            -> GlassMotion.PANEL_FALL_DP.dp.toPx()
-
+            GlassOverlayMotion.BottomPanel -> GlassMotion.PANEL_FALL_DP.dp.toPx()
+            GlassOverlayMotion.ReaderPanel -> GlassMotion.READER_PANEL_FALL_FRAC
             GlassOverlayMotion.Card -> 0f
         }
     }
@@ -234,7 +239,9 @@ fun GlassOverlay(
                 .graphicsLayer {
                     // draw 阶段读取，不触发重组、不参与测量
                     this.alpha = alpha.value
-                    translationY = offsetY.value
+                    // 阅读器面板按自身高度比例位移：面板越高行程越大，观感才像"升起来"
+                    translationY =
+                        if (panelRiseByHeight) offsetY.value * size.height else offsetY.value
                     val s = scale.value
                     scaleX = s
                     scaleY = s

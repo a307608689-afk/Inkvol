@@ -1,5 +1,6 @@
 package com.inkvol.app.ui.search
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
@@ -78,6 +79,8 @@ fun SearchFilterOverlay(
     onApplyTemplate: (SearchFilterTemplate) -> Unit,
     onLongPressTemplate: (SearchFilterTemplate) -> Unit,
 ) {
+    // 系统返回 / 侧滑返回：关面板，不退出搜索页（GlassOverlay 只处理遮罩点击）
+    BackHandler(enabled = visible) { onDismiss() }
     val chrome = LocalGlassChrome.current
     val screenHeight = LocalConfiguration.current.screenHeightDp.dp
     val filter = state.filter
@@ -477,6 +480,8 @@ fun SearchTemplateCardOverlay(
     onDismiss: () -> Unit,
     onConfirm: (String) -> Unit,
 ) {
+    // 系统返回 / 侧滑返回：关卡（叠在筛选面板上时先关这一层）
+    BackHandler(enabled = visible) { onDismiss() }
     val chrome = LocalGlassChrome.current
     var name by remember(visible) { mutableStateOf(initialName) }
     LaunchedEffect(visible) {
@@ -538,6 +543,8 @@ fun SearchTemplateMenuOverlay(
     onRename: (SearchFilterTemplate) -> Unit,
     onDelete: (SearchFilterTemplate) -> Unit,
 ) {
+    // 系统返回 / 侧滑返回：关菜单（与 GlassOverlay 的显示条件同一判据）
+    BackHandler(enabled = visible && template != null) { onDismiss() }
     val chrome = LocalGlassChrome.current
     GlassOverlay(
         visible = visible && template != null,
