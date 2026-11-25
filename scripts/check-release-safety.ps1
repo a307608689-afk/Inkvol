@@ -224,8 +224,13 @@ if ($SkipRemote) {
         Warn 'gh CLI not found, skip remote checks'
     } else {
         $remoteTag = 'v' + $name
-        gh release view $remoteTag 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) { Fail ('release already published: ' + $remoteTag + ' (immutable release policy)') }
+        # gh writes "release not found" to stderr; do not let it abort the script.
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $relOut = gh release view $remoteTag 2>&1
+        $relExit = $LASTEXITCODE
+        $ErrorActionPreference = $prevEap
+        if ($relExit -eq 0) { Fail ('release already published: ' + $remoteTag + ' (immutable release policy)') }
         else { Pass ('release not published yet: ' + $remoteTag) }
 
         $remoteMain = git ls-remote origin refs/heads/main 2>$null
