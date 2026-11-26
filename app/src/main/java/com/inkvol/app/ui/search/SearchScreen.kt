@@ -73,7 +73,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -133,7 +135,10 @@ internal fun SearchScreen(
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     val scope = rememberCoroutineScope()
 
-    var input by rememberSaveable { mutableStateOf(search.query) }
+    // TextFieldValue（而非 String）以拿到 composition：输入法拼音未上屏时不搜不记
+    var input by rememberSaveable(stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(search.query))
+    }
     var showFilter by remember { mutableStateOf(false) }
     var saveTemplateCard by remember { mutableStateOf(false) }
     var renameTemplate by remember { mutableStateOf<SearchFilterTemplate?>(null) }
@@ -175,11 +180,15 @@ internal fun SearchScreen(
     LaunchedEffect(Unit) { repository.ensureSearchFacets() }
 
     // 输入去抖 250ms 即时搜（正文扫描在 runSearch 内部再静默 400ms）
-    LaunchedEffect(input, search.filter) {
-        val q = input.trim()
+    // key 用 input.text：光标/选区变化不重启计时；composition != null = 拼音未上屏，
+    // 此时不搜（否则拿拼音搜出空结果且未提交就切结果态），上屏后自然触发。
+    // 历史只由 submitSearch（搜索键/点历史项）写入，这里走 runSearch 不记历史。
+    LaunchedEffect(input.text, search.filter) {
+        if (input.composition != null) return@LaunchedEffect
+        val q = input.text.trim()
         if (q == search.query) return@LaunchedEffect
         delay(250)
-        repository.runSearch(input)
+        repository.runSearch(input.text)
     }
 
     // 回顶联动：切筛选/新查询（规范 §8-3）。
@@ -298,8 +307,8 @@ internal fun SearchScreen(
                     InitialContent(
                         search = search,
                         onUseHistory = { keyword ->
-                            input = keyword
-                            repository.runSearch(keyword)
+                            input = TextFieldValue(keyword, selection = TextRange(keyword.length))
+                            repository.submitSearch(keyword)
                         },
                         onClearHistory = { repository.clearSearchHistory() },
                         onOpenCategory = onOpenCategory,
@@ -539,10 +548,10 @@ internal fun SearchScreen(
                 onSearch = {
                     focusManager.clearFocus()
                     keyboard?.hide()
-                    repository.runSearch(input)
+                    repository.submitSearch(input.text)
                 },
                 onClear = {
-                    input = ""
+                    input = TextFieldValue("")
                     repository.clearSearch()
                 },
                 onOpenFilter = { showFilter = true },
@@ -809,8 +818,8 @@ private fun InkPillChip(
  */
 @Composable
 private fun SearchBarRow(
-    input: String,
-    onInputChange: (String) -> Unit,
+    input: TextFieldValue,
+    onInputChange: (TextFieldValue) -> Unit,
     onSearch: () -> Unit,
     onClear: () -> Unit,
     onOpenFilter: () -> Unit,
@@ -842,7 +851,7 @@ private fun SearchBarRow(
                     Icon(Icons.Outlined.Search, contentDescription = null)
                 },
                 trailingIcon = {
-                    if (input.isNotEmpty()) {
+                    if (input.text.isNotEmpty()) {
                         IconButton(onClick = onClear) {
                             Icon(Icons.Outlined.Close, contentDescription = "清除")
                         }

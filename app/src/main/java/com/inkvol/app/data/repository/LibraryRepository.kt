@@ -797,7 +797,6 @@ class LibraryRepository(
             bodyScanJob?.cancel()
             return
         }
-        pushHistory(q)
         searchJob = scope.launch {
             // 分区筛选：关掉的分区查询直接短路（正文关=不起扫描，见 startBodyScan）
             val books = if (filter.sectionOn(SearchFilter.SECTION_BOOK)) searchBooks(q, filter) else emptyList()
@@ -808,6 +807,17 @@ class LibraryRepository(
             _search.value = _search.value.copy(loading = false, books = books, chapterHits = chapters, notes = notes)
         }
         startBodyScan(q, filter, bodyDebounceMs)
+    }
+
+    /**
+     * 显式提交搜索（输入法搜索键 / 点历史项）：先写历史再搜索。
+     * 输入去抖即时搜、筛选变化重跑都只走 runSearch，不进历史。
+     */
+    fun submitSearch(rawQuery: String) {
+        val q = rawQuery.trim()
+        if (q.isEmpty()) return
+        pushHistory(q)
+        runSearch(q)
     }
 
     private fun startBodyScan(q: String, filter: SearchFilter, debounceMs: Long) {
