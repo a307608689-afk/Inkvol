@@ -143,7 +143,6 @@ import com.inkvol.app.ui.components.glass.rememberAnimationsEnabled
 import com.inkvol.app.ui.components.glass.rememberGlassBottomBarHeight
 import com.inkvol.app.ui.history.HistoryScreen
 import com.inkvol.app.ui.library.LibraryManagerScreen
-import com.inkvol.app.ui.reader.panel.PanelSpikeScreen
 import com.inkvol.app.ui.library.LibraryScreen
 import com.inkvol.app.ui.library.LibraryTarget
 import com.inkvol.app.ui.library.LibraryUiState
@@ -1273,7 +1272,6 @@ private fun InkvolNavHost(
                         navController.popBackStack(TopDestination.Library.route, inclusive = false)
                     },
                     onOpenLibraryManager = { navController.navigate("library-manager") },
-                    onOpenPanelSpike = { navController.navigate("panel-spike") },
                 )
             }
             composable(route = "library-manager") {
@@ -1282,9 +1280,6 @@ private fun InkvolNavHost(
                     onBack = { navController.popBackStack() },
                     syncRepository = syncRepository,
                 )
-            }
-            composable(route = "panel-spike") {
-                PanelSpikeScreen(onBack = { navController.popBackStack() })
             }
             composable(
                 route = "novel-reader/{bookId}",
@@ -1803,7 +1798,7 @@ private fun tabShift(initialRoute: String?, targetRoute: String?): Int? {
 }
 
 /** 设置页经 NavHost 跳出的二级整页路由，参与与 Tab 一致的左右滑动转场。 */
-private val settingsSubRoutes = setOf("library-manager", "panel-spike")
+private val settingsSubRoutes = setOf("library-manager")
 
 /** Tab 进入转场：向前从右滑入，向后从左滑入。 */
 private fun tabEnter(shift: Int?): EnterTransition = when {

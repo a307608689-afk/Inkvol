@@ -143,7 +143,6 @@ fun SettingsScreen(
     // M6.3-D 收口：设置首页 back = 切回书架 tab
     onBackToLibrary: () -> Unit,
     onOpenLibraryManager: () -> Unit,
-    onOpenPanelSpike: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -314,7 +313,6 @@ fun SettingsScreen(
             }
         },
         onOpenLibraryManager = onOpenLibraryManager,
-        onOpenPanelSpike = onOpenPanelSpike,
         onImportFont = {
             fontImporter.launch(
                 arrayOf(
@@ -1258,7 +1256,6 @@ private fun buildSettingsGroups(
     onExportBackup: () -> Unit,
     onRestoreBackup: () -> Unit,
     onOpenLibraryManager: () -> Unit,
-    onOpenPanelSpike: () -> Unit,
     onImportFont: () -> Unit,
     onOpenChoice: (ChoiceSpec) -> Unit,
     onOpenPurifyRules: () -> Unit,
@@ -1475,13 +1472,6 @@ private fun buildSettingsGroups(
                         SettingChoice("5", "5 层"),
                     ),
                 ),
-            ),
-        ),
-        SettingsGroupSpec(
-            id = "reader_comic",
-            title = "阅读器（漫画）",
-            subtitle = "速度、手势与翻页",
-            specs = listOf(
                 choice(
                     id = "reader_open_speed",
                     title = "一镜到底速度",
@@ -1496,6 +1486,13 @@ private fun buildSettingsGroups(
                         SettingChoice(SettingsKeys.OPEN_SPEED_SLOWER, "更慢 (360ms)"),
                     ),
                 ),
+            ),
+        ),
+        SettingsGroupSpec(
+            id = "reader_comic",
+            title = "漫画阅读器",
+            subtitle = "速度、手势与翻页",
+            specs = listOf(
                 choice(
                     id = "reader_page_transition",
                     title = "翻页动画",
@@ -1652,7 +1649,7 @@ private fun buildSettingsGroups(
         ),
         SettingsGroupSpec(
             id = "novel",
-            title = "小说阅读",
+            title = "小说阅读器",
             subtitle = "全局默认排版、字体与背景",
             specs = run {
                 val defaults = globalPrefs()
@@ -1888,13 +1885,6 @@ private fun buildSettingsGroups(
                         libraryRepository.rescanAll()
                         onNotice("已开始重新扫描")
                     },
-                ),
-                ActionSpec(
-                    id = "panel_spike",
-                    title = "分格检测实验",
-                    subtitle = "M5-A 投影法 spike，不接入阅读器",
-                    value = "打开",
-                    onAction = onOpenPanelSpike,
                 ),
             ),
         ),

@@ -17,6 +17,7 @@ import com.inkvol.app.data.model.ReadingHistoryEntry
 import com.inkvol.app.data.model.ReadingStats
 import com.inkvol.app.data.model.SearchChapterRow
 import com.inkvol.app.data.model.TrashBook
+import com.inkvol.app.data.import.SingleFileImporter
 
 /**
  * M2 数据库：
@@ -538,13 +539,17 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
      * 扫描「再次见到」已存在的书时刷新可见时间戳。
      * 已存在的书走 skip 分支不会调用 upsertBook，last_seen_at 若停留在上次扫描时刻，
      * 会被 removeMissingLocations 的 last_seen_at < scanStart 对账误判为消失并级联删除。
+     *
+     * 必须按 doc_id 精确刷新：一本书可有多个位置（book_locations 主键 = book_id + doc_id），
+     * 若按 book_id + folder_id 整刷，会把「文件已移动后残留的旧位置」一起刷成刚刚见过，
+     * 导致 removeMissingLocations 永远清不掉它，书被永久钉死在旧系列文件夹里。
      */
-    fun touchBookLocation(bookId: String, folderId: Long) {
+    fun touchBookLocation(bookId: String, folderId: Long, docId: String) {
         writableDatabase.update(
             "book_locations",
             ContentValues().apply { put("last_seen_at", System.currentTimeMillis()) },
-            "book_id = ? AND folder_id = ?",
-            arrayOf(bookId, folderId.toString()),
+            "book_id = ? AND folder_id = ? AND doc_id = ?",
+            arrayOf(bookId, folderId.toString(), docId),
         )
     }
 
@@ -552,31 +557,42 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
      * v12 系列路径回填：已存在的书重扫时走 skip 分支（不进 upsertBook），
      * 必须在这里同步刷新系列名与目录路径，否则 folder_path 永远为空、
      * 系列视图的文件夹层级/扁平分组无法生效。
+     *
+     * 按 doc_id 精确 upsert 该位置（而非 book_id + folder_id 整刷）：文件移动后新 doc_id
+     * 尚无位置行时插入，旧位置行不刷新 → 由 removeMissingLocations 按 last_seen_at 清理。
      */
     fun updateBookLocationFolder(
         bookId: String,
         folderId: Long,
+        docId: String,
+        displayPath: String,
         series: String?,
         folderPath: String?,
     ) {
         val db = writableDatabase
+        val now = System.currentTimeMillis()
         db.update(
             "books",
             ContentValues().apply {
                 put("series", series)
-                put("updated_at", System.currentTimeMillis())
+                put("updated_at", now)
             },
             "id = ?",
             arrayOf(bookId),
         )
-        db.update(
+        db.insertWithOnConflict(
             "book_locations",
+            null,
             ContentValues().apply {
+                put("book_id", bookId)
+                put("folder_id", folderId)
+                put("doc_id", docId)
+                put("display_path", displayPath)
+                put("last_seen_at", now)
+                put("is_primary", 1)
                 put("folder_path", folderPath)
-                put("last_seen_at", System.currentTimeMillis())
             },
-            "book_id = ? AND folder_id = ?",
-            arrayOf(bookId, folderId.toString()),
+            SQLiteDatabase.CONFLICT_REPLACE,
         )
     }
 
@@ -951,7 +967,7 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                    (SELECT MAX(updated_at) FROM novel_progress WHERE book_id = b.id),
                    0
                ),
-               l.folder_path
+               l.folder_path, lib.name
         FROM books b
         LEFT JOIN book_locations l ON l.rowid = (
             SELECT rowid FROM book_locations
@@ -1050,6 +1066,9 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
                     lastReadAt = cursor.getLong(17),
                     treeUri = cursor.getString(16),
                     folderPath = cursor.getString(18),
+                    libraryName = cursor.getString(19)?.takeIf {
+                        cursor.getString(16) != SingleFileImporter.SINGLE_LIBRARY_URI
+                    },
                 )
             }
         }

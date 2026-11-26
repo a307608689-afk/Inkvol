@@ -33,6 +33,11 @@ data class BookRecord(
      * 元数据不再覆盖系列归属。
      */
     val folderPath: String? = null,
+    /**
+     * 主位置所属书库名（如「小说」「漫画」）；单文件导入为 null。
+     * 系列视图把书库根当作一层系列：系列路径 = 书库名 + 相对目录路径。
+     */
+    val libraryName: String? = null,
 ) {
     companion object {
         const val READ_UNREAD = "UNREAD"

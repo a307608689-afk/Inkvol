@@ -137,7 +137,7 @@ class LibraryScanner(
             val fingerprint = Fingerprint.ofFolder(images.map { it.name to it.size })
             if (db.hasBook(fingerprint)) {
                 // skip 也要刷新系列归属（v12 回填：旧库 folder_path 为 NULL，重扫靠这里补）
-                db.updateBookLocationFolder(fingerprint, folderId, series, folderPath)
+                db.updateBookLocationFolder(fingerprint, folderId, docId, title, series, folderPath)
                 skipped++
                 return
             }
@@ -176,7 +176,7 @@ class LibraryScanner(
         try {
             val fingerprint = Fingerprint.ofArchive(entry.size) { openDocument(entry.docId) }
             if (db.hasBook(fingerprint)) {
-                db.updateBookLocationFolder(fingerprint, folderId, series, folderPath)
+                db.updateBookLocationFolder(fingerprint, folderId, entry.docId, entry.name, series, folderPath)
                 skipped++
                 return
             }
@@ -306,7 +306,7 @@ class LibraryScanner(
             db.upsertBook(book, folderId)
             db.replaceNovelChapters(fingerprint, parsedChapters)
             if (book.addedAt > 0L && db.queryNovelChapterCount(fingerprint) == parsedChapters.size) {
-                db.touchBookLocation(fingerprint, folderId)
+                db.touchBookLocation(fingerprint, folderId, entry.docId)
             }
             added++
             processed++

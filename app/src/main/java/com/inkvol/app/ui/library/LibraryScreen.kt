@@ -172,6 +172,7 @@ import com.inkvol.app.ui.components.glass.GlassTier
 import com.inkvol.app.ui.components.glass.LocalGlassChrome
 import com.inkvol.app.ui.components.glass.rememberGlassHeaderState
 import com.inkvol.app.ui.components.glass.rememberGlassOverlayPresence
+import com.inkvol.app.ui.search.SectionHeader
 import com.inkvol.app.ui.theme.BookmarkPurple
 import com.inkvol.app.ui.theme.InfoBlue
 import com.inkvol.app.ui.theme.InkvolRadius
@@ -217,11 +218,18 @@ private const val LEGACY_SERIES_PREFIX = "@legacy:"
 
 /**
  * 书所属的叶子系列（直接父目录）——系列视图的唯一归属真源。
- * - folderPath 非空（含 ""）→ 目录自身（文件夹为准，ComicInfo 元数据不参与）
- * - null → 旧数据 / 单文件导入：按旧 series 名（缺省书名）退化，视觉与改前一致
+ * - folderPath 非空（含 ""）且书库名非空 → 系列路径 = 书库名 + 相对目录路径
+ *   （书库根本身算一层系列：库根直接放的书归到「书库名」这一级，二级文件夹归到
+ *   「书库名/文件夹」，从而支持「库根 → 二级系列 + 散书」的分区）
+ * - 无书库名（单文件导入 / 旧数据）→ folderPath 自身，或按旧 series 名退化
  */
 private fun leafSeriesOf(book: BookRecord): Pair<String, String> {
     val path = book.folderPath
+    val lib = book.libraryName
+    if (path != null && lib != null) {
+        val full = if (path.isEmpty()) lib else "$lib/$path"
+        return full to full.substringAfterLast('/')
+    }
     if (path != null) {
         val name = if (path.isEmpty()) ROOT_SERIES_LABEL else path.substringAfterLast('/')
         return path to name
@@ -722,7 +730,8 @@ fun LibraryScreen(
                             SettingsKeys.SERIES_MODE_HIERARCHY,
                         )
                     } ?: SettingsKeys.SERIES_MODE_HIERARCHY
-                    // 列表态子系列行直接排在最前（无「系列/书籍」标题行），书序号 + 子系列行数。
+                    // 列表态：子系列区前置「系列」标题 + 子系列行 +（有直属书时的「书籍」标题），
+                    // 书序号偏移 = 1 + 子系列行数 +（直属书 > 0 时再 +1）。
                     val detailListSubOffset = if (
                         restoreSeriesMode == SettingsKeys.SERIES_MODE_HIERARCHY &&
                         detailTarget is LibraryTarget.Series
@@ -730,7 +739,15 @@ fun LibraryScreen(
                         val all = libraryRepository.books.value
                         val tf = LibraryUiState.typeFilter
                         val source = if (tf == null) all else all.filter { it.type == tf }
-                        childSeriesNodes(source, detailTarget.path).size
+                        val subCount = childSeriesNodes(source, detailTarget.path).size
+                        if (subCount > 0) {
+                            val direct = source.count {
+                                leafSeriesOf(it).first == detailTarget.path
+                            }
+                            1 + subCount + if (direct > 0) 1 else 0
+                        } else {
+                            0
+                        }
                     } else {
                         0
                     }
@@ -789,7 +806,13 @@ fun LibraryScreen(
                     val tf = LibraryUiState.typeFilter
                     val source = if (tf == null) all else all.filter { it.type == tf }
                     val subCount = childSeriesNodes(source, detailTarget.path).size
-                    if (subCount > 0) subCount + 2 else 0
+                    // 子系列标题 + 系列卡 +（有直属书时的「书籍」标题）
+                    if (subCount > 0) {
+                        val direct = source.count { leafSeriesOf(it).first == detailTarget.path }
+                        subCount + 1 + if (direct > 0) 1 else 0
+                    } else {
+                        0
+                    }
                 } else {
                     0
                 }
@@ -2000,11 +2023,21 @@ fun LibraryScreen(
             } else {
                 0
             }
+            // 直属书数：本目录直接放的书，与子系列分开计数（构成一眼看清）
+            val detailDirectCount = if (
+                detailSubCount > 0 && detailTitleTarget is LibraryTarget.Series
+            ) {
+                filteredBooks.count { leafSeriesOf(it).first == detailTitleTarget.path }
+            } else {
+                0
+            }
             DetailTitleRow(
                 title = detailTypeLabel?.let { "${targetTitle(detailTitleTarget)} · $it" }
                     ?: targetTitle(detailTitleTarget),
                 countText = if (selected.isEmpty()) {
-                    if (detailSubCount > 0) {
+                    if (detailSubCount > 0 && detailDirectCount > 0) {
+                        "$detailSubCount 个系列 · $detailDirectCount 本直属"
+                    } else if (detailSubCount > 0) {
                         "${detailBooks.size} 本 · $detailSubCount 个系列"
                     } else {
                         "${detailBooks.size} 本"
@@ -2016,7 +2049,9 @@ fun LibraryScreen(
                     .align(Alignment.TopStart)
                     .graphicsLayer { translationY = headerState.headerOffsetPx }
                     .padding(top = headerState.statusBarTop + 108.dp)
-                    .padding(start = 20.dp, end = 20.dp + chrome.railEndInset),
+                    // start 8dp：IconButton 自带 12dp 内边距，箭头视觉左缘 = 8+12 = 20dp，
+                    // 与书架大标题 / 内容区（均 20dp）对齐；否则箭头缩进到 32dp 看着错位。
+                    .padding(start = 8.dp, end = 20.dp + chrome.railEndInset),
                 onBack = { closeDetailTarget() },
             )
         }
@@ -3166,20 +3201,39 @@ private fun SeriesGrid(
             Spacer(Modifier.height(headerSpacerHeight))
         }
         items(nodes, key = { it.path }) { node ->
+            // 层级模式：算子系列数给副标题标构成（「N 个系列 · M 本直属」）
+            val sub = if (
+                seriesMode == SettingsKeys.SERIES_MODE_HIERARCHY &&
+                node.path.isNotEmpty() && !node.path.startsWith("@")
+            ) {
+                childSeriesNodes(books, node.path).size
+            } else {
+                null
+            }
             SeriesCard(
                 node = node,
+                subCount = sub,
                 onClick = { onOpenSeries(LibraryTarget.Series(node.path, node.name)) },
             )
         }
     }
 }
 
-/** 系列卡（一级网格与二级页「子系列」区共用）：拼贴封面 + 名称 + 子树书数。 */
+/** 系列卡（一级网格与二级页「子系列」区共用）：拼贴封面 + 名称 + 构成（卷数）。 */
 @Composable
 private fun SeriesCard(
     node: SeriesNode,
+    /** 层级模式下该节点的子系列数（非层级 / 伪路径 = null，副标题退回「N 卷」）。 */
+    subCount: Int? = null,
     onClick: () -> Unit,
 ) {
+    // 拼贴封面直属书优先：让「文件夹里直接放的书」在一级卡上可见（层级模式才区分，
+    // 扁平/伪路径下 leafPath == node.path 恒直属，排序为无操作）。
+    val covers = node.books
+        .sortedBy { if (leafSeriesOf(it).first == node.path) 0 else 1 }
+        .take(4)
+        .map { it.coverPath }
+    val directCount = node.books.count { leafSeriesOf(it).first == node.path }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -3187,7 +3241,7 @@ private fun SeriesCard(
             .clickable(onClick = onClick),
     ) {
         Collage(
-            covers = node.books.take(4).map { it.coverPath },
+            covers = covers,
             accent = MaterialTheme.colorScheme.primary,
             shape = InkvolRadius.collection,
             modifier = Modifier
@@ -3210,12 +3264,19 @@ private fun SeriesCard(
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                text = "${node.books.size} 卷",
+                text = seriesSubLabel(node.books.size, subCount, directCount),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
+}
+
+/** 系列卡副标题：有子系列时标明构成（直属书数 > 0 才带「本直属」尾巴）。 */
+private fun seriesSubLabel(total: Int, subCount: Int?, directCount: Int): String = when {
+    subCount != null && subCount > 0 ->
+        if (directCount > 0) "$subCount 个系列 · $directCount 本直属" else "$subCount 个系列"
+    else -> "$total 卷"
 }
 
 @Composable
@@ -3279,8 +3340,18 @@ private fun SeriesList(
             Spacer(Modifier.height(headerSpacerHeight))
         }
         items(nodes, key = { it.path }) { node ->
+            // 层级模式：算子系列数给副标题标构成（与网格卡同源）
+            val sub = if (
+                seriesMode == SettingsKeys.SERIES_MODE_HIERARCHY &&
+                node.path.isNotEmpty() && !node.path.startsWith("@")
+            ) {
+                childSeriesNodes(books, node.path).size
+            } else {
+                null
+            }
             SeriesListRow(
                 node = node,
+                subCount = sub,
                 onClick = { onOpenSeries(LibraryTarget.Series(node.path, node.name)) },
             )
             Spacer(Modifier.height(10.dp))
@@ -3288,12 +3359,19 @@ private fun SeriesList(
     }
 }
 
-/** 系列列表行：迷你拼贴 + 系列名 + 卷数（视觉语言仿书夹列表行）。 */
+/** 系列列表行：迷你拼贴 + 系列名 + 构成（卷数，与网格卡同语言）。 */
 @Composable
 private fun SeriesListRow(
     node: SeriesNode,
+    subCount: Int? = null,
     onClick: () -> Unit,
 ) {
+    // 拼贴封面直属书优先（与 SeriesCard 同源，见彼处注释）
+    val covers = node.books
+        .sortedBy { if (leafSeriesOf(it).first == node.path) 0 else 1 }
+        .take(4)
+        .map { it.coverPath }
+    val directCount = node.books.count { leafSeriesOf(it).first == node.path }
     Surface(
         modifier = Modifier
             .fillMaxWidth()
@@ -3316,7 +3394,7 @@ private fun SeriesListRow(
                 contentAlignment = Alignment.Center,
             ) {
                 Collage(
-                    covers = node.books.take(4).map { it.coverPath },
+                    covers = covers,
                     accent = MaterialTheme.colorScheme.primary,
                     shape = InkvolRadius.collection,
                     modifier = Modifier.fillMaxSize(),
@@ -3332,7 +3410,7 @@ private fun SeriesListRow(
                 )
                 Spacer(Modifier.height(3.dp))
                 Text(
-                    text = "${node.books.size} 卷",
+                    text = seriesSubLabel(node.books.size, subCount, directCount),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -3569,12 +3647,7 @@ private fun CategoryContentView(
                 // 系列卡与书卡同列宽（自适应），实现最稳、不动滚动/锚点容器结构。
                 if (subSeries.isNotEmpty()) {
                     item(span = { GridItemSpan(maxLineSpan) }, key = "subSeriesHeader") {
-                        Text(
-                            text = "系列 · ${subSeries.size}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(top = 4.dp, bottom = 2.dp),
-                        )
+                        SectionHeader(title = "系列 · ${subSeries.size}")
                     }
                     items(subSeries, key = { "series:${it.path}" }) { node ->
                         SeriesCard(
@@ -3586,12 +3659,7 @@ private fun CategoryContentView(
                     }
                     if (books.isNotEmpty()) {
                         item(span = { GridItemSpan(maxLineSpan) }, key = "subBooksHeader") {
-                            Text(
-                                text = "书籍 · ${books.size}",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(top = 8.dp, bottom = 2.dp),
-                            )
+                            SectionHeader(title = "书 · ${books.size} 本")
                         }
                     }
                 }
@@ -3620,8 +3688,8 @@ private fun CategoryContentView(
  * 二级页列表样式（library_shelf_view=list）：书夹 / 系列 / 智能书夹的书行列表。
  * 与网格版 [CategoryContentView] 共用同一套数据与空态，仅容器换成 LazyColumn：
  * 子系列行（层级系列页）+ 书行卡 [BookListRow]，点击/多选/一镜到底语义与一级
- * [FlatList] 完全一致。子系列行直接排最前、无标题行（列表行卡视觉已区分书行，
- * 跨方向恢复的锚点偏移 = 子系列行数）。
+ * [FlatList] 完全一致。层级系列页带分区标题（「系列」区 + 「书籍」区），
+ * 跨方向恢复的锚点偏移 = 标题行 + 子系列行数（+ 直属书区标题）。
  */
 @Composable
 private fun DetailList(
@@ -3676,6 +3744,13 @@ private fun DetailList(
                     bottom = chromeBottom + GlassDimens.ListBottomExtraScroll,
                 ),
             ) {
+                // 层级系列页分区（与网格版 CategoryContentView 同构）：子系列区 + 直属书区。
+                // 关键：直属书不并入任何二级系列，标题隔开让「一级散书」清晰可见。
+                if (subSeries.isNotEmpty()) {
+                    item(key = "subSeriesHeader") {
+                        SectionHeader(title = "系列 · ${subSeries.size}")
+                    }
+                }
                 items(subSeries, key = { "series:${it.path}" }) { node ->
                     SeriesListRow(
                         node = node,
@@ -3684,6 +3759,11 @@ private fun DetailList(
                         },
                     )
                     Spacer(Modifier.height(10.dp))
+                }
+                if (subSeries.isNotEmpty() && books.isNotEmpty()) {
+                    item(key = "subBooksHeader") {
+                        SectionHeader(title = "书 · ${books.size} 本")
+                    }
                 }
                 items(books, key = { it.id }) { book ->
                     BookListRow(
