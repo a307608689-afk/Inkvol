@@ -245,6 +245,7 @@ class ReaderOpenViewModel : ViewModel() {
             // 章首不截断时也只排首屏：`maxPages` 的停页发生在 flushPage 之后，页是完整的；
             // 而 stopAfterCharOffset 会在块中间停（首屏只剩「章节名」那一页不完整的内容）。
             val pageLimit = if (stopAfter > 0) maxPages else if (useDouble) 2 else 1
+            val paginateStartMs = System.currentTimeMillis()
             val pagination = withContext(Dispatchers.Default) {
                 NovelTextPager.paginate(
                     chapterText = chapterText,
@@ -260,6 +261,12 @@ class ReaderOpenViewModel : ViewModel() {
                     stopAfterCharOffset = stopAfter,
                 )
             }
+            // 一镜到底帧率坐实：进度偏移 >0 时 stopAfter 生效、排到进度所在页（页数越大，
+            // 动画期间后台 CPU/GC 竞争越重）。记录排了多少页 + 章节字符量 + 耗时。
+            Log.d(
+                "InkvolOpen",
+                "preload paginate pages=${pagination.pages.size} stopAfter=$stopAfter pageLimit=$pageLimit chapterChars=${chapterText.length} costMs=${System.currentTimeMillis() - paginateStartMs}",
+            )
             val page = if (anchorChar >= 0) {
                 pagination.pages.firstOrNull { p ->
                     p.charStart <= anchorChar && anchorChar < p.charEnd
@@ -427,7 +434,9 @@ class ReaderOpenViewModel : ViewModel() {
         }
         val options = BitmapFactory.Options().apply {
             inSampleSize = sample
-            inPreferredConfig = Bitmap.Config.ARGB_8888
+            // 封面不透明（无 alpha 语义），RGB_565 内存与 GPU 纹理带宽减半——
+            // 120Hz 高刷屏上封面是动画期间采样的最大单张位图之一。
+            inPreferredConfig = Bitmap.Config.RGB_565
         }
         return BitmapFactory.decodeFile(path, options)?.asImageBitmap()
     }

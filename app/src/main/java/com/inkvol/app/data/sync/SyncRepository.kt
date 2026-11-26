@@ -88,6 +88,8 @@ class SyncRepository(
         val scope: SyncFileScope,
         val folders: List<InkvolDatabase.ScopeFolderRow>,
         val singleLibraryBooks: Int,
+        /** 远端来源分组清单（下载范围面板勾选用；散书归一为 SOURCE_FOLDER_SINGLE）。 */
+        val remoteGroups: List<String> = emptyList(),
     )
 
     // ---------- 状态与配置 ----------
@@ -117,12 +119,21 @@ class SyncRepository(
         }
     }
 
-    private fun scopeSummary(scope: SyncFileScope): String = when {
-        scope.all -> "全部同步"
-        scope.isEmpty -> "仅进度与标注"
-        scope.single && scope.folderIds.isEmpty() -> "仅单文件导入"
-        scope.single -> "单文件 + ${scope.folderIds.size} 个文件夹"
-        else -> "${scope.folderIds.size} 个文件夹"
+    private fun scopeSummary(scope: SyncFileScope): String {
+        if (scope.isEmpty) return "仅进度与标注"
+        val up = when {
+            scope.all -> "全部"
+            scope.single && scope.folderIds.isEmpty() -> "散书"
+            scope.single -> "散书+${scope.folderIds.size}夹"
+            scope.folderIds.isNotEmpty() -> "${scope.folderIds.size}夹"
+            else -> "无"
+        }
+        val down = when {
+            scope.downloadAll -> "全部"
+            scope.downloadGroups.isEmpty() -> "无"
+            else -> "${scope.downloadGroups.size}组"
+        }
+        return "上传 $up · 下载 $down"
     }
 
     /** 自动同步门禁状态回填（等待 WiFi / 失败冷却），供状态行展示。 */
@@ -170,10 +181,12 @@ class SyncRepository(
         val legacyAll = settings.booleanOf(prefs, SettingsKeys.SYNC_FILES_ALL, false)
         @Suppress("DEPRECATION")
         val legacySingle = settings.booleanOf(prefs, SettingsKeys.SYNC_FILES_SINGLE, true)
+        // 旧值迁移 / 首次使用：下载侧默认只勾选「散书」组（文件夹书需手动勾）
+        val defaultDownload = listOf(SOURCE_FOLDER_SINGLE)
         return if (legacyAll) {
-            SyncFileScope(all = true, single = true)
+            SyncFileScope(all = true, single = true, downloadGroups = defaultDownload)
         } else {
-            SyncFileScope(all = false, single = legacySingle, folderIds = emptyList())
+            SyncFileScope(all = false, single = legacySingle, folderIds = emptyList(), downloadGroups = defaultDownload)
         }
     }
 
@@ -184,13 +197,15 @@ class SyncRepository(
     fun encodeFileScope(scope: SyncFileScope): String =
         json.encodeToString(SyncFileScope.serializer(), scope)
 
-    /** 面板数据：当前范围 + 文件夹候选（含书数）+ 单文件导入书数。 */
+    /** 面板数据：当前范围 + 文件夹候选（含书数）+ 单文件导入书数 + 远端分组。 */
     suspend fun loadScopeEditor(): ScopeEditorData = withContext(Dispatchers.IO) {
         val prefs = settings.snapshotPreferences()
+        val remoteGroups = listRemoteSourceGroups().getOrDefault(emptyList())
         ScopeEditorData(
             scope = readFileScope(prefs),
             folders = db.queryScopeFolders(),
             singleLibraryBooks = db.countSingleLibraryBooks(),
+            remoteGroups = remoteGroups,
         )
     }
 
@@ -361,10 +376,32 @@ class SyncRepository(
             .flatMap { doc -> doc.books.map { it.bookId to it.title } }
             .toMap()
             .filterValues { it.isNotBlank() }
+        // bookId → 来源分组：首次出现的非空标签胜出（标签以先上传者为准）
+        val remoteSourceFolder = remotes.mapNotNull { it.parsed }
+            .flatMap { doc -> doc.books.map { it.bookId to it.sourceFolder } }
+            .fold(HashMap<String, String>()) { acc, (id, folder) ->
+                if (folder.isNotBlank() && id !in acc) acc[id] = folder
+                acc
+            }
+        val remoteSeries = remotes.mapNotNull { it.parsed }
+            .flatMap { doc -> doc.books.map { it.bookId to it.series } }
+            .fold(HashMap<String, String>()) { acc, (id, s) ->
+                if (s.isNotBlank() && id !in acc) acc[id] = s
+                acc
+            }
+        val remoteFolderPath = remotes.mapNotNull { it.parsed }
+            .flatMap { doc -> doc.books.map { it.bookId to it.folderPath } }
+            .fold(HashMap<String, String>()) { acc, (id, p) ->
+                if (p != null && id !in acc) acc[id] = p
+                acc
+            }
         return syncFiles.run(
             client = client,
             config = config,
             remoteTitles = remoteTitles,
+            remoteSourceFolder = remoteSourceFolder,
+            remoteSeries = remoteSeries,
+            remoteFolderPath = remoteFolderPath,
             tombstonedBookIds = tombstonedIds,
             scope = scope,
             onRequest = onRequest,
@@ -377,6 +414,32 @@ class SyncRepository(
             .filter { it.kind == TombstoneKinds.BOOK }
             .map { it.key.removePrefix(TombstoneKeys.BOOK_PREFIX) }
             .toSet()
+
+    /** 远端来源分组清单（下载范围面板勾选用）：强制读全部 devices 文档，聚合 sourceFolder 去重。 */
+    suspend fun listRemoteSourceGroups(): Result<List<String>> = withContext(Dispatchers.IO) {
+        val config = readConfig()
+            ?: return@withContext Result.failure(IllegalStateException("同步未配置"))
+        val client = WebDavClient(
+            config.server, config.basePath, config.account, config.password,
+            allowInsecureTls = config.allowInsecureTls,
+        )
+        runCatching {
+            val entries = client.list(DEVICE_DIR)
+            val groups = linkedSetOf<String>()
+            entries.forEach { entry ->
+                if (entry.isDirectory || !entry.name.endsWith(".json")) return@forEach
+                if (entry.name.removeSuffix(".json") == config.deviceId) return@forEach
+                val doc = runCatching {
+                    val bytes = client.download("$DEVICE_DIR${entry.name}")
+                    json.decodeFromString(SyncDeviceDoc.serializer(), String(bytes, Charsets.UTF_8))
+                }.getOrNull() ?: return@forEach
+                doc.books.forEach { b ->
+                    groups += if (b.sourceFolder.isBlank()) SOURCE_FOLDER_UNGROUPED else b.sourceFolder
+                }
+            }
+            groups.sorted()
+        }
+    }
 
     /** 云端书籍清单（云端书籍卡展示用）。 */
     suspend fun listCloudBooks(): Result<List<SyncFiles.CloudBookInfo>> = withContext(Dispatchers.IO) {
@@ -398,10 +461,15 @@ class SyncRepository(
             allowInsecureTls = config.allowInsecureTls,
         )
         val remotes = pullRemoteDocs(client, config) { }.getOrDefault(emptyList())
-        val title = remotes.mapNotNull { it.parsed }
+        val remoteBook = remotes.mapNotNull { it.parsed }
             .firstOrNull { doc -> doc.books.any { it.bookId == info.bookId } }
-            ?.books?.firstOrNull { it.bookId == info.bookId }?.title
-        syncFiles.downloadOne(client, info, title)
+            ?.books?.firstOrNull { it.bookId == info.bookId }
+        syncFiles.downloadOne(
+            client, info,
+            title = remoteBook?.title,
+            series = remoteBook?.series,
+            folderPath = remoteBook?.folderPath,
+        )
     }
 
     private fun hasChanges(result: SyncMerge.MergeResult): Boolean = with(result) {
@@ -449,6 +517,7 @@ class SyncRepository(
             val sessions = db.querySyncSessions(row.id).map {
                 SyncReadingSession(it.startedAt, it.endedAt, it.durationMs, it.pagesRead)
             }
+            val seriesFolder = db.queryBookSeriesFolderPath(row.id)
             SyncBookState(
                 bookId = row.id,
                 title = row.title,
@@ -462,6 +531,9 @@ class SyncRepository(
                 annotations = annotations,
                 readingSessions = sessions,
                 bookPrefs = readBookPrefs(row.id),
+                sourceFolder = sourceFolderOf(row.id),
+                series = seriesFolder?.series ?: "",
+                folderPath = seriesFolder?.folderPath,
             )
         }
         val tombstones = db.querySyncTombstones().map {
@@ -479,6 +551,12 @@ class SyncRepository(
             purifyRules = purify,
         )
     }
+
+    /** 书 → 来源分组标签：散书=@single@、无名称文件夹=未分组、否则文件夹名。 */
+    private fun sourceFolderOf(bookId: String): String =
+        db.queryBookSourceFolder(bookId)
+            ?.let { if (it.isBlank()) SOURCE_FOLDER_UNGROUPED else it }
+            ?: SOURCE_FOLDER_SINGLE
 
     private suspend fun readBookPrefs(bookId: String): SyncBookPrefs? {
         val prefs = settings.snapshotPreferences()

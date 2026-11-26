@@ -106,6 +106,8 @@ object LibraryDetailScroll {
     var key: String? = null
     var index: Int = 0
     var offset: Int = 0
+    /** 离开时二级页显示的是列表样式（library_shelf_view=list）而非网格。 */
+    var isList: Boolean = false
 }
 
 /**

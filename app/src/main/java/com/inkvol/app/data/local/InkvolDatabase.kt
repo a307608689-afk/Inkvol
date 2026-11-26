@@ -651,6 +651,86 @@ class InkvolDatabase(context: Context) : SQLiteOpenHelper(context, "inkvol.db", 
     }
 
     /**
+     * 书的来源分组标签（跨设备可读，M4.5 下载白名单用）：
+     * 主位置的文件夹显示名（空则回退书库名）。返回 null = 散书（单文件导入库）；
+     * 返回空串 = 文件夹书但无名称（调用方归「未分组」）。
+     */
+    fun queryBookSourceFolder(bookId: String): String? {
+        val result = readableDatabase.rawQuery(
+            """
+            SELECT COALESCE(f.display_name, lib.name, ''), COALESCE(f.tree_uri, '')
+            FROM book_locations l
+            LEFT JOIN folders f ON f.id = l.folder_id
+            LEFT JOIN libraries lib ON lib.id = f.library_id
+            WHERE l.book_id = ? AND l.is_primary = 1
+            ORDER BY l.last_seen_at DESC
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(bookId),
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return null
+            val name = cursor.getString(0) ?: ""
+            val treeUri = cursor.getString(1) ?: ""
+            if (treeUri == com.inkvol.app.data.import.SingleFileImporter.SINGLE_LIBRARY_URI) null else name
+        }
+        return result
+    }
+
+    /** 同步用：书主位置的系列名 + 目录路径（folderPath null = 散书/旧数据，"" = 库根）。 */
+    data class BookSeriesFolder(val series: String?, val folderPath: String?)
+
+    fun queryBookSeriesFolderPath(bookId: String): BookSeriesFolder? {
+        val result = readableDatabase.rawQuery(
+            """
+            SELECT b.series, l.folder_path
+            FROM book_locations l
+            LEFT JOIN books b ON b.id = l.book_id
+            WHERE l.book_id = ? AND l.is_primary = 1
+            ORDER BY l.last_seen_at DESC
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(bookId),
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return null
+            BookSeriesFolder(
+                series = if (cursor.isNull(0)) null else cursor.getString(0),
+                folderPath = if (cursor.isNull(1)) null else cursor.getString(1),
+            )
+        }
+        return result
+    }
+
+    /**
+     * 回填系列归属（下载同步用）：本地 folder_path 缺失且远端有值时补写。
+     * 幂等：folder_path 一旦有值就不再覆盖（本地重扫/移动优先）。
+     */
+    fun backfillSeriesFolderIfMissing(bookId: String, series: String?, folderPath: String?) {
+        if (folderPath == null && (series == null || series.isBlank())) return
+        val missing = readableDatabase.rawQuery(
+            "SELECT folder_path FROM book_locations WHERE book_id = ? AND is_primary = 1 LIMIT 1",
+            arrayOf(bookId),
+        ).use { c -> c.moveToFirst() && c.isNull(0) }
+        if (!missing) return
+        val db = writableDatabase
+        if (folderPath != null) {
+            db.update(
+                "book_locations",
+                android.content.ContentValues().apply { put("folder_path", folderPath) },
+                "book_id = ?",
+                arrayOf(bookId),
+            )
+        }
+        if (series != null && series.isNotBlank()) {
+            db.update(
+                "books",
+                android.content.ContentValues().apply { put("series", series) },
+                "id = ?",
+                arrayOf(bookId),
+            )
+        }
+    }
+
+    /**
      * 级联删除书本：删所有 location、分类关系、进度、书签、主记录。
      * 返回被删书本的封面路径（非 null），供调用方清理封面文件。
      */

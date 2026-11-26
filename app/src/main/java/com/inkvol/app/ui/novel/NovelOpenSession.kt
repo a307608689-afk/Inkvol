@@ -4,6 +4,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.ImageBitmapConfig
 import androidx.compose.ui.graphics.drawscope.CanvasDrawScope
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.AnnotatedString
@@ -66,7 +67,10 @@ internal object NovelPageSnapshot {
     ): ImageBitmap {
         val width = widthPx.coerceAtLeast(1)
         val height = heightPx.coerceAtLeast(1)
-        val bitmap = ImageBitmap(width, height)
+        // 正文快照 = 纯色不透明背景 + 实色文字，无 alpha 语义；RGB_565 内存与 GPU
+        // 纹理上传减半（全屏 1080×2400 ARGB_8888 ≈ 10MB → 5MB），抗锯齿边缘混入 RGB 即可，
+        // 交接帧观感无损，直接降低一镜到底打开/返回交叉时的首次纹理上传成本。
+        val bitmap = ImageBitmap(width, height, ImageBitmapConfig.Rgb565)
         val canvas = Canvas(bitmap)
         val dual = secondPage != null && halfWidthPx > 0
         CanvasDrawScope().draw(
@@ -80,11 +84,14 @@ internal object NovelPageSnapshot {
 
             fun drawColumn(target: NovelTextPage, x: Float, contentWidth: Int) {
                 // 渲染余数平分上下（与 NovelPageContent 同口径）：页高 - 内容高的余数一半垫到首行上方。
+                // M6.4-K 对齐：真实渲染 Column(spacedBy) 在「余数垫高 Spacer 与首片」之间也插一个
+                // 段距，快照这里必须同样在首片前补一个段距，否则快照正文比真实正文偏上一个段距，
+                // 打开动画交接瞬间正文下跳（「正文落地轻微位置调整」）。
                 val remPx = (
                     height - topPadPx.roundToInt() - bottomPadPx.roundToInt() -
                         target.contentHeightPx
                     ).coerceAtLeast(0)
-                var top = topPadPx + remPx / 2f
+                var top = topPadPx + remPx / 2f + prefs.paragraphSpacing.dp.toPx()
                 target.slices.forEachIndexed { index, slice ->
                     val layout = textMeasurer.measure(
                         text = AnnotatedString(slice.text),

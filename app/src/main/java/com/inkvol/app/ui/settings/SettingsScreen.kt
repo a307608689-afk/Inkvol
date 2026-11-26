@@ -6,6 +6,8 @@ import android.os.Build
 import com.inkvol.app.data.local.InkvolDatabase
 import com.inkvol.app.data.sync.CryptoBox
 import com.inkvol.app.data.sync.DavException
+import com.inkvol.app.data.sync.SOURCE_FOLDER_SINGLE
+import com.inkvol.app.data.sync.SOURCE_FOLDER_UNGROUPED
 import com.inkvol.app.data.sync.SyncFileScope
 import com.inkvol.app.data.sync.SyncFiles
 import com.inkvol.app.data.sync.SyncRepository
@@ -2414,6 +2416,9 @@ private fun SyncScopeDialog(
     var all by remember { mutableStateOf(false) }
     var single by remember { mutableStateOf(true) }
     var selected by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    var downloadAll by remember { mutableStateOf(false) }
+    var downloadGroups by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var remoteGroups by remember { mutableStateOf<List<String>>(emptyList()) }
     var saving by remember { mutableStateOf(false) }
 
     LaunchedEffect(visible) {
@@ -2425,6 +2430,9 @@ private fun SyncScopeDialog(
             selected = data.scope.folderIds.toSet()
             folders = data.folders
             singleBooks = data.singleLibraryBooks
+            downloadAll = data.scope.downloadAll
+            downloadGroups = data.scope.downloadGroups.toSet()
+            remoteGroups = data.remoteGroups
         }
         loading = false
     }
@@ -2438,6 +2446,8 @@ private fun SyncScopeDialog(
                     all = all,
                     single = single,
                     folderIds = selected.toList(),
+                    downloadAll = downloadAll,
+                    downloadGroups = downloadGroups.toList(),
                 ),
             )
             syncRepository.syncNowAsync("首次同步")
@@ -2571,6 +2581,70 @@ private fun SyncScopeDialog(
                             )
                         }
                     }
+                    item(key = "downHeader") {
+                        Column(modifier = Modifier.padding(top = 12.dp, bottom = 4.dp)) {
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                "下载范围",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    item(key = "downAll") {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 4.dp, vertical = 4.dp),
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "全部下载",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                )
+                                Text(
+                                    "下载云端所有来源的书",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            InkvolSwitch(
+                                checked = downloadAll,
+                                onCheckedChange = { checked ->
+                                    downloadAll = checked
+                                    if (checked) downloadGroups = remoteGroups.toSet()
+                                },
+                            )
+                        }
+                    }
+                    if (remoteGroups.isEmpty()) {
+                        item(key = "remoteEmpty") {
+                            Text(
+                                "同步一次后可选择云端分组",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 10.dp),
+                            )
+                        }
+                    } else {
+                        items(remoteGroups, key = { it }) { group ->
+                            ScopeRow(
+                                title = if (group == SOURCE_FOLDER_SINGLE) "单文件导入（散书）" else group,
+                                subtitle = "",
+                                checked = downloadAll || group in downloadGroups,
+                                enabled = !downloadAll,
+                            ) {
+                                downloadGroups = if (group in downloadGroups) {
+                                    downloadGroups - group
+                                } else {
+                                    downloadGroups + group
+                                }
+                            }
+                        }
+                    }
                 }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -2581,10 +2655,12 @@ private fun SyncScopeDialog(
                     .padding(horizontal = 12.dp, vertical = 10.dp),
             ) {
                 TextButton(
-                    enabled = !all,
+                    enabled = !all && !downloadAll,
                     onClick = {
                         single = false
                         selected = emptySet()
+                        downloadAll = false
+                        downloadGroups = emptySet()
                     },
                 ) { Text("全不选") }
                 Spacer(Modifier.weight(1f))

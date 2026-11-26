@@ -1190,6 +1190,7 @@ class LibraryRepository(
                 reload()
                 _scan.value = ScanState(running = false, added = 1)
                 _notice.value = "已加入书架：《${book.title}》"
+                syncOnProgressSaved?.invoke()
             } catch (error: SingleFileImporter.AlreadyExistsException) {
                 _scan.value = ScanState(running = false)
                 _notice.value = error.message
@@ -1239,6 +1240,7 @@ class LibraryRepository(
             } else {
                 "扫描完成 · 新增 $added 本，${failedNames.size} 个文件夹失败（${failedNames.joinToString("、")}）"
             }
+            if (added > 0) syncOnProgressSaved?.invoke()
         }
     }
 
@@ -1281,6 +1283,7 @@ class LibraryRepository(
             } else {
                 "没有发现新书"
             }
+            if (result.added > 0) syncOnProgressSaved?.invoke()
         } catch (error: Throwable) {
             Log.e("InkvolScan", "import failed", error)
             _scan.value = ScanState(running = false, error = error.message ?: "扫描失败")

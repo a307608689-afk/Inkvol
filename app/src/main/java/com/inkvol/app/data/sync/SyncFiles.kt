@@ -86,6 +86,9 @@ class SyncFiles(
         client: WebDavClient,
         config: SyncRepository.SyncConfig,
         remoteTitles: Map<String, String>,
+        remoteSourceFolder: Map<String, String>,
+        remoteSeries: Map<String, String>,
+        remoteFolderPath: Map<String, String>,
         tombstonedBookIds: Set<String>,
         scope: SyncFileScope,
         onRequest: () -> Unit,
@@ -97,7 +100,16 @@ class SyncFiles(
         var failed = 0
         val cloudEntries = client.list(SyncRepository.BOOK_DIR)
         onRequest()
-        val cloudByName = cloudEntries.filter { !it.isDirectory && it.name.contains('.') }
+        // 清理历史错误命名文件（字符串模板 bug 的产物：文件名含 companion 的 .BOOK_DIR 前缀，
+        // 正常文件名是 <32位hex指纹>.<ext>，绝不会含 .BOOK_DIR，可安全删除）
+        cloudEntries.filter { !it.isDirectory && it.name.contains(".BOOK_DIR") }.forEach { orphan ->
+            runCatching {
+                client.delete("${SyncRepository.BOOK_DIR}${orphan.name}")
+                onRequest()
+            }.onFailure { }
+        }
+        val cloudByName = cloudEntries
+            .filter { !it.isDirectory && it.name.contains('.') && !it.name.contains(".BOOK_DIR") }
             .associateBy { it.name.substringBeforeLast('.') }
 
         // 1) 云端删除队列（书库移除/多选删除联动）
@@ -106,7 +118,7 @@ class SyncFiles(
             pendingDeletes.forEach { bookId ->
                 cloudByName[bookId]?.let { entry ->
                     runCatching {
-                        client.delete("$SyncRepository.BOOK_DIR${entry.name}")
+                        client.delete("${SyncRepository.BOOK_DIR}${entry.name}")
                         onRequest()
                         deletedCloud++
                     }.onFailure { failed++ }
@@ -119,7 +131,7 @@ class SyncFiles(
         tombstonedBookIds.forEach { bookId ->
             cloudByName[bookId]?.let { entry ->
                 runCatching {
-                    client.delete("$SyncRepository.BOOK_DIR${entry.name}")
+                    client.delete("${SyncRepository.BOOK_DIR}${entry.name}")
                     onRequest()
                     deletedCloud++
                 }.onFailure { failed++ }
@@ -135,7 +147,7 @@ class SyncFiles(
             if (cloudByName.containsKey(file.bookId)) return@forEach
             runCatching {
                 openLocationStream(file).use { input ->
-                    client.upload("$SyncRepository.BOOK_DIR${file.bookId}.${file.ext}", input.readBytes())
+                    client.upload("${SyncRepository.BOOK_DIR}${file.bookId}.${file.ext}", input.readBytes())
                 }
                 onRequest()
                 uploaded++
@@ -145,10 +157,18 @@ class SyncFiles(
 
         // 4) 下载：云端有、本地无、非墓碑 → 落 filesDir/library/ 持久化并导入
         cloudByName.forEach { (bookId, entry) ->
+            if (bookId in tombstonedBookIds) return@forEach
+            if (bookId in localBookIds) {
+                // 本地已有：补系列归属（旧包下载的书 folder_path 为空）
+                db.backfillSeriesFolderIfMissing(bookId, remoteSeries[bookId], remoteFolderPath[bookId])
+                return@forEach
+            }
             if (downloaded >= DOWNLOAD_CAP_PER_RUN) return@forEach
-            if (bookId in localBookIds || bookId in tombstonedBookIds) return@forEach
+            // 下载白名单：来源分组不在勾选集合且未开「全部下载」则跳过
+            val group = remoteSourceFolder[bookId] ?: SOURCE_FOLDER_UNGROUPED
+            if (!scope.downloadAll && group !in scope.downloadGroups) return@forEach
             runCatching {
-                val bytes = client.download("$SyncRepository.BOOK_DIR${entry.name}")
+                val bytes = client.download("${SyncRepository.BOOK_DIR}${entry.name}")
                 onRequest()
                 val dir = File(context.filesDir, "library").apply { mkdirs() }
                 val local = File(dir, entry.name)
@@ -157,7 +177,11 @@ class SyncFiles(
                 }
                 val title = remoteTitles[bookId] ?: bookId
                 val displayName = if ('.' in title) title else "$title.${entry.extOf()}"
-                importer.importLocalFile(local, displayName)
+                importer.importLocalFile(
+                    local, displayName,
+                    series = remoteSeries[bookId],
+                    folderPath = remoteFolderPath[bookId],
+                )
                 downloaded++
                 onProgress("已导入 $title")
             }.onFailure { failed++ }
@@ -215,17 +239,23 @@ class SyncFiles(
             }.sortedBy { it.fileName }
         }
 
-    /** 云端书籍卡手动下载单个文件并导入（title 取远端 doc，缺省用 fingerprint）。 */
-    suspend fun downloadOne(client: WebDavClient, info: CloudBookInfo, title: String?): Result<Unit> =
+    /** 云端书籍卡手动下载单个文件并导入（title/series/folderPath 取远端 doc，缺省用 fingerprint）。 */
+    suspend fun downloadOne(
+        client: WebDavClient,
+        info: CloudBookInfo,
+        title: String?,
+        series: String?,
+        folderPath: String?,
+    ): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val bytes = client.download("$SyncRepository.BOOK_DIR${info.fileName}")
+                val bytes = client.download("${SyncRepository.BOOK_DIR}${info.fileName}")
                 val dir = File(context.filesDir, "library").apply { mkdirs() }
                 val local = File(dir, info.fileName)
                 if (!local.exists() || local.length() != bytes.size.toLong()) local.writeBytes(bytes)
                 val t = title ?: info.bookId
                 val displayName = if ('.' in t) t else "$t.${info.ext}"
-                importer.importLocalFile(local, displayName)
+                importer.importLocalFile(local, displayName, series = series, folderPath = folderPath)
                 Unit
             }
         }

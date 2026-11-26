@@ -748,24 +748,6 @@ fun InkvolApp(
                             onCloseReader = closeReaderOpen,
                             modifier = Modifier.fillMaxSize(),
                         )
-
-                        // 底部内容渐隐：玻璃底栏采样到稳定底色，同时提升图标可读性。
-                        // 必须在 layerBackdrop 内，否则不会进入采集层。
-                        if (showBottomBar) {
-                            Box(
-                                modifier = Modifier
-                                    .align(Alignment.BottomCenter)
-                                    .fillMaxWidth()
-                                    .height(GlassDimens.BarHeight + chromeInsets.bottomGap + 16.dp)
-                                    .background(
-                                        Brush.verticalGradient(
-                                            listOf(Color.Transparent, backgroundColor),
-                                        ),
-                                    )
-                                    // 让位期间同步淡出，避免保留组合到最后一帧才整条消失
-                                    .graphicsLayer { alpha = 1f - overlayYield },
-                            )
-                        }
                     }
                 }
 
@@ -1458,6 +1440,12 @@ private fun ReaderOpenOverlay(
 
     val density = LocalDensity.current
 
+    // 纹理预热只画一帧：封面 / 正文快照各预绘一次触发 GPU 纹理上传即可，之后跳过。
+    // 之前是每帧都画 alpha≈0.01（draw 块每帧执行），在 120Hz 高刷屏（8.3ms 帧预算）下
+    // 每帧多 2 次全屏大位图采样 → 超预算掉帧。用普通 BooleanArray（非 snapshot state，
+    // draw 阶段读写不触发重组）。[0]=封面，[1]=小说正文快照（pageBitmap）。
+    val warmed = remember(controller.bookId) { BooleanArray(2) }
+
     // 所有 progress 相关内容都放进 draw 阶段：
     // 动画每帧只触发 redraw，不再触发 overlay 的 measure/layout/composition。
     // handoff 是纯函数，不是第二个 Animatable，避免每帧双重状态写入。
@@ -1542,19 +1530,34 @@ private fun ReaderOpenOverlay(
             clipPath(containerPath) {
                 // 迷你阅读器容器：漫画黑底即阅读器黑边；小说填充正文背景色。
                 drawRect(color = containerColor)
-                // 纹理预热：封面位图只在返回交叉淡化时才首绘，首次绘制的 GPU 纹理上传
-                //（~1.1MB）会卡掉 1-5 帧 = 「内容切换到封面那一瞬间」闪一下（gfxinfo
-                // Slow bitmap uploads 与返回次数一致）。Opening 期间以近零 alpha 预绘，
-                // 上传成本落在打开动画内，返回时纹理已就绪。
+                // 纹理预热（只画一帧，见 composable 体 warmed 声明）：封面只在返回交叉
+                // 时才首绘，正文快照在「封面 → 正文交叉」时才首绘，首次绘制触发 GPU
+                // 纹理懒上传会卡 1-5 帧。Opening 期间各自以近零 alpha 预绘一帧，上传
+                // 成本落在打开动画内；之后跳过，避免每帧重复采样大位图。
                 if (!closing) {
-                    coverBitmap?.let { bmp ->
-                        drawReaderBitmap(
-                            bitmap = bmp,
-                            rect = pageRect,
-                            alpha = 0.01f,
-                            radiusPx = 0f,
-                            fillWidthTop = false,
-                        )
+                    if (!warmed[0]) {
+                        coverBitmap?.let { bmp ->
+                            drawReaderBitmap(
+                                bitmap = bmp,
+                                rect = pageRect,
+                                alpha = 0.01f,
+                                radiusPx = 0f,
+                                fillWidthTop = false,
+                            )
+                        }
+                        warmed[0] = true
+                    }
+                    controller.pageBitmap?.let { bmp ->
+                        if (!warmed[1]) {
+                            drawReaderBitmap(
+                                bitmap = bmp,
+                                rect = pageRect,
+                                alpha = 0.01f,
+                                radiusPx = 0f,
+                                fillWidthTop = controller.readerVertical,
+                            )
+                            warmed[1] = true
+                        }
                     }
                 }
                 if (pageAlpha > 0.001f) {

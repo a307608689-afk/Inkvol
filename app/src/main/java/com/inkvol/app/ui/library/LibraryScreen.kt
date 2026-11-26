@@ -646,11 +646,31 @@ fun LibraryScreen(
     val detailStates = remember { HashMap<String, LazyGridState>() }
     fun detailStateOf(t: LibraryTarget): LazyGridState =
         detailStates.getOrPut(targetKeyOf(t).orEmpty()) {
-            val saved = LibraryDetailScroll.takeIf { it.key == targetKeyOf(t) }
+            val saved = LibraryDetailScroll.takeIf {
+                it.key == targetKeyOf(t) && !it.isList
+            }
             if (saved != null) {
                 LazyGridState(saved.index, saved.offset)
             } else {
                 LazyGridState()
+            }
+        }
+    // 二级页列表样式（library_shelf_view=list）的滚动状态：与网格 detailStates 平行、
+    // 各自独立（同一 target 同一时刻只显示一种样式，但样式来回切换时各自原位恢复，
+    // 与一级 gridStates / shelfListStates 同款「网格/列表互不覆盖」语义）。
+    val detailListStates = remember { HashMap<String, LazyListState>() }
+    fun detailListStateOf(t: LibraryTarget): LazyListState =
+        detailListStates.getOrPut(targetKeyOf(t).orEmpty()) {
+            val saved = LibraryDetailScroll.takeIf {
+                it.key == targetKeyOf(t) && it.isList
+            }
+            if (saved != null) {
+                LazyListState(
+                    firstVisibleItemIndex = saved.index,
+                    firstVisibleItemScrollOffset = saved.offset,
+                )
+            } else {
+                LazyListState()
             }
         }
     // 二级页 target 提前声明：头部折叠/标题行/恢复都要按当前页面取网格。
@@ -683,6 +703,62 @@ fun LibraryScreen(
         val detailTarget = LibraryUiState.target
         if (detailTarget != null) {
             // ---- 二级页（书夹 / 系列 / 智能书夹）----
+            if (LibraryDetailScroll.isList) {
+                // 列表样式（library_shelf_view=list）：初值已由 detailListStateOf 携带。
+                // 非跨方向无需再滚；跨方向 offset 是旧方向像素语义 → 归零 + 锚点优先
+                //（书行会开书，返回动画的飞回目标行要在视口内能回报坐标）。
+                if (crossOrientation) {
+                    val snapshot = settingsRepository.cachedPreferences()
+                    val restoreSortMode = snapshot?.let {
+                        settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT, SettingsKeys.SORT_RECENT)
+                    } ?: SettingsKeys.SORT_RECENT
+                    val restoreSortDescending = snapshot?.let {
+                        settingsRepository.stringOf(it, SettingsKeys.LIBRARY_SORT_DESC, "1")
+                    } != "0"
+                    val restoreSeriesMode = snapshot?.let {
+                        settingsRepository.stringOf(
+                            it,
+                            SettingsKeys.LIBRARY_SERIES_MODE,
+                            SettingsKeys.SERIES_MODE_HIERARCHY,
+                        )
+                    } ?: SettingsKeys.SERIES_MODE_HIERARCHY
+                    // 列表态子系列行直接排在最前（无「系列/书籍」标题行），书序号 + 子系列行数。
+                    val detailListSubOffset = if (
+                        restoreSeriesMode == SettingsKeys.SERIES_MODE_HIERARCHY &&
+                        detailTarget is LibraryTarget.Series
+                    ) {
+                        val all = libraryRepository.books.value
+                        val tf = LibraryUiState.typeFilter
+                        val source = if (tf == null) all else all.filter { it.type == tf }
+                        childSeriesNodes(source, detailTarget.path).size
+                    } else {
+                        0
+                    }
+                    val listIndex = LibraryGridScroll.anchorBookId?.let { anchorId ->
+                        sortBooks(
+                            booksOf(
+                                detailTarget,
+                                libraryRepository.books.value,
+                                libraryRepository.categoryBookIds.value,
+                                restoreSeriesMode,
+                            ),
+                            restoreSortMode,
+                            restoreSortDescending,
+                        ).indexOfFirst { it.id == anchorId }.takeIf { it >= 0 }
+                            ?.plus(detailListSubOffset)
+                    } ?: LibraryDetailScroll.index
+                    restoreListPosition(
+                        detailListStateOf(detailTarget),
+                        listIndex,
+                        0,
+                        "detail-list",
+                    )
+                }
+                gridSettled = true
+                Log.d("InkvolOpen", "diag restore gridSettled=true (detail-list)")
+                return@LaunchedEffect
+            }
+            // 网格样式：跨方向时锚点重算（层级系列页网格前有子系列标题/卡/书籍标题条目）。
             var index = LibraryDetailScroll.index
             var offset = LibraryDetailScroll.offset
             if (crossOrientation) {
@@ -923,15 +999,24 @@ fun LibraryScreen(
             LibraryGridScroll.viewMode = currentViewMode
             LibraryGridScroll.typeFilter = typeFilter
             // 二级页：同一时刻只有一个存活，位置同样落进进程级 holder
-            //（key 不匹配时不会被采用，保留「退出再进自然回顶」语义）
+            //（key 不匹配时不会被采用，保留「退出再进自然回顶」语义）。
+            // 列表样式与网格各自独立记录（isList 标记），样式来回切换各自原位恢复。
             val leavingTarget = target
-            val leavingDetail = leavingTarget?.let {
-                detailStates[targetKeyOf(it).orEmpty()]
-            }
-            if (leavingTarget != null && leavingDetail != null) {
-                LibraryDetailScroll.key = targetKeyOf(leavingTarget)
-                LibraryDetailScroll.index = leavingDetail.firstVisibleItemIndex
-                LibraryDetailScroll.offset = leavingDetail.firstVisibleItemScrollOffset
+            if (leavingTarget != null) {
+                val targetKey = targetKeyOf(leavingTarget).orEmpty()
+                LibraryDetailScroll.key = targetKey
+                LibraryDetailScroll.isList = currentFolderView == SettingsKeys.SHELF_VIEW_LIST
+                if (LibraryDetailScroll.isList) {
+                    detailListStates[targetKey]?.let {
+                        LibraryDetailScroll.index = it.firstVisibleItemIndex
+                        LibraryDetailScroll.offset = it.firstVisibleItemScrollOffset
+                    }
+                } else {
+                    detailStates[targetKey]?.let {
+                        LibraryDetailScroll.index = it.firstVisibleItemIndex
+                        LibraryDetailScroll.offset = it.firstVisibleItemScrollOffset
+                    }
+                }
             }
             // 记录离开时的方向：下次进入若方向不同（阅读期间旋转过再返回），
             // 恢复逻辑走跨方向路径（index 保留、offset 归零 + 锚点校准）。
@@ -996,23 +1081,28 @@ fun LibraryScreen(
     // ② 返回二级页时 atTop 不再读「未组合的一级网格」（恒在顶部 → 状态栏被强制唤出，
     //    与进书前的隐藏态打架 = 用户看到的「状态栏消失又出现」）。
     val activeDetailState = target?.let { detailStateOf(it) }
+    val activeDetailListState = target?.let { detailListStateOf(it) }
     val activeGridState = activeDetailState ?: gridStates.getValue(viewMode to typeFilter)
-    // 列表样式（三视图联动，一级、无二级页）时头部绑定列表容器：LazyListState 版重载
+    // 列表样式（三视图联动，一级/二级页统一）时头部绑定列表容器：LazyListState 版重载
     // 与网格版同返回类型、语义一致（折叠驱动 / 短内容守卫）。切样式时实例变化，core 内
     // remember(stateKey) 重建滚动连接；resetKey 拼上 folderView 保证头部滑回展开。
-    val shelfListHeaderActive = activeDetailState == null &&
-        folderView == SettingsKeys.SHELF_VIEW_LIST
-    val activeShelfListState = shelfListStates.getValue(viewMode to typeFilter)
-    val headerState = if (shelfListHeaderActive) {
+    // 列表容器按「二级页 / 一级」分流：二级页用 detailListStateOf(target)、一级用
+    // shelfListStates（与渲染侧 DetailList / FlatList/BookcaseList/SeriesList 同源）。
+    val listHeaderActive = folderView == SettingsKeys.SHELF_VIEW_LIST
+    val activeListState = activeDetailListState
+        ?: shelfListStates.getValue(viewMode to typeFilter)
+    val headerState = if (listHeaderActive) {
         rememberGlassHeaderState(
-            listState = activeShelfListState,
+            listState = activeListState,
             // resetKey：样式/视图/分类切换、二级页进出都是离散时机，头部滑回展开。
             resetKey = viewMode to typeFilter to targetKeyOf(target) to folderView,
             frozenStatusBarTop = frozenStatusBarTop,
             closingHold = readerOpenCtl?.phase == ReaderOpenPhase.Closing,
             statusBarHold = !gridSettled,
             // 与网格版同一几何（书夹排上移 10dp 的 108dp）；书架页接进程级 holder。
-            headerContentHeight = 108.dp,
+            // 二级页头部多一行标题行（随折叠一起上移、折满整块出屏）。
+            headerContentHeight = 108.dp +
+                if (activeDetailListState != null) DETAIL_TITLE_ROW_HEIGHT else 0.dp,
             useLibraryHolder = true,
         )
     } else {
@@ -1042,14 +1132,14 @@ fun LibraryScreen(
     // 回顶事件要落在「当前显示网格」上：LaunchedEffect(Unit) 不随重组重启，
     // 直接读 activeGridState 会捕获首帧实例（二级页切进来后仍是旧的一级网格）。
     val currentActiveGrid by rememberUpdatedState(activeGridState)
-    // 列表样式回顶：一级显示 LazyColumn 时滚列表（否则滚网格）。事件闭包读
+    // 列表样式回顶：显示 LazyColumn（一级/二级）时滚列表（否则滚网格）。事件闭包读
     // rememberUpdatedState 中转的实时值，不随重组重启、不捕获首帧实例。
-    val currentShelfListHeaderActive by rememberUpdatedState(shelfListHeaderActive)
-    val currentShelfListState by rememberUpdatedState(activeShelfListState)
+    val currentListHeaderActive by rememberUpdatedState(listHeaderActive)
+    val currentActiveList by rememberUpdatedState(activeListState)
     LaunchedEffect(Unit) {
         scrollToTop.events.collect {
-            if (currentShelfListHeaderActive) {
-                val listTopState = currentShelfListState
+            if (currentListHeaderActive) {
+                val listTopState = currentActiveList
                 if (listTopState.layoutInfo.totalItemsCount > 0) {
                     listTopState.animateScrollToItem(0)
                 }
@@ -1681,8 +1771,9 @@ fun LibraryScreen(
                         // ① AnimatedContent 退场页按旧 t 仍取旧实例，不会当场回顶；
                         // ② 初值吃 LibraryDetailScroll（一镜到底返回恢复位置）；
                         // ③ 顶层可访问 → 头部状态机/恢复逻辑都能按「当前显示的网格」取。
-                        // 标题行已上提到头部层（随折叠一起上移），这里只画网格/空态。
+                        // 标题行已上提到头部层（随折叠一起上移），这里只画网格/列表/空态。
                         val targetGridState = detailStateOf(t)
+                        val targetListState = detailListStateOf(t)
                         // 排序与一级书架共用全局档（library_sort / library_sort_desc，
                         // 全 App 一份排序，SSMH 同款）；方向也共用全局键。
                         val targetBooks = sortBooks(
@@ -1704,7 +1795,7 @@ fun LibraryScreen(
                         } else {
                             emptyList()
                         }
-                        // 层级系列页的网格书区只放「本目录直属书」：子目录的书已由上面的
+                        // 层级系列页的书区只放「本目录直属书」：子目录的书已由上面的
                         // 子系列卡代表，父页再铺一遍会重复（计数/排序仍用子树集合）。
                         val gridBooks = if (
                             seriesMode == SettingsKeys.SERIES_MODE_HIERARCHY &&
@@ -1718,25 +1809,52 @@ fun LibraryScreen(
                             gridBooks.isEmpty() &&
                             subSeries.isEmpty() &&
                             booksOf(t, books, categoryBookIds, seriesMode).isNotEmpty()
-                        CategoryContentView(
-                            books = gridBooks,
-                            subSeries = subSeries,
-                            emptyBecauseFiltered = emptyBecauseFiltered,
-                            emptyTitle = if (t is LibraryTarget.Series) "这个系列还没有书" else null,
-                            emptyHint = if (t is LibraryTarget.Series) {
-                                "换一个文件夹系列，或回到书架下拉重新扫描。"
-                            } else {
-                                null
+                        val emptyTitle = if (t is LibraryTarget.Series) "这个系列还没有书" else null
+                        val emptyHint = if (t is LibraryTarget.Series) {
+                            "换一个文件夹系列，或回到书架下拉重新扫描。"
+                        } else {
+                            null
+                        }
+                        // 二级页同样跟随全局展示样式（library_shelf_view）：网格/列表共用
+                        // 同一套数据与空态，仅容器不同（与一级三视图的 ShelfStyleSwitch 同源）。
+                        ShelfStyleSwitch(
+                            style = folderView,
+                            grid = {
+                                CategoryContentView(
+                                    books = gridBooks,
+                                    subSeries = subSeries,
+                                    emptyBecauseFiltered = emptyBecauseFiltered,
+                                    emptyTitle = emptyTitle,
+                                    emptyHint = emptyHint,
+                                    state = targetGridState,
+                                    selected = selected,
+                                    reportSettled = gridSettled,
+                                    onToggleSelect = { id ->
+                                        selected = if (id in selected) selected - id else selected + id
+                                    },
+                                    onOpenBook = onOpenBook,
+                                    onOpenSeries = { target = it },
+                                    chromeBottom = chrome.contentBottomForPage,
+                                )
                             },
-                            state = targetGridState,
-                            selected = selected,
-                            reportSettled = gridSettled,
-                            onToggleSelect = { id ->
-                                selected = if (id in selected) selected - id else selected + id
+                            list = {
+                                DetailList(
+                                    books = gridBooks,
+                                    subSeries = subSeries,
+                                    emptyBecauseFiltered = emptyBecauseFiltered,
+                                    emptyTitle = emptyTitle,
+                                    emptyHint = emptyHint,
+                                    state = targetListState,
+                                    selected = selected,
+                                    reportSettled = gridSettled,
+                                    onToggleSelect = { id ->
+                                        selected = if (id in selected) selected - id else selected + id
+                                    },
+                                    onOpenBook = onOpenBook,
+                                    onOpenSeries = { target = it },
+                                    chromeBottom = chrome.contentBottomForPage,
+                                )
                             },
-                            onOpenBook = onOpenBook,
-                            onOpenSeries = { target = it },
-                            chromeBottom = chrome.contentBottomForPage,
                         )
                     }
                 }
@@ -3495,6 +3613,96 @@ private fun CategoryContentView(
             }
         }
 
+    }
+}
+
+/**
+ * 二级页列表样式（library_shelf_view=list）：书夹 / 系列 / 智能书夹的书行列表。
+ * 与网格版 [CategoryContentView] 共用同一套数据与空态，仅容器换成 LazyColumn：
+ * 子系列行（层级系列页）+ 书行卡 [BookListRow]，点击/多选/一镜到底语义与一级
+ * [FlatList] 完全一致。子系列行直接排最前、无标题行（列表行卡视觉已区分书行，
+ * 跨方向恢复的锚点偏移 = 子系列行数）。
+ */
+@Composable
+private fun DetailList(
+    books: List<BookRecord>,
+    subSeries: List<SeriesNode> = emptyList(),
+    emptyBecauseFiltered: Boolean = false,
+    emptyTitle: String? = null,
+    emptyHint: String? = null,
+    state: LazyListState,
+    selected: Set<String>,
+    reportSettled: Boolean,
+    onToggleSelect: (String) -> Unit,
+    onOpenBook: (BookRecord, ReaderOpenRect?) -> Unit,
+    onOpenSeries: (LibraryTarget.Series) -> Unit = {},
+    chromeBottom: androidx.compose.ui.unit.Dp,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        if (books.isEmpty() && subSeries.isEmpty()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = InkvolRadius.card,
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            ) {
+                Column(Modifier.padding(20.dp)) {
+                    Text(
+                        text = when {
+                            emptyBecauseFiltered -> "当前分类下没有书"
+                            else -> emptyTitle ?: "这个书夹还是空的"
+                        },
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = when {
+                            emptyBecauseFiltered ->
+                                "书夹里有书，但都不属于当前选中的分类。返回书架切换到「全部」查看。"
+
+                            else -> emptyHint ?: "回到书架长按书本，选择「加入书夹」。"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        } else {
+            LazyColumn(
+                state = state,
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(
+                    top = 4.dp,
+                    bottom = chromeBottom + GlassDimens.ListBottomExtraScroll,
+                ),
+            ) {
+                items(subSeries, key = { "series:${it.path}" }) { node ->
+                    SeriesListRow(
+                        node = node,
+                        onClick = {
+                            onOpenSeries(LibraryTarget.Series(node.path, node.name))
+                        },
+                    )
+                    Spacer(Modifier.height(10.dp))
+                }
+                items(books, key = { it.id }) { book ->
+                    BookListRow(
+                        book = book,
+                        selected = book.id in selected,
+                        reportSettled = reportSettled,
+                        onClick = { rect ->
+                            if (selected.isEmpty()) {
+                                onOpenBook(book, rect)
+                            } else {
+                                onToggleSelect(book.id)
+                            }
+                        },
+                        onLongClick = { onToggleSelect(book.id) },
+                    )
+                    Spacer(Modifier.height(10.dp))
+                }
+            }
+        }
     }
 }
 

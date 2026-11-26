@@ -202,7 +202,12 @@ class SingleFileImporter(
      * M4.5 文件同步下载导入：文件已由调用方持久化在 filesDir/library/（docId=file://）。
      * 指纹校验去重；书架已存在时抛 AlreadyExistsException 由调用方忽略。
      */
-    suspend fun importLocalFile(file: File, displayName: String): BookRecord = withContext(Dispatchers.IO) {
+    suspend fun importLocalFile(
+        file: File,
+        displayName: String,
+        series: String? = null,
+        folderPath: String? = null,
+    ): BookRecord = withContext(Dispatchers.IO) {
         val size = file.length()
         if (size <= 0) throw UnsupportedException("文件为空")
         val fingerprint = Fingerprint.ofArchive(size) { file.inputStream() }
@@ -249,7 +254,8 @@ class SingleFileImporter(
                             id = fingerprint,
                             type = "COMIC",
                             title = title,
-                            series = "单文件导入",
+                            series = series ?: "单文件导入",
+                            folderPath = folderPath,
                             volume = null,
                             writer = null,
                             tags = null,
@@ -305,7 +311,8 @@ class SingleFileImporter(
                 id = fingerprint,
                 type = "NOVEL",
                 title = title,
-                series = "单文件导入",
+                series = series ?: "单文件导入",
+                folderPath = folderPath,
                 volume = null,
                 writer = null,
                 tags = null,
@@ -329,7 +336,8 @@ class SingleFileImporter(
             id = fingerprint,
             type = "COMIC",
             title = probe.meta?.title ?: title,
-            series = "单文件导入",
+            series = series ?: "单文件导入",
+            folderPath = folderPath,
             volume = probe.meta?.volume,
             writer = probe.meta?.writer,
             tags = probe.meta?.tags,

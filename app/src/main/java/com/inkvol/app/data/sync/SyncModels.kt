@@ -5,6 +5,12 @@ import kotlinx.serialization.Serializable
 /** 同步文档格式版本：结构破坏性变更时 +1；旧端读到更高版本应跳过合并并提示升级。 */
 const val SYNC_FORMAT_VERSION = 1
 
+/** 散书（单文件导入）的来源分组标签；用 @single@ 前缀避免与真实文件夹名冲突。 */
+const val SOURCE_FOLDER_SINGLE = "@single@"
+
+/** 无法归属到具体文件夹的书（无名称 / 旧文档无 sourceFolder）归入的分组标签。 */
+const val SOURCE_FOLDER_UNGROUPED = "未分组"
+
 /** 墓碑种类。 */
 object TombstoneKinds {
     const val BOOK = "book"
@@ -110,6 +116,12 @@ data class SyncBookState(
     val annotations: List<SyncAnnotation> = emptyList(),
     val readingSessions: List<SyncReadingSession> = emptyList(),
     val bookPrefs: SyncBookPrefs? = null,
+    /** 来源分组标签（SOURCE_FOLDER_SINGLE / 文件夹显示名 / SOURCE_FOLDER_UNGROUPED）；空 = 旧数据待补齐。 */
+    val sourceFolder: String = "",
+    /** 系列名（所在目录名；folderPath 缺失时系列视图退化显示用）。 */
+    val series: String = "",
+    /** 相对库根的目录路径（系列视图层级/扁平建树的唯一真源）；null = 散书/旧数据。 */
+    val folderPath: String? = null,
 )
 
 /** 自定义净化规则（同步合并用；内置规则以各端本机为准不互传，仅占用 name+pattern 去重空间）。 */
@@ -161,8 +173,13 @@ data class SyncFileScope(
     val all: Boolean = false,
     val single: Boolean = true,
     val folderIds: List<Long> = emptyList(),
+    /** 下载：全部（开关兜底，默认关 = 只下勾选的组）。 */
+    val downloadAll: Boolean = false,
+    /** 下载：勾选的来源分组（SOURCE_FOLDER_SINGLE / 文件夹名 / SOURCE_FOLDER_UNGROUPED）。 */
+    val downloadGroups: List<String> = emptyList(),
 ) {
-    val isEmpty: Boolean get() = !all && !single && folderIds.isEmpty()
+    val isEmpty: Boolean get() =
+        !all && !single && folderIds.isEmpty() && !downloadAll && downloadGroups.isEmpty()
 }
 
 /** 单条同步记录（最近 20 条持久化于 DataStore）。 */
